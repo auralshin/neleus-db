@@ -1,0 +1,27 @@
+pub mod atomic;
+pub mod blob_store;
+pub mod canonical;
+pub mod cas;
+pub mod commit;
+pub mod db;
+pub mod encryption;
+pub mod hash;
+pub mod index;
+pub mod lock;
+pub mod manifest;
+pub mod merkle;
+pub mod object_store;
+pub mod provenance;
+pub mod refs;
+pub mod state;
+pub mod wal;
+
+pub use blob_store::BlobStore;
+pub use commit::{Commit, CommitHash, CommitStore};
+pub use db::Database;
+pub use encryption::{EncryptionConfig, EncryptionManager, EncryptionProvider};
+pub use hash::Hash;
+pub use manifest::{DocManifest, ManifestStore, RunManifest};
+pub use provenance::{Evidence, ProvenanceManifest, ProvenanceRecord, SourceType};
+pub use refs::RefsStore;
+pub use state::{StateProof, StateRoot, StateStore};
