@@ -1,0 +1,28 @@
+[package]
+name = "neleus-db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1.0"
+base64 = "0.22"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.2"
+hex = "0.4"
+pbkdf2 = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_ipld_dagcbor = "0.6"
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+
+[dev-dependencies]
+rand = "0.8"
+tempfile = "3.16"
+
+[[bin]]
+name = "neleus-db"
+path = "src/main.rs"
