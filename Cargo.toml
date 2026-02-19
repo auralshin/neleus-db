@@ -1,6 +1,6 @@
 [package]
 name = "neleus-db"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Local-first Merkle-DAG database for AI agents with cryptographic proofs and immutable versioning"
 license = "MIT"
