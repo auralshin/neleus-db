@@ -84,23 +84,34 @@ fn main() -> Result<()> {
     let retrieved_json = db.blob_store.get(manifest_hash)?;
     let retrieved_manifest: ProvenanceManifest = serde_json::from_slice(&retrieved_json)?;
 
-    println!("\n✓ Retrieved manifest with {} records", retrieved_manifest.records.len());
+    println!(
+        "\nRetrieved manifest with {} records",
+        retrieved_manifest.records.len()
+    );
 
     if let Some(claim) = retrieved_manifest.find_by_claim_id("claim_001") {
         println!("\nFound claim by ID:");
         println!("  Text: {}", claim.claim_text);
         println!("  Confidence: {}", claim.confidence);
         println!("  Evidence sources: {}", claim.evidence.len());
-        
+
         for (i, ev) in claim.evidence.iter().enumerate() {
-            println!("    Evidence {}: {:?} from {}", i + 1, ev.source_type, ev.source_blob);
+            println!(
+                "    Evidence {}: {:?} from {}",
+                i + 1,
+                ev.source_type,
+                ev.source_blob
+            );
         }
     }
 
     let geography_claims = retrieved_manifest.find_by_tag("geography");
-    println!("\n✓ Found {} claims tagged 'geography'", geography_claims.len());
+    println!(
+        "\nFound {} claims tagged 'geography'",
+        geography_claims.len()
+    );
 
-    println!("\n✓ Provenance tracking complete!");
+    println!("\nProvenance tracking complete!");
 
     Ok(())
 }

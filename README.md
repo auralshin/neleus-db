@@ -7,9 +7,9 @@
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   </p>
   
-  # 🔱 Neleus DB
+# 🔱 Neleus DB
 
-  ### Local-first Merkle-DAG database for AI agents, reproducible runs, and verifiable state
+## Local-first Merkle-DAG database for AI agents, reproducible runs, and verifiable state
 
   A high-performance, content-addressed database designed for AI agent workflows with cryptographic proofs and immutable versioning.
 
