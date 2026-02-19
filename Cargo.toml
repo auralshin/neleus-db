@@ -9,7 +9,7 @@ homepage = "https://github.com/auralshin/neleus-db"
 documentation = "https://docs.rs/neleus-db"
 readme = "README.md"
 keywords = ["database", "merkle", "ai-agents", "content-addressed", "versioning"]
-categories = ["database-implementations", "cryptography"]
+categories = ["database-implementations", "cryptography", "ai", "ai-agent", "data-structures"]
 
 [dependencies]
 aes-gcm = "0.10"
