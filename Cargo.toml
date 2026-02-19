@@ -1,7 +1,15 @@
 [package]
 name = "neleus-db"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "Local-first Merkle-DAG database for AI agents with cryptographic proofs and immutable versioning"
+license = "MIT"
+repository = "https://github.com/auralshin/neleus-db"
+homepage = "https://github.com/auralshin/neleus-db"
+documentation = "https://docs.rs/neleus-db"
+readme = "README.md"
+keywords = ["database", "merkle", "ai-agents", "content-addressed", "versioning"]
+categories = ["database-implementations", "cryptography"]
 
 [dependencies]
 aes-gcm = "0.10"
