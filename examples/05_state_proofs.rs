@@ -27,7 +27,9 @@ fn main() -> Result<()> {
     }
 
     let missing_proof = db.state_store.proof(r3, b"key_missing")?;
-    let missing_verified = db.state_store.verify_proof(r3, b"key_missing", &missing_proof);
+    let missing_verified = db
+        .state_store
+        .verify_proof(r3, b"key_missing", &missing_proof);
     println!("Non-membership proof verified: {}", missing_verified);
 
     let r4 = db.state_store.del(r3, b"key_b")?;

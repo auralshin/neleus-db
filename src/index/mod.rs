@@ -49,6 +49,14 @@ pub struct SearchIndex {
     pub vector_dim: Option<usize>,
 }
 
+type SemanticTables = (
+    u32,
+    f32,
+    BTreeMap<String, u32>,
+    BTreeMap<String, u32>,
+    BTreeMap<String, Vec<Posting>>,
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchHit {
     pub chunk_hash: Hash,
@@ -371,15 +379,7 @@ fn vector_search_index(
     Ok(hits)
 }
 
-fn build_semantic_tables(
-    chunks: &[IndexChunk],
-) -> (
-    u32,
-    f32,
-    BTreeMap<String, u32>,
-    BTreeMap<String, u32>,
-    BTreeMap<String, Vec<Posting>>,
-) {
+fn build_semantic_tables(chunks: &[IndexChunk]) -> SemanticTables {
     let mut doc_len: BTreeMap<String, u32> = BTreeMap::new();
     let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
     let mut postings: BTreeMap<String, Vec<Posting>> = BTreeMap::new();

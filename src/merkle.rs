@@ -53,7 +53,7 @@ pub fn prove_inclusion(leaves: &[Hash], index: usize) -> Option<MerkleProof> {
     let mut level = leaves.to_vec();
 
     while level.len() > 1 {
-        let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
         let sibling = if sibling_idx < level.len() {
             level[sibling_idx]
         } else {
@@ -102,7 +102,7 @@ pub fn verify_inclusion(root_hash: Hash, leaf_hash: Hash, proof: &MerkleProof) -
     let mut idx = proof.index;
     let mut current = leaf_hash;
     for sibling in &proof.siblings {
-        current = if idx % 2 == 0 {
+        current = if idx.is_multiple_of(2) {
             hash_pair(current, *sibling)
         } else {
             hash_pair(*sibling, current)

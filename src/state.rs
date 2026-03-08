@@ -603,7 +603,7 @@ fn verify_non_inclusion(segment: &StateSegment, key: &[u8], np: &NonInclusionPro
             if left.proof.index + 1 != np.insertion_index {
                 return false;
             }
-            if !(left.entry.key.as_slice() < key) {
+            if left.entry.key.as_slice() >= key {
                 return false;
             }
         }
@@ -622,7 +622,7 @@ fn verify_non_inclusion(segment: &StateSegment, key: &[u8], np: &NonInclusionPro
             if right.proof.index != np.insertion_index {
                 return false;
             }
-            if !(key < right.entry.key.as_slice()) {
+            if key >= right.entry.key.as_slice() {
                 return false;
             }
         }
@@ -634,7 +634,7 @@ fn verify_non_inclusion(segment: &StateSegment, key: &[u8], np: &NonInclusionPro
     }
 
     if let (Some(left), Some(right)) = (&np.left, &np.right)
-        && !(left.entry.key.as_slice() < right.entry.key.as_slice())
+        && left.entry.key.as_slice() >= right.entry.key.as_slice()
     {
         return false;
     }
