@@ -1,16 +1,19 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::canonical::{from_cbor, to_cbor};
 use crate::cas::CasStore;
+use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_typed};
 
 #[derive(Clone, Debug)]
 pub struct ObjectStore {
     cas: CasStore,
     verify_on_read: bool,
+    encryption: Option<Arc<EncryptionRuntime>>,
 }
 
 impl ObjectStore {
@@ -18,13 +21,23 @@ impl ObjectStore {
         Self {
             cas: CasStore::new(root),
             verify_on_read: false,
+            encryption: None,
         }
     }
 
     pub fn with_options(root: impl Into<PathBuf>, verify_on_read: bool) -> Self {
+        Self::with_runtime_options(root, verify_on_read, None)
+    }
+
+    pub fn with_runtime_options(
+        root: impl Into<PathBuf>,
+        verify_on_read: bool,
+        encryption: Option<Arc<EncryptionRuntime>>,
+    ) -> Self {
         Self {
             cas: CasStore::new(root),
             verify_on_read,
+            encryption,
         }
     }
 
@@ -38,16 +51,28 @@ impl ObjectStore {
 
     pub fn put_typed_bytes(&self, tag: &[u8], bytes: &[u8]) -> Result<Hash> {
         let hash = hash_typed(tag, bytes);
-        self.cas.put_existing_hash(hash, bytes)?;
+        let stored = match &self.encryption {
+            Some(runtime) => runtime.encrypt(bytes)?,
+            None => bytes.to_vec(),
+        };
+        self.cas.put_existing_hash(hash, &stored)?;
         Ok(hash)
     }
 
     pub fn get_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
-        self.cas.get(hash)
+        let raw = self.cas.get(hash)?;
+        match &self.encryption {
+            Some(runtime) => runtime.decrypt(&raw),
+            None => Ok(raw),
+        }
     }
 
     pub fn get_typed_bytes(&self, tag: &[u8], hash: Hash) -> Result<Vec<u8>> {
-        let bytes = self.cas.get(hash)?;
+        let raw = self.cas.get(hash)?;
+        let bytes = match &self.encryption {
+            Some(runtime) => runtime.decrypt(&raw)?,
+            None => raw,
+        };
         if self.verify_on_read {
             let computed = hash_typed(tag, &bytes);
             if computed != hash {

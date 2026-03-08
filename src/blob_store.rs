@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 
 use crate::cas::CasStore;
+use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_blob};
 
 #[derive(Clone, Debug)]
@@ -10,6 +12,7 @@ pub struct BlobStore {
     pub root: PathBuf,
     cas: CasStore,
     verify_on_read: bool,
+    encryption: Option<Arc<EncryptionRuntime>>,
 }
 
 impl BlobStore {
@@ -19,15 +22,25 @@ impl BlobStore {
             root: root.clone(),
             cas: CasStore::new(root),
             verify_on_read: false,
+            encryption: None,
         }
     }
 
     pub fn with_options(root: impl Into<PathBuf>, verify_on_read: bool) -> Self {
+        Self::with_runtime_options(root, verify_on_read, None)
+    }
+
+    pub fn with_runtime_options(
+        root: impl Into<PathBuf>,
+        verify_on_read: bool,
+        encryption: Option<Arc<EncryptionRuntime>>,
+    ) -> Self {
         let root = root.into();
         Self {
             root: root.clone(),
             cas: CasStore::new(root),
             verify_on_read,
+            encryption,
         }
     }
 
@@ -40,11 +53,21 @@ impl BlobStore {
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<Hash> {
-        self.cas.put_and_hash(bytes, hash_blob)
+        let hash = hash_blob(bytes);
+        let stored = match &self.encryption {
+            Some(runtime) => runtime.encrypt(bytes)?,
+            None => bytes.to_vec(),
+        };
+        self.cas.put_existing_hash(hash, &stored)?;
+        Ok(hash)
     }
 
     pub fn get(&self, hash: Hash) -> Result<Vec<u8>> {
-        let bytes = self.cas.get(hash)?;
+        let raw = self.cas.get(hash)?;
+        let bytes = match &self.encryption {
+            Some(runtime) => runtime.decrypt(&raw)?,
+            None => raw,
+        };
         if self.verify_on_read {
             let computed = hash_blob(&bytes);
             if computed != hash {

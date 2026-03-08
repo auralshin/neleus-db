@@ -36,6 +36,10 @@ pub fn acquire_lock(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLoc
                 return Ok(FileLockGuard { path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&path, timeout)? {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
                 let elapsed = start.elapsed().unwrap_or(Duration::from_secs(0));
                 if elapsed >= timeout {
                     return Err(anyhow!(
@@ -52,6 +56,54 @@ pub fn acquire_lock(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLoc
             }
         }
     }
+}
+
+fn lock_is_stale(path: &Path, timeout: Duration) -> Result<bool> {
+    let metadata = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", path.display())),
+    };
+
+    if let Ok(contents) = fs::read_to_string(path)
+        && let Some(pid) = parse_pid(&contents)
+        && !process_is_alive(pid)
+    {
+        return Ok(true);
+    }
+
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::from_secs(0));
+    Ok(age > timeout.saturating_mul(20))
+}
+
+fn parse_pid(contents: &str) -> Option<u32> {
+    for line in contents.lines() {
+        if let Some(v) = line.strip_prefix("pid=")
+            && let Ok(pid) = v.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) does not send a signal; it only performs existence/permission checks.
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    errno == libc::EPERM
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -78,5 +130,14 @@ mod tests {
         let _g = acquire_lock(&p, Duration::from_secs(1)).unwrap();
         let err = acquire_lock(&p, Duration::from_millis(80)).unwrap_err();
         assert!(err.to_string().contains("timed out acquiring lock"));
+    }
+
+    #[test]
+    fn stale_lock_is_recovered() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("x.lock");
+        fs::write(&p, "pid=999999\ncreated_at=1\n").unwrap();
+        let _g = acquire_lock(&p, Duration::from_millis(80)).unwrap();
+        assert!(p.exists());
     }
 }

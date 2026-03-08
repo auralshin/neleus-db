@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -8,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_atomic;
 use crate::blob_store::BlobStore;
 use crate::commit::CommitStore;
+use crate::encryption::{EncryptionConfig, EncryptionRuntime};
+use crate::hash::Hash;
 use crate::index::SearchIndexStore;
 use crate::lock::acquire_lock;
 use crate::manifest::ManifestStore;
@@ -16,7 +19,8 @@ use crate::refs::RefsStore;
 use crate::state::StateStore;
 use crate::wal::{Wal, WalRecoveryReport};
 
-const DB_CONFIG_SCHEMA_VERSION: u32 = 2;
+const DB_CONFIG_SCHEMA_VERSION: u32 = 3;
+const DEFAULT_CAS_RETRIES: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -38,6 +42,8 @@ pub struct Config {
     pub hashing: String,
     pub created_at: u64,
     pub verify_on_read: bool,
+    #[serde(default)]
+    pub encryption: Option<EncryptionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +72,7 @@ impl Database {
                 hashing: "blake3".into(),
                 created_at: now_unix(),
                 verify_on_read: false,
+                encryption: None,
             };
             let bytes = serde_json::to_vec_pretty(&cfg)?;
             write_atomic(&cfg_path, &bytes)?;
@@ -97,8 +104,17 @@ impl Database {
             write_atomic(&cfg_path, &bytes)?;
         }
 
-        let blob_store = BlobStore::with_options(root.join("blobs"), config.verify_on_read);
-        let object_store = ObjectStore::with_options(root.join("objects"), config.verify_on_read);
+        let encryption = build_encryption_runtime(&config)?;
+        let blob_store = BlobStore::with_runtime_options(
+            root.join("blobs"),
+            config.verify_on_read,
+            encryption.clone(),
+        );
+        let object_store = ObjectStore::with_runtime_options(
+            root.join("objects"),
+            config.verify_on_read,
+            encryption,
+        );
         let wal = Wal::new(root.join("wal"));
         let refs = RefsStore::new(root.join("refs"), wal.clone());
         let state_store = StateStore::new(object_store.clone(), blob_store.clone(), wal.clone());
@@ -127,6 +143,133 @@ impl Database {
             config,
         })
     }
+
+    pub fn resolve_state_root(&self, head: &str) -> Result<Hash> {
+        if let Some(staged) = self.refs.state_get(head)? {
+            return Ok(staged);
+        }
+
+        if let Some(commit_hash) = self.refs.head_get(head)? {
+            let commit = self.commit_store.get_commit(commit_hash)?;
+            return Ok(commit.state_root);
+        }
+
+        self.state_store.empty_root()
+    }
+
+    pub fn state_set_at_head(&self, head: &str, key: &[u8], value: &[u8]) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| {
+            self.state_store.set(base_root, key, value)
+        })
+    }
+
+    pub fn state_del_at_head(&self, head: &str, key: &[u8]) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| self.state_store.del(base_root, key))
+    }
+
+    pub fn state_compact_at_head(&self, head: &str) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| self.state_store.compact(base_root))
+    }
+
+    pub fn create_commit_at_head(
+        &self,
+        head: &str,
+        author: &str,
+        message: &str,
+        manifests: Vec<Hash>,
+    ) -> Result<Hash> {
+        for _ in 0..DEFAULT_CAS_RETRIES {
+            let parent = self.refs.head_get(head)?;
+            let parents = parent.into_iter().collect::<Vec<_>>();
+            let state_root = self.resolve_state_root(head)?;
+            let candidate = self.commit_store.create_commit(
+                parents,
+                state_root,
+                manifests.clone(),
+                author.to_string(),
+                message.to_string(),
+            )?;
+
+            if !self.sync_state_ref_for_commit(head, state_root)? {
+                continue;
+            }
+
+            if self.refs.head_compare_and_set(head, parent, candidate)? {
+                return Ok(candidate);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "concurrent update contention while creating commit for '{}'",
+            head
+        ))
+    }
+
+    pub fn ensure_index_ready(&self, commit: Hash) -> Result<()> {
+        if self.index_store.read_index(commit).is_ok() {
+            return Ok(());
+        }
+
+        let _ = self.index_store.build_for_head(
+            commit,
+            &self.commit_store,
+            &self.manifest_store,
+            &self.blob_store,
+        )?;
+        Ok(())
+    }
+
+    fn resolve_base_root_for_state_update(
+        &self,
+        head: &str,
+        expected_state: Option<Hash>,
+    ) -> Result<Hash> {
+        if let Some(root) = expected_state {
+            return Ok(root);
+        }
+
+        if let Some(commit_hash) = self.refs.head_get(head)? {
+            let commit = self.commit_store.get_commit(commit_hash)?;
+            return Ok(commit.state_root);
+        }
+
+        self.state_store.empty_root()
+    }
+
+    fn apply_state_update_with_cas<F>(&self, head: &str, mut op: F) -> Result<Hash>
+    where
+        F: FnMut(Hash) -> Result<Hash>,
+    {
+        for _ in 0..DEFAULT_CAS_RETRIES {
+            let expected_state = self.refs.state_get(head)?;
+            let base_root = self.resolve_base_root_for_state_update(head, expected_state)?;
+            let new_root = op(base_root)?;
+            if self
+                .refs
+                .state_compare_and_set(head, expected_state, new_root)?
+            {
+                return Ok(new_root);
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "concurrent state update contention on head '{}', retry command",
+            head
+        ))
+    }
+
+    fn sync_state_ref_for_commit(&self, head: &str, state_root: Hash) -> Result<bool> {
+        for _ in 0..DEFAULT_CAS_RETRIES {
+            let expected_state = self.refs.state_get(head)?;
+            if self
+                .refs
+                .state_compare_and_set(head, expected_state, state_root)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 pub fn init(path: impl AsRef<Path>) -> Result<()> {
@@ -152,6 +295,7 @@ fn load_and_migrate_config(cfg_path: &Path) -> Result<(Config, bool)> {
         hashing: old.hashing,
         created_at: old.created_at,
         verify_on_read: false,
+        encryption: None,
     };
     Ok((migrate_config(migrated), true))
 }
@@ -164,6 +308,21 @@ fn migrate_config(mut cfg: Config) -> Config {
         cfg.hashing = "blake3".into();
     }
     cfg
+}
+
+fn build_encryption_runtime(config: &Config) -> Result<Option<Arc<EncryptionRuntime>>> {
+    let Some(enc) = &config.encryption else {
+        return Ok(None);
+    };
+    if !enc.enabled {
+        return Ok(None);
+    }
+
+    let password = std::env::var("NELEUS_DB_ENCRYPTION_PASSWORD").with_context(
+        || "encryption is enabled in config but NELEUS_DB_ENCRYPTION_PASSWORD is not set",
+    )?;
+    let runtime = EncryptionRuntime::from_config(enc.clone(), password)?;
+    Ok(Some(Arc::new(runtime)))
 }
 
 fn now_unix() -> u64 {
@@ -313,5 +472,32 @@ mod tests {
         fs::write(db_root.join("wal").join("bad.wal"), b"not-cbor").unwrap();
         let db = Database::open(&db_root).unwrap();
         assert!(db.wal.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn high_level_state_set_and_get_work() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let root = db.state_set_at_head("main", b"k", b"v").unwrap();
+        let read_root = db.resolve_state_root("main").unwrap();
+        assert_eq!(root, read_root);
+        assert_eq!(db.state_store.get(root, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn high_level_commit_updates_head() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
+        let commit = db
+            .create_commit_at_head("main", "agent", "m1", vec![])
+            .unwrap();
+        assert_eq!(db.refs.head_get("main").unwrap(), Some(commit));
     }
 }

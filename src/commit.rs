@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::to_cbor;
@@ -61,6 +61,7 @@ impl CommitStore {
         author: String,
         message: String,
     ) -> Result<CommitHash> {
+        self.validate_references(state_root, &manifests)?;
         let commit = Commit {
             schema_version: COMMIT_SCHEMA_VERSION,
             parents,
@@ -83,6 +84,7 @@ impl CommitStore {
         author: String,
         message: String,
     ) -> Result<CommitHash> {
+        self.validate_references(state_root, &manifests)?;
         let unsigned = Commit {
             schema_version: COMMIT_SCHEMA_VERSION,
             parents,
@@ -116,6 +118,18 @@ impl CommitStore {
     ) -> Result<()> {
         let commit = self.get_commit(hash)?;
         verifier.verify(hash, &commit)
+    }
+
+    fn validate_references(&self, state_root: StateRoot, manifests: &[Hash]) -> Result<()> {
+        if !self.objects.exists(state_root) {
+            return Err(anyhow!("state_root {} does not exist", state_root));
+        }
+        for manifest in manifests {
+            if !self.objects.exists(*manifest) {
+                return Err(anyhow!("manifest {} does not exist", manifest));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -219,9 +233,9 @@ mod tests {
     #[test]
     fn commit_can_reference_manifests() {
         let tmp = TempDir::new().unwrap();
-        let (cs, state, blobs) = stores(&tmp);
+        let (cs, state, _blobs) = stores(&tmp);
         let root = state.empty_root().unwrap();
-        let manifest_hash = blobs.put(b"manifest ref").unwrap();
+        let manifest_hash = state.set(root, b"manifest", b"ref").unwrap();
         let c = cs
             .create_commit(
                 vec![],
@@ -300,5 +314,34 @@ mod tests {
         let c = cs.get_commit(h).unwrap();
         assert!(c.signature.is_some());
         cs.verify_commit_with(h, &DummyVerifier).unwrap();
+    }
+
+    #[test]
+    fn create_commit_rejects_missing_state_root() {
+        let tmp = TempDir::new().unwrap();
+        let (cs, _state, _) = stores(&tmp);
+        let missing_root = hash_typed(b"missing:", b"state");
+        let err = cs
+            .create_commit(vec![], missing_root, vec![], "agent".into(), "msg".into())
+            .unwrap_err();
+        assert!(err.to_string().contains("state_root"));
+    }
+
+    #[test]
+    fn create_commit_rejects_missing_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let (cs, state, _) = stores(&tmp);
+        let root = state.empty_root().unwrap();
+        let missing_manifest = hash_typed(b"missing:", b"manifest");
+        let err = cs
+            .create_commit(
+                vec![],
+                root,
+                vec![missing_manifest],
+                "agent".into(),
+                "msg".into(),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("manifest"));
     }
 }

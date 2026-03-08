@@ -47,6 +47,21 @@ impl RefsStore {
         Ok(())
     }
 
+    pub fn head_compare_and_set(
+        &self,
+        name: &str,
+        expected: Option<Hash>,
+        new_hash: Hash,
+    ) -> Result<bool> {
+        self.compare_and_set(
+            name,
+            expected,
+            new_hash,
+            WalOp::RefHeadSet,
+            self.head_path(name),
+        )
+    }
+
     pub fn state_get(&self, name: &str) -> Result<Option<Hash>> {
         validate_ref_name(name)?;
         read_hash(self.state_path(name))
@@ -63,6 +78,21 @@ impl RefsStore {
         write_atomic(&self.state_path(name), format!("{hash}\n").as_bytes())?;
         self.wal.end(&wal_path)?;
         Ok(())
+    }
+
+    pub fn state_compare_and_set(
+        &self,
+        name: &str,
+        expected: Option<Hash>,
+        new_hash: Hash,
+    ) -> Result<bool> {
+        self.compare_and_set(
+            name,
+            expected,
+            new_hash,
+            WalOp::RefStateSet,
+            self.state_path(name),
+        )
     }
 
     pub fn root(&self) -> &PathBuf {
@@ -83,6 +113,30 @@ impl RefsStore {
 
     fn state_path(&self, name: &str) -> PathBuf {
         self.states_dir().join(name)
+    }
+
+    fn compare_and_set(
+        &self,
+        name: &str,
+        expected: Option<Hash>,
+        new_hash: Hash,
+        wal_op: WalOp,
+        path: PathBuf,
+    ) -> Result<bool> {
+        validate_ref_name(name)?;
+        self.ensure_dirs()?;
+
+        let _lock = acquire_lock(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        let current = read_hash(path.clone())?;
+        if current != expected {
+            return Ok(false);
+        }
+
+        let entry = Wal::make_ref_entry(wal_op, name, new_hash);
+        let wal_path = self.wal.begin_entry(&entry)?;
+        write_atomic(&path, format!("{new_hash}\n").as_bytes())?;
+        self.wal.end(&wal_path)?;
+        Ok(true)
     }
 }
 
@@ -193,5 +247,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         assert_eq!(s.state_get("dev").unwrap(), None);
+    }
+
+    #[test]
+    fn state_compare_and_set_succeeds_on_match() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let a = hash_blob(b"a");
+        let b = hash_blob(b"b");
+        s.state_set("main", a).unwrap();
+        let ok = s.state_compare_and_set("main", Some(a), b).unwrap();
+        assert!(ok);
+        assert_eq!(s.state_get("main").unwrap(), Some(b));
+    }
+
+    #[test]
+    fn head_compare_and_set_fails_on_mismatch() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let a = hash_blob(b"a");
+        let b = hash_blob(b"b");
+        s.head_set("main", a).unwrap();
+        let ok = s.head_compare_and_set("main", Some(b), b).unwrap();
+        assert!(!ok);
+        assert_eq!(s.head_get("main").unwrap(), Some(a));
     }
 }

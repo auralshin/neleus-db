@@ -218,6 +218,28 @@ Canonical encoding:
 - optional verify-on-read mode for blobs and typed objects
 - authenticated encryption support for persisted payloads
 
+To enable encryption at rest, set `meta/config.json` with an enabled encryption block and provide
+`NELEUS_DB_ENCRYPTION_PASSWORD` when running the CLI.
+
+Example config snippet:
+
+```json
+{
+  "schema_version": 3,
+  "hashing": "blake3",
+  "verify_on_read": true,
+  "encryption": {
+    "enabled": true,
+    "algorithm": "aes-256-gcm",
+    "kdf": "pbkdf2",
+    "key_size": 32,
+    "salt_size": 16,
+    "nonce_size": 12,
+    "kdf_iterations": 210000
+  }
+}
+```
+
 ## Testing
 
 ```bash

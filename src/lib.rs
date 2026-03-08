@@ -19,7 +19,7 @@ pub mod wal;
 pub use blob_store::BlobStore;
 pub use commit::{Commit, CommitHash, CommitStore};
 pub use db::Database;
-pub use encryption::{EncryptionConfig, EncryptionManager, EncryptionProvider};
+pub use encryption::{EncryptionConfig, EncryptionManager, EncryptionProvider, EncryptionRuntime};
 pub use hash::Hash;
 pub use manifest::{DocManifest, ManifestStore, RunManifest};
 pub use provenance::{Evidence, ProvenanceManifest, ProvenanceRecord, SourceType};

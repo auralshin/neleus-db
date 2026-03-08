@@ -293,10 +293,8 @@ fn main() -> Result<()> {
                     key_encoding,
                 } => {
                     let key_bytes = decode_key(&key, &key_encoding)?;
-                    let base_root = resolve_state_root(&db, &head)?;
                     let value = fs::read(value_file.clone())?;
-                    let new_root = db.state_store.set(base_root, &key_bytes, &value)?;
-                    db.refs.state_set(&head, new_root)?;
+                    let new_root = db.state_set_at_head(&head, &key_bytes, &value)?;
                     emit(
                         json_output,
                         serde_json::json!({"state_root": new_root.to_string(), "head": head}),
@@ -353,9 +351,7 @@ fn main() -> Result<()> {
                     key_encoding,
                 } => {
                     let key_bytes = decode_key(&key, &key_encoding)?;
-                    let base_root = resolve_state_root(&db, &head)?;
-                    let new_root = db.state_store.del(base_root, &key_bytes)?;
-                    db.refs.state_set(&head, new_root)?;
+                    let new_root = db.state_del_at_head(&head, &key_bytes)?;
                     emit(
                         json_output,
                         serde_json::json!({"state_root": new_root.to_string(), "head": head}),
@@ -363,9 +359,7 @@ fn main() -> Result<()> {
                     )?;
                 }
                 StateCommands::Compact { head } => {
-                    let base_root = resolve_state_root(&db, &head)?;
-                    let compacted = db.state_store.compact(base_root)?;
-                    db.refs.state_set(&head, compacted)?;
+                    let compacted = db.state_compact_at_head(&head)?;
                     emit(
                         json_output,
                         serde_json::json!({"state_root": compacted.to_string(), "head": head}),
@@ -383,23 +377,12 @@ fn main() -> Result<()> {
                     message,
                     manifests,
                 } => {
-                    let parent = db.refs.head_get(&head)?;
-                    let parents = parent.into_iter().collect::<Vec<_>>();
-                    let state_root = resolve_state_root(&db, &head)?;
                     let manifest_hashes = manifests
                         .into_iter()
                         .map(|m| m.parse::<Hash>())
                         .collect::<Result<Vec<_>, _>>()?;
-
-                    let commit_hash = db.commit_store.create_commit(
-                        parents,
-                        state_root,
-                        manifest_hashes,
-                        author,
-                        message,
-                    )?;
-                    db.refs.head_set(&head, commit_hash)?;
-                    db.refs.state_set(&head, state_root)?;
+                    let commit_hash =
+                        db.create_commit_at_head(&head, &author, &message, manifest_hashes)?;
                     emit(
                         json_output,
                         serde_json::json!({"commit_hash": commit_hash.to_string(), "head": head}),
@@ -438,12 +421,7 @@ fn main() -> Result<()> {
                 } => {
                     let q = resolve_query_text(query, query_file)?;
                     let commit = resolve_head_commit(&db, &head)?;
-                    let _ = db.index_store.build_for_head(
-                        commit,
-                        &db.commit_store,
-                        &db.manifest_store,
-                        &db.blob_store,
-                    )?;
+                    db.ensure_index_ready(commit)?;
                     let hits = db.index_store.semantic_search(commit, &q, top_k)?;
                     emit_hits(json_output, "semantic", &head, commit, &hits)?;
                 }
@@ -453,12 +431,7 @@ fn main() -> Result<()> {
                     top_k,
                 } => {
                     let commit = resolve_head_commit(&db, &head)?;
-                    let _ = db.index_store.build_for_head(
-                        commit,
-                        &db.commit_store,
-                        &db.manifest_store,
-                        &db.blob_store,
-                    )?;
+                    db.ensure_index_ready(commit)?;
                     let bytes = fs::read(embedding_file)?;
                     let query_vec = SearchIndexStore::parse_embedding(&bytes)?;
                     let hits = db.index_store.vector_search(commit, &query_vec, top_k)?;
@@ -536,16 +509,7 @@ fn main() -> Result<()> {
 }
 
 fn resolve_state_root(db: &Database, head: &str) -> Result<Hash> {
-    if let Some(staged) = db.refs.state_get(head)? {
-        return Ok(staged);
-    }
-
-    if let Some(commit_hash) = db.refs.head_get(head)? {
-        let commit = db.commit_store.get_commit(commit_hash)?;
-        return Ok(commit.state_root);
-    }
-
-    db.state_store.empty_root()
+    db.resolve_state_root(head)
 }
 
 fn resolve_head_commit(db: &Database, head: &str) -> Result<Hash> {

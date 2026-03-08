@@ -5,9 +5,10 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     pub algorithm: String,
@@ -191,6 +192,57 @@ impl EncryptionManager {
     }
 }
 
+#[derive(Clone)]
+pub struct EncryptionRuntime {
+    manager: Arc<EncryptionManager>,
+    password: Arc<String>,
+}
+
+impl std::fmt::Debug for EncryptionRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionRuntime")
+            .field("enabled", &self.manager.is_enabled())
+            .field("algorithm", &self.manager.config().algorithm)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+impl EncryptionRuntime {
+    pub fn from_config(config: EncryptionConfig, password: String) -> Result<Self> {
+        if !config.enabled {
+            return Err(anyhow!(
+                "encryption runtime requires enabled encryption config"
+            ));
+        }
+        if password.is_empty() {
+            return Err(anyhow!("encryption password cannot be empty"));
+        }
+
+        let manager = EncryptionManager::from_config(config)?;
+        Ok(Self {
+            manager: Arc::new(manager),
+            password: Arc::new(password),
+        })
+    }
+
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.manager.encrypt(plaintext, self.password.as_str())
+    }
+
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        self.manager.decrypt(ciphertext, self.password.as_str())
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.manager.is_enabled()
+    }
+
+    pub fn algorithm(&self) -> &str {
+        self.manager.config().algorithm.as_str()
+    }
+}
+
 pub struct Aes256GcmEncryption {
     config: EncryptionConfig,
 }
@@ -214,8 +266,8 @@ impl EncryptionProvider for Aes256GcmEncryption {
             self.config.key_size,
         )?;
 
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| anyhow!("invalid AES-256-GCM key size"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-256-GCM key size"))?;
         let nonce_ref = AesNonce::from_slice(&nonce);
 
         let ciphertext = cipher
@@ -270,13 +322,15 @@ impl EncryptionProvider for Aes256GcmEncryption {
             self.config.key_size,
         )?;
 
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|_| anyhow!("invalid AES-256-GCM key size"))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&key).map_err(|_| anyhow!("invalid AES-256-GCM key size"))?;
         let nonce_ref = AesNonce::from_slice(&encrypted.nonce);
 
         cipher
             .decrypt(nonce_ref, encrypted.ciphertext.as_ref())
-            .map_err(|_| anyhow!("AES-256-GCM authentication failed (wrong password or tampered data)"))
+            .map_err(|_| {
+                anyhow!("AES-256-GCM authentication failed (wrong password or tampered data)")
+            })
     }
 
     fn algorithm(&self) -> &str {
@@ -419,7 +473,10 @@ fn derive_key(
 
     match kdf.to_ascii_lowercase().as_str() {
         "pbkdf2" => utils::derive_key_pbkdf2(password, salt, iterations, key_size),
-        other => Err(anyhow!("unsupported kdf '{}'; only pbkdf2 is supported", other)),
+        other => Err(anyhow!(
+            "unsupported kdf '{}'; only pbkdf2 is supported",
+            other
+        )),
     }
 }
 
@@ -616,5 +673,23 @@ mod tests {
         let mut config = enabled_aes_config();
         config.kdf_iterations = 100;
         assert!(Aes256GcmEncryption::new(config).is_err());
+    }
+
+    #[test]
+    fn runtime_encrypt_decrypt_roundtrip() {
+        let runtime =
+            EncryptionRuntime::from_config(enabled_aes_config(), "strong-password".into()).unwrap();
+        let plaintext = b"runtime payload";
+        let ciphertext = runtime.encrypt(plaintext).unwrap();
+        let decrypted = runtime.decrypt(&ciphertext).unwrap();
+        assert_eq!(plaintext, &decrypted[..]);
+        assert!(runtime.is_enabled());
+        assert_eq!(runtime.algorithm(), "aes-256-gcm");
+    }
+
+    #[test]
+    fn runtime_requires_password() {
+        let err = EncryptionRuntime::from_config(enabled_aes_config(), "".into()).unwrap_err();
+        assert!(err.to_string().contains("password"));
     }
 }
