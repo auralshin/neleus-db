@@ -6,10 +6,13 @@ use anyhow::{Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand, ValueEnum};
+use neleus_db::canonical::from_cbor;
+use neleus_db::commit::Commit;
 use neleus_db::db::Database;
 use neleus_db::hash::Hash;
 use neleus_db::index::{SearchHit, SearchIndexStore};
-use neleus_db::manifest::{ChunkingSpec, RunManifest, now_unix};
+use neleus_db::manifest::{ChunkManifest, ChunkingSpec, DocManifest, RunManifest, now_unix};
+use neleus_db::state::{StateManifest, StateSegment};
 
 #[derive(Debug, Parser)]
 #[command(name = "neleus-db")]
@@ -62,11 +65,22 @@ enum Commands {
         #[command(subcommand)]
         command: ProofCommands,
     },
+    Object {
+        #[command(subcommand)]
+        command: ObjectCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum DbCommands {
     Init { path: PathBuf },
+    /// Re-encrypt all blobs and objects with a new password.
+    /// The new password is read from the environment variable given by --new-password-env.
+    /// The current password must still be set in NELEUS_DB_ENCRYPTION_PASSWORD.
+    Reencrypt {
+        #[arg(long, default_value = "NELEUS_DB_NEW_ENCRYPTION_PASSWORD")]
+        new_password_env: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -123,6 +137,18 @@ enum StateCommands {
     Compact {
         head: String,
     },
+    /// Apply multiple key-value writes in one segment from a JSON file.
+    /// The file must be a JSON array: [{"key": "<utf8>", "value_base64": "<base64>"}]
+    SetMany {
+        head: String,
+        entries_file: PathBuf,
+    },
+    /// Tombstone multiple keys in one segment from a JSON file.
+    /// The file must be a JSON array of UTF-8 key strings: ["key1", "key2"]
+    DelMany {
+        head: String,
+        keys_file: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -152,6 +178,16 @@ enum IndexCommands {
         #[arg(long)]
         head: String,
     },
+    Stats {
+        #[arg(long)]
+        head: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ObjectCommands {
+    /// Inspect a raw object by hash, attempting to decode it as known types.
+    Inspect { hash: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -202,6 +238,18 @@ fn main() -> Result<()> {
                     json_output,
                     serde_json::json!({"status": "ok", "path": path}),
                     "initialized",
+                )?;
+            }
+            DbCommands::Reencrypt { new_password_env } => {
+                let new_password = std::env::var(&new_password_env).map_err(|_| {
+                    anyhow!("environment variable {new_password_env} is not set")
+                })?;
+                let db = Database::open(&db_path)?;
+                let count = db.rotate_encryption_key(&new_password)?;
+                emit(
+                    json_output,
+                    serde_json::json!({"status": "ok", "files_reencrypted": count}),
+                    &format!("reencrypted {count} files"),
                 )?;
             }
         },
@@ -366,6 +414,45 @@ fn main() -> Result<()> {
                         &compacted.to_string(),
                     )?;
                 }
+                StateCommands::SetMany { head, entries_file } => {
+                    #[derive(serde::Deserialize)]
+                    struct Entry {
+                        key: String,
+                        value_base64: String,
+                    }
+                    let raw = fs::read(entries_file)?;
+                    let entries: Vec<Entry> = serde_json::from_slice(&raw)?;
+                    let decoded: Vec<(Vec<u8>, Vec<u8>)> = entries
+                        .iter()
+                        .map(|e| {
+                            let v = BASE64.decode(e.value_base64.as_bytes())?;
+                            Ok((e.key.as_bytes().to_vec(), v))
+                        })
+                        .collect::<Result<_>>()?;
+                    let pairs: Vec<(&[u8], &[u8])> = decoded
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect();
+                    let new_root = db.state_set_many_at_head(&head, &pairs)?;
+                    emit(
+                        json_output,
+                        serde_json::json!({"state_root": new_root.to_string(), "head": head, "count": pairs.len()}),
+                        &new_root.to_string(),
+                    )?;
+                }
+                StateCommands::DelMany { head, keys_file } => {
+                    let raw = fs::read(keys_file)?;
+                    let key_strs: Vec<String> = serde_json::from_slice(&raw)?;
+                    let key_bytes: Vec<Vec<u8>> =
+                        key_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
+                    let keys: Vec<&[u8]> = key_bytes.iter().map(|k| k.as_slice()).collect();
+                    let new_root = db.state_del_many_at_head(&head, &keys)?;
+                    emit(
+                        json_output,
+                        serde_json::json!({"state_root": new_root.to_string(), "head": head, "count": keys.len()}),
+                        &new_root.to_string(),
+                    )?;
+                }
             }
         }
         Commands::Commit { command } => {
@@ -406,6 +493,36 @@ fn main() -> Result<()> {
                         json_output,
                         serde_json::json!({"head": head, "commit": commit.to_string(), "index_version": index_hash.to_string()}),
                         &index_hash.to_string(),
+                    )?;
+                }
+                IndexCommands::Stats { head } => {
+                    let commit = resolve_head_commit(&db, &head)?;
+                    db.ensure_index_ready(commit)?;
+                    let idx = db.index_store.read_index(commit)?;
+                    let total_terms = idx.semantic_postings.len();
+                    let chunks_with_embeddings =
+                        idx.chunks.iter().filter(|c| c.embedding.is_some()).count();
+                    emit(
+                        json_output,
+                        serde_json::json!({
+                            "head": head,
+                            "commit": commit.to_string(),
+                            "schema_version": idx.schema_version,
+                            "built_at": idx.built_at,
+                            "chunks": idx.chunks.len(),
+                            "chunks_with_embeddings": chunks_with_embeddings,
+                            "semantic_docs": idx.semantic_docs,
+                            "avg_doc_len": idx.avg_doc_len,
+                            "unique_terms": total_terms,
+                            "vector_dim": idx.vector_dim,
+                        }),
+                        &format!(
+                            "chunks={} terms={} embeddings={} vector_dim={:?}",
+                            idx.chunks.len(),
+                            total_terms,
+                            chunks_with_embeddings,
+                            idx.vector_dim
+                        ),
                     )?;
                 }
             }
@@ -498,6 +615,16 @@ fn main() -> Result<()> {
                         "proof": proof,
                         "verified": verified,
                     });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+            }
+        }
+        Commands::Object { command } => {
+            let db = Database::open(&db_path)?;
+            match command {
+                ObjectCommands::Inspect { hash } => {
+                    let h: Hash = hash.parse()?;
+                    let out = inspect_object(&db, h)?;
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }
             }
@@ -606,4 +733,79 @@ fn to_hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{b:02x}"));
     }
     out
+}
+
+/// Try to decode an object by hash as each known typed structure.
+/// Returns a JSON value with a "kind" field and the decoded content.
+fn inspect_object(db: &Database, hash: Hash) -> Result<serde_json::Value> {
+    // Try blob store first (raw bytes).
+    if db.blob_store.exists(hash) {
+        let bytes = db.blob_store.get(hash)?;
+        let text = String::from_utf8(bytes.clone()).ok();
+        return Ok(serde_json::json!({
+            "kind": "blob",
+            "hash": hash.to_string(),
+            "bytes": bytes.len(),
+            "utf8": text,
+            "hex_preview": to_hex(&bytes[..bytes.len().min(64)]),
+        }));
+    }
+
+    // Try object store — each known CBOR type.
+    if db.object_store.exists(hash) {
+        let raw = db.object_store.get_bytes(hash)?;
+
+        if let Ok(obj) = from_cbor::<Commit>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "commit",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+        if let Ok(obj) = from_cbor::<DocManifest>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "doc_manifest",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+        if let Ok(obj) = from_cbor::<RunManifest>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "run_manifest",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+        if let Ok(obj) = from_cbor::<ChunkManifest>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "chunk_manifest",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+        if let Ok(obj) = from_cbor::<StateManifest>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "state_manifest",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+        if let Ok(obj) = from_cbor::<StateSegment>(&raw) {
+            return Ok(serde_json::json!({
+                "kind": "state_segment",
+                "hash": hash.to_string(),
+                "object": obj,
+            }));
+        }
+
+        // Unknown object type — return raw bytes info.
+        return Ok(serde_json::json!({
+            "kind": "unknown_object",
+            "hash": hash.to_string(),
+            "bytes": raw.len(),
+            "hex_preview": to_hex(&raw[..raw.len().min(64)]),
+        }));
+    }
+
+    Err(anyhow!("hash {} not found in blob or object store", hash))
 }

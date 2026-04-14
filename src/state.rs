@@ -182,6 +182,89 @@ impl StateStore {
         result
     }
 
+    /// Set multiple key-value pairs atomically in a single segment.
+    /// Duplicate keys are resolved last-write-wins (stable sort preserves order,
+    /// then dedup keeps the last occurrence so the caller's ordering matters).
+    pub fn set_many(&self, root: StateRoot, pairs: &[(&[u8], &[u8])]) -> Result<StateRoot> {
+        if pairs.is_empty() {
+            return Ok(root);
+        }
+
+        let wal_path =
+            self.wal
+                .begin_entry(&Wal::make_state_entry(WalOp::StateSet, root, pairs.len()))?;
+
+        let result = (|| {
+            let manifest = self.load_manifest_or_empty(root)?;
+
+            // Deduplicate: last occurrence for each key wins.
+            let mut deduped: BTreeMap<Vec<u8>, &[u8]> = BTreeMap::new();
+            for (k, v) in pairs {
+                deduped.insert(k.to_vec(), v);
+            }
+
+            let mut entries = Vec::with_capacity(deduped.len());
+            for (key, value) in deduped {
+                let value_hash = self.blobs.put(value)?;
+                entries.push(SegmentEntry {
+                    key,
+                    value: ValueRef::Value(value_hash),
+                });
+            }
+
+            let segment = StateSegment::from_entries(entries)?;
+            let segment_hash = self.store_segment(&segment)?;
+            let new_manifest =
+                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
+            self.store_manifest(&new_manifest)
+        })();
+
+        if result.is_ok() {
+            self.wal.end(&wal_path)?;
+        }
+        result
+    }
+
+    /// Delete multiple keys atomically in a single tombstone segment.
+    pub fn del_many(&self, root: StateRoot, keys: &[&[u8]]) -> Result<StateRoot> {
+        if keys.is_empty() {
+            return Ok(root);
+        }
+
+        let wal_path =
+            self.wal
+                .begin_entry(&Wal::make_state_entry(WalOp::StateDel, root, keys.len()))?;
+
+        let result = (|| {
+            let manifest = self.load_manifest_or_empty(root)?;
+
+            // Deduplicate keys via BTreeSet.
+            let mut unique: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+            for k in keys {
+                unique.insert(k.to_vec());
+            }
+
+            let entries = unique
+                .into_iter()
+                .map(|key| SegmentEntry {
+                    key,
+                    value: ValueRef::Tombstone,
+                })
+                .collect();
+
+            let segment = StateSegment::from_entries(entries)?;
+            let segment_hash = self.store_segment(&segment)?;
+            let new_manifest =
+                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
+            self.store_manifest(&new_manifest)
+        })();
+
+        if result.is_ok() {
+            self.wal.end(&wal_path)?;
+        }
+        result
+    }
+
     pub fn compact(&self, root: StateRoot) -> Result<StateRoot> {
         let wal_path =
             self.wal
@@ -966,4 +1049,124 @@ mod tests {
     prop_test!(property_random_ops_seed_8, 8);
     prop_test!(property_random_ops_seed_9, 9);
     prop_test!(property_random_ops_seed_10, 10);
+
+    mod proptest_suite {
+        use proptest::prelude::*;
+        use tempfile::TempDir;
+
+        use super::*;
+
+        fn fresh_store() -> (TempDir, StateStore) {
+            let tmp = TempDir::new().unwrap();
+            let s = store(&tmp);
+            (tmp, s)
+        }
+
+        proptest! {
+            /// For any sequence of unique keys, set_many must make all of them readable.
+            #[test]
+            fn set_many_all_readable(
+                pairs in proptest::collection::vec(
+                    (proptest::collection::vec(any::<u8>(), 1..16),
+                     proptest::collection::vec(any::<u8>(), 1..32)),
+                    1..20,
+                )
+            ) {
+                // Deduplicate keys so the last one wins (mirrors set_many semantics).
+                use std::collections::BTreeMap;
+                let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+                for (k, v) in &pairs {
+                    map.insert(k.clone(), v.clone());
+                }
+
+                let (_tmp, s) = fresh_store();
+                let root0 = s.empty_root().unwrap();
+                let pairs_ref: Vec<(&[u8], &[u8])> = map
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect();
+                let root1 = s.set_many(root0, &pairs_ref).unwrap();
+
+                for (k, expected_v) in &map {
+                    let got = s.get(root1, k.as_slice()).unwrap();
+                    prop_assert_eq!(got.as_deref(), Some(expected_v.as_slice()));
+                }
+            }
+
+            /// del_many must remove exactly the specified keys without touching others.
+            #[test]
+            fn del_many_removes_specified_keys(
+                all_keys in proptest::collection::vec(
+                    proptest::collection::vec(any::<u8>(), 1..12),
+                    2..16,
+                )
+            ) {
+                use std::collections::BTreeSet;
+                // Deduplicate keys.
+                let unique: BTreeSet<Vec<u8>> = all_keys.into_iter().collect();
+                if unique.len() < 2 {
+                    return Ok(());
+                }
+                let keys: Vec<Vec<u8>> = unique.into_iter().collect();
+
+                let (_tmp, s) = fresh_store();
+                let mut root = s.empty_root().unwrap();
+
+                // Set all keys.
+                for k in &keys {
+                    root = s.set(root, k, b"value").unwrap();
+                }
+
+                // Delete the first half.
+                let (to_delete, to_keep) = keys.split_at(keys.len() / 2);
+                let del_refs: Vec<&[u8]> = to_delete.iter().map(|k| k.as_slice()).collect();
+                root = s.del_many(root, &del_refs).unwrap();
+
+                for k in to_delete {
+                    prop_assert_eq!(s.get(root, k).unwrap(), None, "key {:?} should be deleted", k);
+                }
+                for k in to_keep {
+                    let val = s.get(root, k).unwrap();
+                    prop_assert_eq!(
+                        val.as_deref(),
+                        Some(b"value".as_slice()),
+                        "key {:?} should still be present",
+                        k
+                    );
+                }
+            }
+
+            /// Every state proof must self-verify after arbitrary set operations.
+            #[test]
+            fn proofs_always_verify(
+                ops in proptest::collection::vec(
+                    (proptest::collection::vec(b'a'..=b'z', 1..8),
+                     proptest::collection::vec(any::<u8>(), 1..16),
+                     any::<bool>()),
+                    1..15,
+                )
+            ) {
+                let (_tmp, s) = fresh_store();
+                let mut root = s.empty_root().unwrap();
+
+                for (k, v, is_del) in &ops {
+                    if *is_del {
+                        root = s.del(root, k).unwrap();
+                    } else {
+                        root = s.set(root, k, v).unwrap();
+                    }
+                }
+
+                // Probe every key that was ever touched.
+                for (k, _, _) in &ops {
+                    let proof = s.proof(root, k).unwrap();
+                    prop_assert!(
+                        s.verify_proof(root, k, &proof),
+                        "proof failed for key {:?}",
+                        k
+                    );
+                }
+            }
+        }
+    }
 }

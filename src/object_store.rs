@@ -6,6 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use crate::canonical::{from_cbor, to_cbor};
 use crate::cas::CasStore;
+use crate::compression;
 use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_typed};
 
@@ -13,6 +14,7 @@ use crate::hash::{Hash, hash_typed};
 pub struct ObjectStore {
     cas: CasStore,
     verify_on_read: bool,
+    compress: bool,
     encryption: Option<Arc<EncryptionRuntime>>,
 }
 
@@ -21,22 +23,25 @@ impl ObjectStore {
         Self {
             cas: CasStore::new(root),
             verify_on_read: false,
+            compress: false,
             encryption: None,
         }
     }
 
     pub fn with_options(root: impl Into<PathBuf>, verify_on_read: bool) -> Self {
-        Self::with_runtime_options(root, verify_on_read, None)
+        Self::with_runtime_options(root, verify_on_read, false, None)
     }
 
     pub fn with_runtime_options(
         root: impl Into<PathBuf>,
         verify_on_read: bool,
+        compress: bool,
         encryption: Option<Arc<EncryptionRuntime>>,
     ) -> Self {
         Self {
             cas: CasStore::new(root),
             verify_on_read,
+            compress,
             encryption,
         }
     }
@@ -45,15 +50,25 @@ impl ObjectStore {
         self.verify_on_read
     }
 
+    pub fn compress(&self) -> bool {
+        self.compress
+    }
+
     pub fn ensure_dir(&self) -> Result<()> {
         self.cas.ensure_dir()
     }
 
     pub fn put_typed_bytes(&self, tag: &[u8], bytes: &[u8]) -> Result<Hash> {
+        // Hash is always over the canonical (uncompressed, unencrypted) bytes.
         let hash = hash_typed(tag, bytes);
+        let after_compress: Vec<u8> = if self.compress {
+            compression::compress(bytes)?
+        } else {
+            bytes.to_vec()
+        };
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(bytes)?,
-            None => bytes.to_vec(),
+            Some(runtime) => runtime.encrypt(&after_compress)?,
+            None => after_compress,
         };
         self.cas.put_existing_hash(hash, &stored)?;
         Ok(hash)
@@ -61,18 +76,20 @@ impl ObjectStore {
 
     pub fn get_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
-        match &self.encryption {
-            Some(runtime) => runtime.decrypt(&raw),
-            None => Ok(raw),
-        }
+        let after_decrypt = match &self.encryption {
+            Some(runtime) => runtime.decrypt(&raw)?,
+            None => raw,
+        };
+        compression::decompress_if_compressed(&after_decrypt)
     }
 
     pub fn get_typed_bytes(&self, tag: &[u8], hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
-        let bytes = match &self.encryption {
+        let after_decrypt = match &self.encryption {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
+        let bytes = compression::decompress_if_compressed(&after_decrypt)?;
         if self.verify_on_read {
             let computed = hash_typed(tag, &bytes);
             if computed != hash {
