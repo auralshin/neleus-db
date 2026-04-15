@@ -89,19 +89,66 @@ impl SearchIndexStore {
     ) -> Result<IndexVersionHash> {
         self.ensure_dir()?;
 
-        let commit = commit_store.get_commit(head)?;
-        let mut chunks: BTreeMap<Hash, IndexChunk> = BTreeMap::new();
-
-        for manifest_hash in commit.manifests {
-            if let Ok(doc) = manifest_store.get_doc_manifest(manifest_hash) {
-                self.add_doc_chunks(&doc, blob_store, &mut chunks)?;
-            }
-            if let Ok(chunk_manifest) = manifest_store.get_chunk_manifest(manifest_hash) {
-                self.add_chunk_manifest(&chunk_manifest, blob_store, &mut chunks)?;
-            }
+        // Return early if the index for this exact commit already exists.
+        if let Ok(existing) = self.read_index(head) {
+            return Ok(hash_typed(INDEX_TAG, &serde_json::to_vec(&existing)?));
         }
 
-        let mut chunk_vec: Vec<IndexChunk> = chunks.into_values().collect();
+        let commit = commit_store.get_commit(head)?;
+
+        // Attempt an incremental build: if this commit has exactly one parent,
+        // that parent's index exists, and the current commit's manifest set is
+        // a *superset* of the parent's (i.e. no manifests were removed), we can
+        // seed from the parent index and only ingest the new manifests.
+        //
+        // If any manifests were removed we fall back to a full rebuild to avoid
+        // carrying stale chunks from manifests that no longer belong to this commit.
+        let chunks: BTreeMap<Hash, IndexChunk> = if let Some(&parent_hash) =
+            commit.parents.first()
+        {
+            if let Ok(parent_index) = self.read_index(parent_hash) {
+                let parent_commit = commit_store.get_commit(parent_hash)?;
+                let parent_manifest_set: BTreeSet<Hash> =
+                    parent_commit.manifests.iter().copied().collect();
+                let current_manifest_set: BTreeSet<Hash> =
+                    commit.manifests.iter().copied().collect();
+
+                // Only use incremental path when the current set is a superset of parent.
+                if parent_manifest_set.is_subset(&current_manifest_set) {
+                    // Seed chunks from the parent index.
+                    let mut c: BTreeMap<Hash, IndexChunk> = parent_index
+                        .chunks
+                        .into_iter()
+                        .map(|ch| (ch.chunk_hash, ch))
+                        .collect();
+
+                    // Ingest only manifests that are genuinely new in this commit.
+                    for manifest_hash in &commit.manifests {
+                        if parent_manifest_set.contains(manifest_hash) {
+                            continue;
+                        }
+                        if let Ok(doc) = manifest_store.get_doc_manifest(*manifest_hash) {
+                            self.add_doc_chunks(&doc, blob_store, &mut c)?;
+                        }
+                        if let Ok(chunk_manifest) =
+                            manifest_store.get_chunk_manifest(*manifest_hash)
+                        {
+                            self.add_chunk_manifest(&chunk_manifest, blob_store, &mut c)?;
+                        }
+                    }
+                    c
+                } else {
+                    // Manifests were removed — full rebuild to avoid stale chunks.
+                    self.ingest_all_manifests(&commit.manifests, manifest_store, blob_store)?
+                }
+            } else {
+                self.ingest_all_manifests(&commit.manifests, manifest_store, blob_store)?
+            }
+        } else {
+            self.ingest_all_manifests(&commit.manifests, manifest_store, blob_store)?
+        };
+
+        let mut chunk_vec: Vec<IndexChunk> = chunks.values().cloned().collect();
         chunk_vec.sort_by(|a, b| a.chunk_hash.cmp(&b.chunk_hash));
 
         let (semantic_docs, avg_doc_len, semantic_doc_len, semantic_doc_freq, semantic_postings) =
@@ -125,6 +172,25 @@ impl SearchIndexStore {
         };
 
         self.write_index(&index)
+    }
+
+    /// Ingest all manifests from a commit from scratch.
+    fn ingest_all_manifests(
+        &self,
+        manifests: &[Hash],
+        manifest_store: &ManifestStore,
+        blob_store: &BlobStore,
+    ) -> Result<BTreeMap<Hash, IndexChunk>> {
+        let mut chunks: BTreeMap<Hash, IndexChunk> = BTreeMap::new();
+        for manifest_hash in manifests {
+            if let Ok(doc) = manifest_store.get_doc_manifest(*manifest_hash) {
+                self.add_doc_chunks(&doc, blob_store, &mut chunks)?;
+            }
+            if let Ok(chunk_manifest) = manifest_store.get_chunk_manifest(*manifest_hash) {
+                self.add_chunk_manifest(&chunk_manifest, blob_store, &mut chunks)?;
+            }
+        }
+        Ok(chunks)
     }
 
     pub fn read_index(&self, commit: CommitHash) -> Result<SearchIndex> {

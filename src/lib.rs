@@ -2,6 +2,7 @@ pub mod atomic;
 pub mod blob_store;
 pub mod canonical;
 pub mod cas;
+pub mod compression;
 pub mod commit;
 pub mod db;
 pub mod encryption;

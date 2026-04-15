@@ -118,6 +118,58 @@ mod tests {
     use super::*;
     use crate::hash::hash_typed;
 
+    #[cfg(test)]
+    mod prop_tests {
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::hash::hash_typed;
+
+        fn make_leaves(count: usize) -> Vec<Hash> {
+            (0..count)
+                .map(|i| hash_typed(b"leaf:", &(i as u64).to_le_bytes()))
+                .collect()
+        }
+
+        proptest! {
+            /// For any non-empty leaf list, every leaf's inclusion proof must verify
+            /// against the root computed from the same leaf list.
+            #[test]
+            fn all_leaves_prove_against_their_root(count in 1usize..=64) {
+                let leaves = make_leaves(count);
+                let r = root(&leaves);
+                for (idx, leaf) in leaves.iter().enumerate() {
+                    let proof = prove_inclusion(&leaves, idx).unwrap();
+                    prop_assert!(
+                        verify_inclusion(r, *leaf, &proof),
+                        "proof failed for index {idx} in {count}-leaf tree"
+                    );
+                }
+            }
+
+            /// Modifying any leaf changes the root.
+            #[test]
+            fn different_leaf_set_produces_different_root(count in 2usize..=32) {
+                let leaves_a = make_leaves(count);
+                let mut leaves_b = leaves_a.clone();
+                // Flip the last leaf to something different.
+                *leaves_b.last_mut().unwrap() = hash_typed(b"leaf:", b"changed");
+                prop_assert_ne!(root(&leaves_a), root(&leaves_b));
+            }
+
+            /// A proof from one leaf list does not verify against a different leaf.
+            #[test]
+            fn proof_does_not_verify_wrong_leaf(count in 2usize..=32) {
+                let leaves = make_leaves(count);
+                let r = root(&leaves);
+                let proof = prove_inclusion(&leaves, 0).unwrap();
+                let wrong_leaf = hash_typed(b"leaf:", b"impostor");
+                // The wrong leaf should (overwhelmingly) fail.
+                prop_assert!(!verify_inclusion(r, wrong_leaf, &proof));
+            }
+        }
+    }
+
     fn hs(n: u8) -> Hash {
         hash_typed(b"leaf:", &[n])
     }

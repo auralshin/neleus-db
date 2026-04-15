@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 
 use crate::cas::CasStore;
+use crate::compression;
 use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_blob};
 
@@ -12,6 +13,7 @@ pub struct BlobStore {
     pub root: PathBuf,
     cas: CasStore,
     verify_on_read: bool,
+    compress: bool,
     encryption: Option<Arc<EncryptionRuntime>>,
 }
 
@@ -22,17 +24,19 @@ impl BlobStore {
             root: root.clone(),
             cas: CasStore::new(root),
             verify_on_read: false,
+            compress: false,
             encryption: None,
         }
     }
 
     pub fn with_options(root: impl Into<PathBuf>, verify_on_read: bool) -> Self {
-        Self::with_runtime_options(root, verify_on_read, None)
+        Self::with_runtime_options(root, verify_on_read, false, None)
     }
 
     pub fn with_runtime_options(
         root: impl Into<PathBuf>,
         verify_on_read: bool,
+        compress: bool,
         encryption: Option<Arc<EncryptionRuntime>>,
     ) -> Self {
         let root = root.into();
@@ -40,6 +44,7 @@ impl BlobStore {
             root: root.clone(),
             cas: CasStore::new(root),
             verify_on_read,
+            compress,
             encryption,
         }
     }
@@ -48,15 +53,25 @@ impl BlobStore {
         self.verify_on_read
     }
 
+    pub fn compress(&self) -> bool {
+        self.compress
+    }
+
     pub fn ensure_dir(&self) -> Result<()> {
         self.cas.ensure_dir()
     }
 
     pub fn put(&self, bytes: &[u8]) -> Result<Hash> {
+        // Hash is always over the original (uncompressed, unencrypted) bytes.
         let hash = hash_blob(bytes);
+        let after_compress: Vec<u8> = if self.compress {
+            compression::compress(bytes)?
+        } else {
+            bytes.to_vec()
+        };
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(bytes)?,
-            None => bytes.to_vec(),
+            Some(runtime) => runtime.encrypt(&after_compress)?,
+            None => after_compress,
         };
         self.cas.put_existing_hash(hash, &stored)?;
         Ok(hash)
@@ -64,10 +79,13 @@ impl BlobStore {
 
     pub fn get(&self, hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
-        let bytes = match &self.encryption {
+        let after_decrypt = match &self.encryption {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
+        // Always try-decompress; backward-compatible because uncompressed blobs
+        // won't start with the zstd magic number.
+        let bytes = compression::decompress_if_compressed(&after_decrypt)?;
         if self.verify_on_read {
             let computed = hash_blob(&bytes);
             if computed != hash {

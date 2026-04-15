@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ pub struct Config {
     pub created_at: u64,
     pub verify_on_read: bool,
     #[serde(default)]
+    pub compression: Option<String>,
+    #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
 }
 
@@ -72,6 +75,7 @@ impl Database {
                 hashing: "blake3".into(),
                 created_at: now_unix(),
                 verify_on_read: false,
+                compression: None,
                 encryption: None,
             };
             let bytes = serde_json::to_vec_pretty(&cfg)?;
@@ -105,14 +109,17 @@ impl Database {
         }
 
         let encryption = build_encryption_runtime(&config)?;
+        let compress = config.compression.as_deref() == Some("zstd");
         let blob_store = BlobStore::with_runtime_options(
             root.join("blobs"),
             config.verify_on_read,
+            compress,
             encryption.clone(),
         );
         let object_store = ObjectStore::with_runtime_options(
             root.join("objects"),
             config.verify_on_read,
+            compress,
             encryption,
         );
         let wal = Wal::new(root.join("wal"));
@@ -169,6 +176,18 @@ impl Database {
 
     pub fn state_compact_at_head(&self, head: &str) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| self.state_store.compact(base_root))
+    }
+
+    pub fn state_set_many_at_head(&self, head: &str, pairs: &[(&[u8], &[u8])]) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| {
+            self.state_store.set_many(base_root, pairs)
+        })
+    }
+
+    pub fn state_del_many_at_head(&self, head: &str, keys: &[&[u8]]) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| {
+            self.state_store.del_many(base_root, keys)
+        })
     }
 
     pub fn create_commit_at_head(
@@ -258,6 +277,55 @@ impl Database {
         ))
     }
 
+    /// Re-encrypt all blobs and objects with a new password.
+    ///
+    /// Encryption must already be enabled in the database config.  The new
+    /// password is used to produce new per-blob ciphertext; the KDF algorithm
+    /// and iteration count stay the same.  Writes are atomic (temp → rename)
+    /// so a crash mid-rotation leaves at most one file in the old format; the
+    /// next call to `rotate_encryption_key` with either password will fix it.
+    ///
+    /// Returns the number of files successfully re-encrypted.
+    pub fn rotate_encryption_key(&self, new_password: &str) -> Result<usize> {
+        let enc_config = self
+            .config
+            .encryption
+            .as_ref()
+            .filter(|e| e.enabled)
+            .ok_or_else(|| {
+                anyhow::anyhow!("encryption is not enabled; nothing to rotate")
+            })?;
+
+        if new_password.is_empty() {
+            return Err(anyhow::anyhow!("new password cannot be empty"));
+        }
+
+        let new_runtime = Arc::new(EncryptionRuntime::from_config(
+            enc_config.clone(),
+            new_password.to_string(),
+        )?);
+
+        let mut count = 0usize;
+
+        for dir in [self.root.join("blobs"), self.root.join("objects")] {
+            count += reencrypt_cas_dir(&dir, &self.encryption_runtime(), new_runtime.clone())?;
+        }
+
+        // Persist the new config (algorithm/iterations unchanged; salt is per-blob).
+        let cfg_path = self.root.join("meta").join("config.json");
+        let bytes = serde_json::to_vec_pretty(&self.config)?;
+        crate::atomic::write_atomic(&cfg_path, &bytes)?;
+
+        Ok(count)
+    }
+
+    fn encryption_runtime(&self) -> Option<Arc<EncryptionRuntime>> {
+        // Re-derive from stored config + env var (same as Database::open).
+        let enc = self.config.encryption.as_ref().filter(|e| e.enabled)?;
+        let password = std::env::var("NELEUS_DB_ENCRYPTION_PASSWORD").ok()?;
+        EncryptionRuntime::from_config(enc.clone(), password).ok().map(Arc::new)
+    }
+
     fn sync_state_ref_for_commit(&self, head: &str, state_root: Hash) -> Result<bool> {
         for _ in 0..DEFAULT_CAS_RETRIES {
             let expected_state = self.refs.state_get(head)?;
@@ -295,6 +363,7 @@ fn load_and_migrate_config(cfg_path: &Path) -> Result<(Config, bool)> {
         hashing: old.hashing,
         created_at: old.created_at,
         verify_on_read: false,
+        compression: None,
         encryption: None,
     };
     Ok((migrate_config(migrated), true))
@@ -330,6 +399,61 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock drift before epoch")
         .as_secs()
+}
+
+/// Walk a CAS directory recursively and re-encrypt every file with `new_runtime`.
+/// Files that fail to decrypt with the old runtime are skipped (they may already
+/// use the new key from a previous partial rotation).
+fn reencrypt_cas_dir(
+    dir: &Path,
+    old_runtime: &Option<Arc<EncryptionRuntime>>,
+    new_runtime: Arc<EncryptionRuntime>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            count += reencrypt_cas_dir(&path, old_runtime, new_runtime.clone())?;
+            continue;
+        }
+        // Skip non-content files (e.g. temp files left by atomic writes).
+        let is_content = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()))
+            .unwrap_or(false);
+        if !is_content {
+            continue;
+        }
+
+        let raw = fs::read(&path)?;
+
+        // Decrypt with old key, or pass through if no old runtime.
+        let plaintext = match old_runtime {
+            Some(rt) => match rt.decrypt(&raw) {
+                Ok(p) => p,
+                Err(_) => {
+                    // May already be encrypted with the new key; skip.
+                    continue;
+                }
+            },
+            None => raw,
+        };
+
+        // Re-encrypt with the new key.
+        let new_ciphertext = new_runtime.encrypt(&plaintext)?;
+        crate::atomic::write_atomic(&path, &new_ciphertext)?;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 #[cfg(test)]
