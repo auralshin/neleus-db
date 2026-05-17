@@ -14,6 +14,49 @@ use crate::lock::process_is_alive;
 /// nanosecond.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only fsync override. In test builds fsync is skipped by default —
+/// tests don't simulate crashes, so durability is moot and the savings on
+/// macOS APFS / Linux ext4 are large (each fsync is several ms). Production
+/// builds get an `#[inline(always)] true` branch the optimizer will erase.
+///
+/// If you ever add a test that genuinely needs durability semantics (e.g. a
+/// crash-replay test that powers down between writes), call
+/// `enable_fsync_for_tests()` in its setup before any I/O.
+#[cfg(test)]
+static TEST_FSYNC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force fsync back on for the lifetime of the current test process. Use it
+/// in the rare test that asserts durability semantics; the global default in
+/// test builds is "fsync off".
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn enable_fsync_for_tests() {
+    TEST_FSYNC_ENABLED.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn fsync_enabled() -> bool {
+    TEST_FSYNC_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn fsync_enabled() -> bool {
+    true
+}
+
+pub(crate) fn maybe_sync_file(f: &File) -> std::io::Result<()> {
+    if fsync_enabled() { f.sync_all() } else { Ok(()) }
+}
+
+pub(crate) fn maybe_sync_dir(path: &Path) -> std::io::Result<()> {
+    if !fsync_enabled() {
+        return Ok(());
+    }
+    File::open(path)?.sync_all()
+}
+
 /// Build a unique temp filename of the shape `.{stem}.tmp-{pid}-{nanos}-{seq}`.
 pub(crate) fn build_temp_name(stem: &str) -> Result<String> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
@@ -46,7 +89,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("failed creating temp file {}", tmp_path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("failed writing temp file {}", tmp_path.display()))?;
-    f.sync_all()
+    maybe_sync_file(&f)
         .with_context(|| format!("failed syncing temp file {}", tmp_path.display()))?;
 
     fs::rename(&tmp_path, path).with_context(|| {
@@ -57,9 +100,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         )
     })?;
 
-    File::open(parent)
-        .with_context(|| format!("failed opening parent dir {}", parent.display()))?
-        .sync_all()
+    maybe_sync_dir(parent)
         .with_context(|| format!("failed syncing parent dir {}", parent.display()))?;
 
     Ok(())

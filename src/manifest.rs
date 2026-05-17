@@ -28,7 +28,6 @@ pub struct ToolCallRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkManifest {
-    #[serde(default = "default_manifest_schema_version")]
     pub schema_version: u32,
     pub chunk_text: Hash,
     pub start: usize,
@@ -38,7 +37,6 @@ pub struct ChunkManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocManifest {
-    #[serde(default = "default_manifest_schema_version")]
     pub schema_version: u32,
     pub source: String,
     pub created_at: u64,
@@ -49,7 +47,6 @@ pub struct DocManifest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunManifest {
-    #[serde(default = "default_manifest_schema_version")]
     pub schema_version: u32,
     pub model: String,
     pub prompt: Hash,
@@ -79,21 +76,15 @@ impl ManifestStore {
     }
 
     pub fn get_doc_manifest(&self, hash: Hash) -> Result<DocManifest> {
-        let mut manifest: DocManifest = self.get_manifest(hash)?;
-        migrate_doc_manifest_in_place(&mut manifest);
-        Ok(manifest)
+        self.get_manifest(hash)
     }
 
     pub fn get_run_manifest(&self, hash: Hash) -> Result<RunManifest> {
-        let mut manifest: RunManifest = self.get_manifest(hash)?;
-        migrate_run_manifest_in_place(&mut manifest);
-        Ok(manifest)
+        self.get_manifest(hash)
     }
 
     pub fn get_chunk_manifest(&self, hash: Hash) -> Result<ChunkManifest> {
-        let mut manifest: ChunkManifest = self.get_manifest(hash)?;
-        migrate_chunk_manifest_in_place(&mut manifest);
-        Ok(manifest)
+        self.get_manifest(hash)
     }
 
     pub fn put_doc_manifest_from_bytes(
@@ -200,21 +191,6 @@ pub fn get_manifest<T: DeserializeOwned>(store: &ManifestStore, hash: Hash) -> R
     store.get_manifest(hash)
 }
 
-pub fn migrate_doc_manifest(mut manifest: DocManifest) -> DocManifest {
-    migrate_doc_manifest_in_place(&mut manifest);
-    manifest
-}
-
-pub fn migrate_run_manifest(mut manifest: RunManifest) -> RunManifest {
-    migrate_run_manifest_in_place(&mut manifest);
-    manifest
-}
-
-pub fn migrate_chunk_manifest(mut manifest: ChunkManifest) -> ChunkManifest {
-    migrate_chunk_manifest_in_place(&mut manifest);
-    manifest
-}
-
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -244,28 +220,6 @@ pub fn chunk_fixed(input: &[u8], chunk_size: usize, overlap: usize) -> Result<Ve
         start = end - overlap;
     }
     Ok(out)
-}
-
-fn default_manifest_schema_version() -> u32 {
-    MANIFEST_SCHEMA_VERSION
-}
-
-fn migrate_doc_manifest_in_place(manifest: &mut DocManifest) {
-    if manifest.schema_version == 0 {
-        manifest.schema_version = MANIFEST_SCHEMA_VERSION;
-    }
-}
-
-fn migrate_run_manifest_in_place(manifest: &mut RunManifest) {
-    if manifest.schema_version == 0 {
-        manifest.schema_version = MANIFEST_SCHEMA_VERSION;
-    }
-}
-
-fn migrate_chunk_manifest_in_place(manifest: &mut ChunkManifest) {
-    if manifest.schema_version == 0 {
-        manifest.schema_version = MANIFEST_SCHEMA_VERSION;
-    }
 }
 
 #[cfg(test)]
@@ -475,21 +429,4 @@ mod tests {
         assert!(prove_blob_inclusion(&run, missing).is_none());
     }
 
-    #[test]
-    fn migration_fills_legacy_schema_version() {
-        let legacy = DocManifest {
-            schema_version: 0,
-            source: "s".into(),
-            created_at: 0,
-            chunking: ChunkingSpec {
-                method: "fixed".into(),
-                chunk_size: 2,
-                overlap: 0,
-            },
-            chunks: vec![],
-            original: Hash::zero(),
-        };
-        let migrated = migrate_doc_manifest(legacy);
-        assert_eq!(migrated.schema_version, MANIFEST_SCHEMA_VERSION);
-    }
 }

@@ -23,7 +23,6 @@ pub struct CommitSignature {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Commit {
-    #[serde(default = "default_commit_schema_version")]
     pub schema_version: u32,
     pub parents: Vec<CommitHash>,
     pub timestamp: u64,
@@ -136,8 +135,7 @@ impl CommitStore {
     }
 
     pub fn get_commit(&self, hash: CommitHash) -> Result<Commit> {
-        let mut commit: Commit = self.objects.get_deserialized_typed(COMMIT_TAG, hash)?;
-        migrate_commit_in_place(&mut commit);
+        let commit: Commit = self.objects.get_deserialized_typed(COMMIT_TAG, hash)?;
         Ok(commit)
     }
 
@@ -186,16 +184,6 @@ pub fn create_commit(
 
 pub fn get_commit(store: &CommitStore, hash: CommitHash) -> Result<Commit> {
     store.get_commit(hash)
-}
-
-fn default_commit_schema_version() -> u32 {
-    COMMIT_SCHEMA_VERSION
-}
-
-fn migrate_commit_in_place(commit: &mut Commit) {
-    if commit.schema_version == 0 {
-        commit.schema_version = COMMIT_SCHEMA_VERSION;
-    }
 }
 
 fn now_unix() -> u64 {
