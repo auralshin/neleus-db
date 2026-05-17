@@ -1,0 +1,101 @@
+name: Bug report
+description: Report a correctness, safety, security, or performance defect in neleus-db
+title: "[bug] "
+labels: ["type:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please include enough context that a reviewer can reproduce
+        or audit the issue without having to ask follow-up questions.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences describing the defect.
+      placeholder: "`Database::open` panics when the system clock is set before 1970-01-01."
+    validations:
+      required: true
+
+  - type: textarea
+    id: affected
+    attributes:
+      label: Affected code
+      description: File path(s) and line number(s). Use the `path:line` form so links resolve.
+      placeholder: |
+        - src/db.rs:397
+        - src/commit.rs:161
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Minimal steps, snippet, or test case that triggers the issue. If the bug is theoretical, state the trigger condition explicitly.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: |
+        - **critical** — data loss, silent corruption, or exploitable security flaw
+        - **high** — correctness bug or serious security weakness
+        - **medium** — design flaw, missing protection, performance disaster
+        - **low** — minor risk, missing test, API gap
+      options:
+        - critical
+        - high
+        - medium
+        - low
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - encryption
+        - storage
+        - state
+        - commit
+        - index
+        - concurrency
+        - cli
+        - code-health
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_fix
+    attributes:
+      label: Proposed fix (optional)
+      description: Sketch of the fix or invariant that should hold.
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: |
+        - neleus-db version / commit:
+        - rustc version:
+        - OS / filesystem:

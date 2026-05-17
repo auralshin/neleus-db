@@ -1,0 +1,67 @@
+name: Feature request
+description: Propose a new capability, API, or significant enhancement to neleus-db
+title: "[feat] "
+labels: ["type:enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Feature requests should describe the *problem* before the solution.
+        If you have a design in mind, include it — but be explicit about which parts
+        are required vs. suggested.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What use case is currently hard or impossible? Who is affected?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: High-level approach. Cite specific modules or APIs if applicable.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches and why they were rejected.
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants and compatibility
+      description: |
+        - Does this change on-disk format, hash domains, or canonical encoding?
+        - Does it require a schema migration?
+        - Is it backward compatible with existing databases?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - encryption
+        - storage
+        - state
+        - commit
+        - index
+        - concurrency
+        - cli
+        - code-health
+    validations:
+      required: true
+
+  - type: textarea
+    id: tests
+    attributes:
+      label: Testing strategy
+      description: How will correctness be demonstrated? Property tests, golden bytes, integration scenarios?
