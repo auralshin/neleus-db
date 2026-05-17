@@ -3,7 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -11,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_atomic;
 use crate::blob_store::BlobStore;
 use crate::canonical::{from_cbor, to_cbor};
+use crate::clock::now_unix;
 use crate::commit::{CommitHash, CommitStore};
 use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_typed};
@@ -189,7 +189,7 @@ impl SearchIndexStore {
         let index = SearchIndex {
             schema_version: INDEX_SCHEMA_VERSION,
             commit: head,
-            built_at: now_unix(),
+            built_at: now_unix()?,
             chunks: chunk_vec,
             semantic_docs,
             avg_doc_len,
@@ -564,13 +564,6 @@ fn preview(text: &str) -> String {
 
 fn l2_norm(v: &[f32]) -> f32 {
     v.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock drift before epoch")
-        .as_secs()
 }
 
 #[cfg(test)]

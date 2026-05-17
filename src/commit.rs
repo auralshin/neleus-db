@@ -1,9 +1,8 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::to_cbor;
+use crate::clock::now_unix;
 use crate::hash::{Hash, hash_typed};
 use crate::object_store::ObjectStore;
 use crate::state::StateRoot;
@@ -91,7 +90,7 @@ impl CommitStore {
         let commit = Commit {
             schema_version: COMMIT_SCHEMA_VERSION,
             parents,
-            timestamp: now_unix(),
+            timestamp: now_unix()?,
             author,
             message,
             state_root,
@@ -115,7 +114,7 @@ impl CommitStore {
         let unsigned = Commit {
             schema_version: COMMIT_SCHEMA_VERSION,
             parents,
-            timestamp: now_unix(),
+            timestamp: now_unix()?,
             author,
             message,
             state_root,
@@ -184,13 +183,6 @@ pub fn create_commit(
 
 pub fn get_commit(store: &CommitStore, hash: CommitHash) -> Result<Commit> {
     store.get_commit(hash)
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock drift before epoch")
-        .as_secs()
 }
 
 #[cfg(test)]

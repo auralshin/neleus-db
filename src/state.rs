@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::blob_store::BlobStore;
 use crate::canonical::from_cbor;
 use crate::hash::{Hash, hash_typed};
-use crate::merkle::{MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
+use crate::merkle::{MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
 use crate::object_store::ObjectStore;
 use crate::wal::{Wal, WalOp};
 
@@ -387,7 +387,7 @@ impl StateStore {
                 return false;
             }
 
-            let leaf = manifest_segment_leaf_hash(scan.segment_hash);
+            let leaf = manifest_segment_leaf(scan.segment_hash);
             if !verify_inclusion(manifest.segments_merkle_root, leaf, &scan.manifest_proof) {
                 return false;
             }
@@ -514,7 +514,7 @@ impl StateSegment {
             return Err(anyhow!("segment entries must have unique sorted keys"));
         }
 
-        let leaves: Vec<Hash> = entries.iter().map(leaf_hash).collect();
+        let leaves: Vec<MerkleLeaf> = entries.iter().map(entry_leaf).collect();
         let merkle_root = merkle_root(&leaves);
         Ok(Self {
             schema_version: STATE_SCHEMA_VERSION,
@@ -559,19 +559,15 @@ fn segment_is_sorted_unique(entries: &[SegmentEntry]) -> bool {
         .all(|w| w[0].key.as_slice() < w[1].key.as_slice())
 }
 
-fn manifest_segment_leaf_hash(segment_hash: Hash) -> Hash {
-    hash_typed(STATE_MANIFEST_LEAF_TAG, segment_hash.as_bytes())
+fn manifest_segment_leaf(segment_hash: Hash) -> MerkleLeaf {
+    MerkleLeaf::new(STATE_MANIFEST_LEAF_TAG, segment_hash.as_bytes())
 }
 
-fn manifest_segment_leaves(segments: &[Hash]) -> Vec<Hash> {
-    segments
-        .iter()
-        .copied()
-        .map(manifest_segment_leaf_hash)
-        .collect()
+fn manifest_segment_leaves(segments: &[Hash]) -> Vec<MerkleLeaf> {
+    segments.iter().copied().map(manifest_segment_leaf).collect()
 }
 
-fn leaf_hash(entry: &SegmentEntry) -> Hash {
+fn entry_leaf(entry: &SegmentEntry) -> MerkleLeaf {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&(entry.key.len() as u32).to_be_bytes());
     bytes.extend_from_slice(&entry.key);
@@ -584,7 +580,7 @@ fn leaf_hash(entry: &SegmentEntry) -> Hash {
         ValueRef::Tombstone => bytes.push(0),
     }
 
-    hash_typed(STATE_LEAF_TAG, &bytes)
+    MerkleLeaf::new(STATE_LEAF_TAG, &bytes)
 }
 
 fn build_segment_scan(
@@ -593,7 +589,7 @@ fn build_segment_scan(
     manifest_proof: MerkleProof,
     key: &[u8],
 ) -> Result<SegmentScanProof> {
-    let leaves: Vec<Hash> = segment.entries.iter().map(leaf_hash).collect();
+    let leaves: Vec<MerkleLeaf> = segment.entries.iter().map(entry_leaf).collect();
 
     match find_key(&segment.entries, key) {
         Ok(index) => {
@@ -657,7 +653,7 @@ fn verify_entry_proof(segment: &StateSegment, entry_proof: &EntryProof) -> bool 
         return false;
     }
 
-    let leaf = leaf_hash(&entry_proof.entry);
+    let leaf = entry_leaf(&entry_proof.entry);
     verify_inclusion(segment.merkle_root, leaf, &entry_proof.proof)
 }
 
@@ -842,7 +838,7 @@ mod tests {
             .segments
             .iter()
             .copied()
-            .map(super::manifest_segment_leaf_hash)
+            .map(super::manifest_segment_leaf)
             .collect::<Vec<_>>();
         assert_eq!(m.segments_merkle_root, merkle_root(&leaves));
     }
@@ -1188,6 +1184,78 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Forged proofs must be rejected by `verify_proof`. Each test tampers one
+    /// field at a time on an otherwise-valid proof and asserts rejection — this
+    /// is the soundness side of the existing `proofs_always_verify` property
+    /// (which only checks honest proofs).
+    mod adversarial_proofs {
+        use super::*;
+        use crate::hash::hash_typed;
+
+        fn setup() -> (TempDir, StateStore, StateRoot) {
+            let tmp = TempDir::new().unwrap();
+            let s = store(&tmp);
+            let root = s.empty_root().unwrap();
+            let root = s.set(root, b"a", b"1").unwrap();
+            let root = s.set(root, b"b", b"2").unwrap();
+            let root = s.set(root, b"c", b"3").unwrap();
+            (tmp, s, root)
+        }
+
+        #[test]
+        fn forged_outcome_value_for_missing_key_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"missing-key").unwrap();
+            assert!(matches!(proof.outcome, StateOutcome::Missing));
+            proof.outcome = StateOutcome::Found(hash_typed(b"blob:", b"fake"));
+            assert!(!s.verify_proof(root, b"missing-key", &proof));
+        }
+
+        #[test]
+        fn forged_outcome_missing_for_present_key_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"a").unwrap();
+            assert!(matches!(proof.outcome, StateOutcome::Found(_)));
+            proof.outcome = StateOutcome::Missing;
+            assert!(!s.verify_proof(root, b"a", &proof));
+        }
+
+        #[test]
+        fn wrong_manifest_segment_count_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"a").unwrap();
+            proof.manifest_segment_count += 1;
+            assert!(!s.verify_proof(root, b"a", &proof));
+        }
+
+        #[test]
+        fn wrong_manifest_segments_root_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"a").unwrap();
+            proof.manifest_segments_root = hash_typed(b"forged:", b"root");
+            assert!(!s.verify_proof(root, b"a", &proof));
+        }
+
+        #[test]
+        fn extra_unrelated_scan_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"a").unwrap();
+            // Duplicate the terminal scan to make `scans.len()` inconsistent
+            // with the recorded terminal index.
+            let last = proof.scans.last().cloned().unwrap();
+            proof.scans.push(last);
+            assert!(!s.verify_proof(root, b"a", &proof));
+        }
+
+        #[test]
+        fn schema_version_mismatch_is_rejected() {
+            let (_tmp, s, root) = setup();
+            let mut proof = s.proof(root, b"a").unwrap();
+            proof.manifest_schema_version = proof.manifest_schema_version.wrapping_add(1);
+            assert!(!s.verify_proof(root, b"a", &proof));
         }
     }
 }

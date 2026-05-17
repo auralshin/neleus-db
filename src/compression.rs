@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use anyhow::{Result, anyhow};
 
 /// zstd frame magic bytes: 0xFD2FB528 in little-endian order.
@@ -8,14 +10,16 @@ pub fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     zstd::encode_all(bytes, 0).map_err(|e| anyhow!("zstd compress failed: {e}"))
 }
 
-/// Decompress `bytes` if they start with the zstd magic, otherwise return a
-/// copy of the input unchanged.  This allows transparent backward-compatibility
-/// with blobs that were stored before compression was enabled.
-pub fn decompress_if_compressed(bytes: &[u8]) -> Result<Vec<u8>> {
+/// Decompress `bytes` if they start with the zstd magic, otherwise borrow the
+/// input unchanged. Returning `Cow` avoids a full copy of every uncompressed
+/// blob — the common case when compression is off.
+pub fn decompress_if_compressed(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     if bytes.starts_with(&ZSTD_MAGIC) {
-        zstd::decode_all(bytes).map_err(|e| anyhow!("zstd decompress failed: {e}"))
+        zstd::decode_all(bytes)
+            .map(Cow::Owned)
+            .map_err(|e| anyhow!("zstd decompress failed: {e}"))
     } else {
-        Ok(bytes.to_vec())
+        Ok(Cow::Borrowed(bytes))
     }
 }
 
@@ -34,14 +38,19 @@ mod tests {
         let compressed = compress(data).unwrap();
         assert!(is_compressed(&compressed));
         let back = decompress_if_compressed(&compressed).unwrap();
-        assert_eq!(back, data);
+        assert!(matches!(back, Cow::Owned(_)));
+        assert_eq!(&*back, data);
     }
 
     #[test]
-    fn uncompressed_bytes_pass_through() {
+    fn uncompressed_bytes_pass_through_without_copy() {
         let data = b"plain bytes without zstd magic";
         let out = decompress_if_compressed(data).unwrap();
-        assert_eq!(out, data);
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "uncompressed input should be borrowed, not copied"
+        );
+        assert_eq!(&*out, data);
     }
 
     #[test]

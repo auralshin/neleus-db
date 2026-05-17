@@ -103,7 +103,6 @@ See the [examples/](examples/) directory for practical code demonstrating common
 - **[01_basic_blob_storage.rs](examples/01_basic_blob_storage.rs)** - Content-addressed storage and deduplication
 - **[02_state_and_commits.rs](examples/02_state_and_commits.rs)** - Versioned state with Git-like history
 - **[03_document_chunking.rs](examples/03_document_chunking.rs)** - Deterministic document chunking and manifests
-- **[04_provenance_tracking.rs](examples/04_provenance_tracking.rs)** - Evidence chains and confidence scoring
 - **[05_state_proofs.rs](examples/05_state_proofs.rs)** - Cryptographic proof generation and verification
 
 Run any example:

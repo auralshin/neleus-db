@@ -9,6 +9,30 @@ pub struct MerkleProof {
     pub siblings: Vec<Hash>,
 }
 
+/// A domain-separated Merkle leaf. The only constructor is `MerkleLeaf::new`,
+/// which forces every leaf to be hashed with a leaf-domain tag distinct from
+/// the internal-node tag used by `hash_pair`. This makes the second-preimage
+/// substitution of an internal-node hash for a leaf hash impossible at the
+/// API level rather than relying on caller convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MerkleLeaf(Hash);
+
+impl MerkleLeaf {
+    /// Build a leaf by hashing `bytes` with the caller-chosen domain `tag`.
+    /// The tag MUST be distinct from `merkle_node:` (the internal-node tag)
+    /// and from every other leaf tag in the codebase, otherwise the
+    /// domain-separation guarantee is forfeited at the application layer.
+    pub fn new(tag: &[u8], bytes: &[u8]) -> Self {
+        Self(hash_typed(tag, bytes))
+    }
+
+    /// Underlying leaf hash. Used by `verify_inclusion` and by callers that
+    /// need to include the leaf hash in their own proof container.
+    pub fn hash(&self) -> Hash {
+        self.0
+    }
+}
+
 fn hash_pair(left: Hash, right: Hash) -> Hash {
     let mut bytes = [0u8; 64];
     bytes[..32].copy_from_slice(left.as_bytes());
@@ -20,11 +44,11 @@ pub fn empty_root() -> Hash {
     hash_typed(b"merkle_node:", b"empty")
 }
 
-pub fn root(leaves: &[Hash]) -> Hash {
+pub fn root(leaves: &[MerkleLeaf]) -> Hash {
     if leaves.is_empty() {
         return empty_root();
     }
-    let mut level = leaves.to_vec();
+    let mut level: Vec<Hash> = leaves.iter().map(|l| l.0).collect();
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
@@ -43,14 +67,14 @@ pub fn root(leaves: &[Hash]) -> Hash {
     level[0]
 }
 
-pub fn prove_inclusion(leaves: &[Hash], index: usize) -> Option<MerkleProof> {
+pub fn prove_inclusion(leaves: &[MerkleLeaf], index: usize) -> Option<MerkleProof> {
     if leaves.is_empty() || index >= leaves.len() {
         return None;
     }
 
     let mut siblings = Vec::new();
     let mut idx = index;
-    let mut level = leaves.to_vec();
+    let mut level: Vec<Hash> = leaves.iter().map(|l| l.0).collect();
 
     while level.len() > 1 {
         let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
@@ -84,7 +108,7 @@ pub fn prove_inclusion(leaves: &[Hash], index: usize) -> Option<MerkleProof> {
     })
 }
 
-pub fn verify_inclusion(root_hash: Hash, leaf_hash: Hash, proof: &MerkleProof) -> bool {
+pub fn verify_inclusion(root_hash: Hash, leaf: MerkleLeaf, proof: &MerkleProof) -> bool {
     if proof.leaf_count == 0 || proof.index >= proof.leaf_count {
         return false;
     }
@@ -100,7 +124,7 @@ pub fn verify_inclusion(root_hash: Hash, leaf_hash: Hash, proof: &MerkleProof) -
     }
 
     let mut idx = proof.index;
-    let mut current = leaf_hash;
+    let mut current = leaf.0;
     for sibling in &proof.siblings {
         current = if idx.is_multiple_of(2) {
             hash_pair(current, *sibling)
@@ -116,18 +140,16 @@ pub fn verify_inclusion(root_hash: Hash, leaf_hash: Hash, proof: &MerkleProof) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::hash_typed;
 
     #[cfg(test)]
     mod prop_tests {
         use proptest::prelude::*;
 
         use super::*;
-        use crate::hash::hash_typed;
 
-        fn make_leaves(count: usize) -> Vec<Hash> {
+        fn make_leaves(count: usize) -> Vec<MerkleLeaf> {
             (0..count)
-                .map(|i| hash_typed(b"leaf:", &(i as u64).to_le_bytes()))
+                .map(|i| MerkleLeaf::new(b"leaf:", &(i as u64).to_le_bytes()))
                 .collect()
         }
 
@@ -155,7 +177,7 @@ mod tests {
                 let leaves_a = make_leaves(count);
                 let mut leaves_b = leaves_a.clone();
                 // Flip the last leaf to something different.
-                *leaves_b.last_mut().unwrap() = hash_typed(b"leaf:", b"changed");
+                *leaves_b.last_mut().unwrap() = MerkleLeaf::new(b"leaf:", b"changed");
                 prop_assert_ne!(root(&leaves_a), root(&leaves_b));
             }
 
@@ -165,15 +187,15 @@ mod tests {
                 let leaves = make_leaves(count);
                 let r = root(&leaves);
                 let proof = prove_inclusion(&leaves, 0).unwrap();
-                let wrong_leaf = hash_typed(b"leaf:", b"impostor");
+                let wrong_leaf = MerkleLeaf::new(b"leaf:", b"impostor");
                 // The wrong leaf should (overwhelmingly) fail.
                 prop_assert!(!verify_inclusion(r, wrong_leaf, &proof));
             }
         }
     }
 
-    fn hs(n: u8) -> Hash {
-        hash_typed(b"leaf:", &[n])
+    fn hs(n: u8) -> MerkleLeaf {
+        MerkleLeaf::new(b"leaf:", &[n])
     }
 
     #[test]
@@ -184,7 +206,7 @@ mod tests {
     #[test]
     fn merkle_single_leaf_root_is_leaf() {
         let leaf = hs(1);
-        assert_eq!(root(&[leaf]), leaf);
+        assert_eq!(root(&[leaf]), leaf.hash());
     }
 
     #[test]
@@ -234,7 +256,7 @@ mod tests {
         let leaves = vec![hs(1), hs(2), hs(3), hs(4)];
         let r = root(&leaves);
         let mut p = prove_inclusion(&leaves, 1).unwrap();
-        p.siblings[0] = hs(9);
+        p.siblings[0] = crate::hash::hash_typed(b"leaf:", &[9]);
         assert!(!verify_inclusion(r, hs(2), &p));
     }
 }
