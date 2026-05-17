@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,6 @@ pub struct SegmentEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSegment {
-    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub entries: Vec<SegmentEntry>,
     pub merkle_root: Hash,
@@ -40,10 +40,8 @@ pub struct StateSegment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateManifest {
-    #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub segments: Vec<Hash>, // newest first
-    #[serde(default = "Hash::zero")]
     pub segments_merkle_root: Hash,
 }
 
@@ -104,6 +102,11 @@ pub struct StateStore {
     objects: ObjectStore,
     blobs: BlobStore,
     wal: Wal,
+    /// Cached hash of the empty manifest. Computed and stored on first call;
+    /// subsequent calls return the hash without touching disk. Shared across
+    /// all clones of this `StateStore` so different `Database` views share
+    /// the cache.
+    empty_root: Arc<OnceLock<StateRoot>>,
 }
 
 impl StateStore {
@@ -112,12 +115,20 @@ impl StateStore {
             objects,
             blobs,
             wal,
+            empty_root: Arc::new(OnceLock::new()),
         }
     }
 
     pub fn empty_root(&self) -> Result<StateRoot> {
+        if let Some(cached) = self.empty_root.get() {
+            return Ok(*cached);
+        }
         let empty = new_state_manifest(vec![]);
-        self.store_manifest(&empty)
+        let root = self.store_manifest(&empty)?;
+        // `set` returns Err if another thread won the race; either way the
+        // cached value is now Some, so we just read it back.
+        let _ = self.empty_root.set(root);
+        Ok(*self.empty_root.get().unwrap_or(&root))
     }
 
     pub fn get(&self, root: StateRoot, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -477,8 +488,7 @@ impl StateStore {
         if computed != hash {
             return Err(anyhow!("manifest hash mismatch for {}", hash));
         }
-        let mut manifest: StateManifest = from_cbor(&bytes)?;
-        migrate_manifest(&mut manifest);
+        let manifest: StateManifest = from_cbor(&bytes)?;
         Ok(manifest)
     }
 
@@ -492,10 +502,7 @@ impl StateStore {
         if computed != hash {
             return Err(anyhow!("segment hash mismatch for {}", hash));
         }
-        let mut segment: StateSegment = from_cbor(&bytes)?;
-        if segment.schema_version == 0 {
-            segment.schema_version = STATE_SCHEMA_VERSION;
-        }
+        let segment: StateSegment = from_cbor(&bytes)?;
         Ok(segment)
     }
 }
@@ -517,38 +524,11 @@ impl StateSegment {
     }
 }
 
-fn default_schema_version() -> u32 {
-    STATE_SCHEMA_VERSION
-}
-
 fn new_state_manifest(segments: Vec<Hash>) -> StateManifest {
     StateManifest {
         schema_version: STATE_SCHEMA_VERSION,
         segments_merkle_root: merkle_root(&manifest_segment_leaves(&segments)),
         segments,
-    }
-}
-
-/// Repair in-memory views of manifests written by older code paths.
-///
-/// Older versions stored manifests without `segments_merkle_root`, which
-/// deserializes as `Hash::zero()`. Recomputing the correct value here lets
-/// `verify_proof` validate proofs against the right root regardless of the
-/// stored manifest's age.
-///
-/// The correction is **in-memory only**: persisting it would change the
-/// manifest's hash and orphan every commit/ref pointing at the old one,
-/// which requires a full state-root chain rewrite. That migration is
-/// deferred (see issue #2's PR description). Repeated loads of a legacy
-/// manifest pay this O(n) hash-walk; it is acceptable because manifests
-/// are small and the cost is bounded by `segments.len()`.
-fn migrate_manifest(manifest: &mut StateManifest) {
-    if manifest.schema_version == 0 {
-        manifest.schema_version = STATE_SCHEMA_VERSION;
-    }
-    let expected = merkle_root(&manifest_segment_leaves(&manifest.segments));
-    if manifest.segments_merkle_root == Hash::zero() || manifest.segments_merkle_root != expected {
-        manifest.segments_merkle_root = expected;
     }
 }
 
@@ -1010,45 +990,27 @@ mod tests {
         );
     }
 
-    /// Regression for issue #2: a manifest stored by older code that omitted
-    /// `segments_merkle_root` (deserializes as `Hash::zero()`) must still
-    /// support proof verification once `migrate_manifest` repairs it.
+    /// Regression for issue #5: `empty_root` must memoize so subsequent
+    /// calls don't re-write the empty manifest to disk. Verified by
+    /// deleting the on-disk object after the first call and asserting that
+    /// the second call returns the same hash without re-creating the file.
     #[test]
-    fn migrate_manifest_repairs_zero_segments_root() {
+    fn empty_root_is_memoized_and_skips_redundant_writes() {
+        use crate::cas::CasStore;
+
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
+        let h1 = s.empty_root().unwrap();
 
-        // Stage a real segment via the normal path so its bytes live in the
-        // object store.
-        let value_hash = s.blobs.put(b"v").unwrap();
-        let segment = StateSegment::from_entries(vec![SegmentEntry {
-            key: b"k".to_vec(),
-            value: ValueRef::Value(value_hash),
-        }])
-        .unwrap();
-        let segment_hash = s.store_segment(&segment).unwrap();
+        let cas_path = CasStore::new(tmp.path().join("objects")).path_for(h1);
+        assert!(cas_path.exists(), "first empty_root call must store the object");
+        std::fs::remove_file(&cas_path).unwrap();
 
-        // Hand-craft the legacy manifest shape: schema_version=0,
-        // segments_merkle_root=Hash::zero(), but real segments.
-        let broken = StateManifest {
-            schema_version: 0,
-            segments: vec![segment_hash],
-            segments_merkle_root: Hash::zero(),
-        };
-        let broken_root = s.store_manifest(&broken).unwrap();
-
-        // Loading must succeed and produce a corrected manifest in memory.
-        let loaded = s.load_manifest(broken_root).unwrap();
-        let expected_root = merkle_root(&manifest_segment_leaves(&loaded.segments));
-        assert_eq!(loaded.segments_merkle_root, expected_root);
-        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
-
-        // Functional check: get() returns the value and proof verifies.
-        assert_eq!(s.get(broken_root, b"k").unwrap(), Some(b"v".to_vec()));
-        let proof = s.proof(broken_root, b"k").unwrap();
+        let h2 = s.empty_root().unwrap();
+        assert_eq!(h1, h2);
         assert!(
-            s.verify_proof(broken_root, b"k", &proof),
-            "proof against legacy manifest must verify after migration"
+            !cas_path.exists(),
+            "second empty_root call re-stored the object — memoization is bypassed"
         );
     }
 

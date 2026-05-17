@@ -49,13 +49,6 @@ pub struct Config {
     pub encryption: Option<EncryptionConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyConfigV1 {
-    version: u32,
-    hashing: String,
-    created_at: u64,
-}
-
 impl Database {
     pub fn init(path: impl AsRef<Path>) -> Result<()> {
         let root = path.as_ref();
@@ -102,17 +95,18 @@ impl Database {
             Duration::from_secs(10),
         )?;
 
-        let (mut config, mut migrated) = load_and_migrate_config(&cfg_path)?;
-        // Lazily generate the master_salt for any encryption config that
-        // pre-dates the master-key flow. Persisted before the runtime is
-        // built so the very first encrypted write can decrypt on next open.
+        let mut config = load_config(&cfg_path)?;
+        // Generate the `master_salt` the first time an encryption-enabled
+        // config is opened. Persisted before the runtime is built so the
+        // very first encrypted write can decrypt on next open.
+        let mut config_dirty = false;
         if let Some(enc) = config.encryption.as_mut()
             && enc.enabled
             && crate::encryption::ensure_master_salt(enc)?
         {
-            migrated = true;
+            config_dirty = true;
         }
-        if migrated {
+        if config_dirty {
             let bytes = serde_json::to_vec_pretty(&config)?;
             write_atomic(&cfg_path, &bytes)?;
         }
@@ -417,35 +411,19 @@ pub fn open(path: impl AsRef<Path>) -> Result<Database> {
     Database::open(path)
 }
 
-fn load_and_migrate_config(cfg_path: &Path) -> Result<(Config, bool)> {
+fn load_config(cfg_path: &Path) -> Result<Config> {
     let raw = fs::read(cfg_path)
         .with_context(|| format!("failed to read config {}", cfg_path.display()))?;
-
-    if let Ok(cfg) = serde_json::from_slice::<Config>(&raw) {
-        return Ok((migrate_config(cfg), false));
-    }
-
-    let old = serde_json::from_slice::<LegacyConfigV1>(&raw)
+    let cfg: Config = serde_json::from_slice(&raw)
         .with_context(|| format!("failed to parse config {}", cfg_path.display()))?;
-    let migrated = Config {
-        schema_version: DB_CONFIG_SCHEMA_VERSION,
-        hashing: old.hashing,
-        created_at: old.created_at,
-        verify_on_read: false,
-        compression: None,
-        encryption: None,
-    };
-    Ok((migrate_config(migrated), true))
-}
-
-fn migrate_config(mut cfg: Config) -> Config {
-    if cfg.schema_version < DB_CONFIG_SCHEMA_VERSION {
-        cfg.schema_version = DB_CONFIG_SCHEMA_VERSION;
+    if cfg.schema_version != DB_CONFIG_SCHEMA_VERSION {
+        return Err(anyhow::anyhow!(
+            "unsupported config schema_version {} (expected {})",
+            cfg.schema_version,
+            DB_CONFIG_SCHEMA_VERSION
+        ));
     }
-    if cfg.hashing.is_empty() {
-        cfg.hashing = "blake3".into();
-    }
-    cfg
+    Ok(cfg)
 }
 
 fn build_encryption_runtime(config: &Config) -> Result<Option<Arc<EncryptionRuntime>>> {
@@ -610,33 +588,6 @@ mod tests {
         let reopened = Database::open(&db_root).unwrap();
         let head = reopened.refs.head_get("main").unwrap();
         assert_eq!(head, Some(stable));
-    }
-
-    #[test]
-    fn migrates_legacy_config() {
-        let tmp = TempDir::new().unwrap();
-        let db_root = tmp.path().join("neleus_db");
-        fs::create_dir_all(db_root.join("meta")).unwrap();
-        fs::create_dir_all(db_root.join("blobs")).unwrap();
-        fs::create_dir_all(db_root.join("objects")).unwrap();
-        fs::create_dir_all(db_root.join("refs").join("heads")).unwrap();
-        fs::create_dir_all(db_root.join("refs").join("states")).unwrap();
-        fs::create_dir_all(db_root.join("wal")).unwrap();
-
-        let legacy = LegacyConfigV1 {
-            version: 1,
-            hashing: "blake3".into(),
-            created_at: 1,
-        };
-        fs::write(
-            db_root.join("meta/config.json"),
-            serde_json::to_vec_pretty(&legacy).unwrap(),
-        )
-        .unwrap();
-
-        let db = Database::open(&db_root).unwrap();
-        assert_eq!(db.config.schema_version, DB_CONFIG_SCHEMA_VERSION);
-        assert!(!db.config.verify_on_read);
     }
 
     #[test]
@@ -912,7 +863,7 @@ mod tests {
         let path = db_root
             .join("index")
             .join(commit.to_string())
-            .join("search_index.json");
+            .join("search_index.cbor");
         let raw = fs::read(&path).unwrap();
         assert!(
             !raw.windows(needle.len()).any(|w| w == needle),

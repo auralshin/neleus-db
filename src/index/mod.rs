@@ -10,19 +10,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_atomic;
 use crate::blob_store::BlobStore;
+use crate::canonical::{from_cbor, to_cbor};
 use crate::commit::{CommitHash, CommitStore};
 use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_typed};
 use crate::manifest::{ChunkManifest, DocManifest, ManifestStore};
 
-const INDEX_SCHEMA_VERSION: u32 = 1;
+/// Schema version of the on-disk search index. v2 switched the serialization
+/// from `serde_json::to_vec_pretty` to canonical DAG-CBOR so the returned
+/// `IndexVersionHash` is byte-stable across reserialization cycles and
+/// reproducible across machines.
+const INDEX_SCHEMA_VERSION: u32 = 2;
 const INDEX_TAG: &[u8] = b"index:";
 
 pub type IndexVersionHash = Hash;
-
-pub trait IndexBuilder {
-    fn build(&self, root: CommitHash) -> Result<IndexVersionHash>;
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexChunk {
@@ -111,7 +112,7 @@ impl SearchIndexStore {
 
         // Return early if the index for this exact commit already exists.
         if let Ok(existing) = self.read_index(head) {
-            return Ok(hash_typed(INDEX_TAG, &serde_json::to_vec(&existing)?));
+            return Ok(hash_typed(INDEX_TAG, &to_cbor(&existing)?));
         }
 
         let commit = commit_store.get_commit(head)?;
@@ -218,12 +219,12 @@ impl SearchIndexStore {
         let raw = fs::read(&path)
             .with_context(|| format!("missing index for {} at {}", commit, path.display()))?;
         let bytes = match &self.encryption {
-            Some(rt) => rt.decrypt(&raw).with_context(|| {
-                format!("failed decrypting index {}", path.display())
-            })?,
+            Some(rt) => rt
+                .decrypt(&raw)
+                .with_context(|| format!("failed decrypting index {}", path.display()))?,
             None => raw,
         };
-        let index: SearchIndex = serde_json::from_slice(&bytes)
+        let index: SearchIndex = from_cbor(&bytes)
             .with_context(|| format!("failed decoding index {}", path.display()))?;
         if index.schema_version != INDEX_SCHEMA_VERSION {
             return Err(anyhow!(
@@ -263,9 +264,11 @@ impl SearchIndexStore {
         fs::create_dir_all(&dir)?;
         let path = self.index_path(index.commit);
 
-        let bytes = serde_json::to_vec_pretty(index)?;
-        // The returned IndexVersionHash is derived from the plaintext index
-        // bytes so it remains stable regardless of whether encryption is on.
+        // DAG-CBOR is canonical (deterministic map key order, no whitespace
+        // ambiguity, no `f32`-to-string lossy rounding). The returned
+        // `IndexVersionHash` is derived from these plaintext bytes and is
+        // therefore stable across rebuilds, machines, and reserialization.
+        let bytes = to_cbor(index)?;
         let on_disk = match &self.encryption {
             Some(rt) => rt.encrypt(&bytes)?,
             None => bytes.clone(),
@@ -336,15 +339,10 @@ impl SearchIndexStore {
     }
 
     fn index_path(&self, commit: CommitHash) -> PathBuf {
-        self.commit_dir(commit).join("search_index.json")
-    }
-}
-
-impl IndexBuilder for SearchIndexStore {
-    fn build(&self, _root: CommitHash) -> Result<IndexVersionHash> {
-        Err(anyhow!(
-            "build(root) requires stores; use build_for_head(root, ...)"
-        ))
+        // `.cbor` reflects the on-disk format introduced in INDEX_SCHEMA_VERSION 2.
+        // Old `search_index.json` files from earlier builds are stale derived
+        // data and can be deleted by hand; they are never read again.
+        self.commit_dir(commit).join("search_index.cbor")
     }
 }
 
@@ -407,17 +405,29 @@ fn semantic_search_index(index: &SearchIndex, query: &str, top_k: usize) -> Vec<
         }
     }
 
+    // `index.chunks` is sorted by `chunk_hash` (see `build_for_head`), so we
+    // can lookup each scoring hit in O(log n) via binary search instead of
+    // the previous O(n) linear scan that made BM25 quadratic over the
+    // matched-hit count.
+    debug_assert!(
+        index
+            .chunks
+            .windows(2)
+            .all(|w| w[0].chunk_hash <= w[1].chunk_hash),
+        "index.chunks must be sorted by chunk_hash"
+    );
+
     let mut hits: Vec<SearchHit> = scores
         .into_iter()
         .filter_map(|(chunk_hash, score)| {
             index
                 .chunks
-                .iter()
-                .find(|c| c.chunk_hash == chunk_hash)
-                .map(|chunk| SearchHit {
+                .binary_search_by_key(&chunk_hash, |c| c.chunk_hash)
+                .ok()
+                .map(|idx| SearchHit {
                     chunk_hash,
                     score,
-                    text_preview: preview(&chunk.text),
+                    text_preview: preview(&index.chunks[idx].text),
                 })
         })
         .collect();
@@ -715,16 +725,125 @@ mod tests {
     }
 
     #[test]
-    fn trait_build_returns_error_without_context() {
-        let tmp = TempDir::new().unwrap();
-        let store = SearchIndexStore::new(tmp.path());
-        let h = hash_typed(b"x", b"y");
-        let err = IndexBuilder::build(&store, h).unwrap_err();
-        assert!(err.to_string().contains("requires stores"));
-    }
-
-    #[test]
     fn helper_types_compile_usage() {
         fn _use_types(_: &ManifestStore, _: &CommitStore) {}
+    }
+
+    /// Regression for issue #5: the IndexVersionHash returned by
+    /// build_for_head must be reproducible. With JSON-pretty serialization
+    /// it was sensitive to whitespace and f32-text-f32 round-tripping;
+    /// canonical DAG-CBOR eliminates both.
+    #[test]
+    fn index_version_hash_is_stable_across_rebuild_and_reserialize() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let doc_hash = db
+            .manifest_store
+            .put_doc_manifest_from_bytes(
+                &db.blob_store,
+                "src".into(),
+                b"rust systems programming\npython data scripts",
+                ChunkingSpec {
+                    method: "fixed".into(),
+                    chunk_size: 24,
+                    overlap: 0,
+                },
+                Some(1),
+            )
+            .unwrap();
+
+        let empty = db.state_store.empty_root().unwrap();
+        let commit = db
+            .commit_store
+            .create_commit(
+                vec![],
+                empty,
+                vec![doc_hash],
+                "agent".into(),
+                "hash stability".into(),
+            )
+            .unwrap();
+
+        let store = SearchIndexStore::new(db.root.join("index"));
+        let h1 = store
+            .build_for_head(commit, &db.commit_store, &db.manifest_store, &db.blob_store)
+            .unwrap();
+
+        // Read back, re-encode, and assert the hash is identical to the
+        // first build (i.e. encode → decode → re-encode is a no-op on the
+        // bytes that produce the hash).
+        let loaded = store.read_index(commit).unwrap();
+        let reserialized = crate::canonical::to_cbor(&loaded).unwrap();
+        let h2 = hash_typed(INDEX_TAG, &reserialized);
+        assert_eq!(h1, h2, "index hash must be stable across reserialize");
+
+        // A second build call (which exercises the early-return path) must
+        // also yield the same hash.
+        let h3 = store
+            .build_for_head(commit, &db.commit_store, &db.manifest_store, &db.blob_store)
+            .unwrap();
+        assert_eq!(h1, h3, "second build must return identical hash");
+    }
+
+    /// Regression for issue #5: with the old O(n) chunk lookup per scoring
+    /// hit, BM25 over many chunks degraded quadratically. With binary
+    /// search on the sorted chunk slice, 5000 chunks must score quickly.
+    #[test]
+    fn semantic_search_scales_sublinearly_over_chunks() {
+        // Build a synthetic SearchIndex directly — avoids the cost of
+        // putting 5000 manifests through the DB just to exercise scoring.
+        let n = 5000usize;
+        let mut chunks: Vec<IndexChunk> = (0..n)
+            .map(|i| IndexChunk {
+                chunk_hash: hash_typed(b"chunk:", i.to_string().as_bytes()),
+                text: format!("token{i} common"),
+                embedding: None,
+            })
+            .collect();
+        chunks.sort_by(|a, b| a.chunk_hash.cmp(&b.chunk_hash));
+
+        let mut doc_len = BTreeMap::new();
+        let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
+        let mut postings: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
+        for c in &chunks {
+            doc_len.insert(c.chunk_hash.to_string(), 2);
+            *doc_freq.entry("common".into()).or_insert(0) += 1;
+            postings
+                .entry("common".into())
+                .or_default()
+                .push(Posting {
+                    chunk_hash: c.chunk_hash,
+                    tf: 1,
+                });
+        }
+        let index = SearchIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            commit: hash_typed(b"any:", b"c"),
+            built_at: 0,
+            chunks,
+            semantic_docs: n as u32,
+            avg_doc_len: 2.0,
+            semantic_doc_len: doc_len,
+            semantic_doc_freq: doc_freq,
+            semantic_postings: postings,
+            vector_dim: None,
+        };
+
+        let start = std::time::Instant::now();
+        let hits = semantic_search_index(&index, "common", 10);
+        let elapsed = start.elapsed();
+        assert_eq!(hits.len(), 10);
+        // With the previous O(n²) lookup this took seconds on a modern
+        // laptop; binary search drops it to single-digit ms. Generous bound
+        // to avoid CI flakiness.
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "BM25 over {} chunks took {:?}; lookup is likely regressed",
+            n,
+            elapsed
+        );
     }
 }

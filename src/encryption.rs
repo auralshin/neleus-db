@@ -34,7 +34,6 @@
 //! escapes our control, so it's not zeroized here — document and move on.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
@@ -66,18 +65,6 @@ pub const MASTER_SALT_LEN: usize = 16;
 pub struct EncryptionConfig {
     pub enabled: bool,
     pub algorithm: String,
-    pub kdf: String,
-    /// Advisory only. AEAD key length is fixed at 32 bytes for both
-    /// supported algorithms; validation rejects any other value.
-    pub key_size: usize,
-    /// Advisory only. Per-blob HKDF salt length is fixed at 16 bytes;
-    /// validation requires `salt_size >= 16`.
-    pub salt_size: usize,
-    /// Advisory only. AEAD nonce length is fixed at 12 bytes; validation
-    /// rejects any other value.
-    #[serde(default = "default_nonce_size")]
-    pub nonce_size: usize,
-    #[serde(default = "default_kdf_iterations")]
     pub kdf_iterations: u32,
     /// Long-lived random salt for master-key derivation. Persisted in
     /// `meta/config.json`. Hex-encoded so the config remains human-readable.
@@ -93,11 +80,7 @@ impl Default for EncryptionConfig {
         Self {
             enabled: false,
             algorithm: "aes-256-gcm".to_string(),
-            kdf: "pbkdf2".to_string(),
-            key_size: AEAD_KEY_LEN,
-            salt_size: PER_BLOB_SALT_LEN,
-            nonce_size: default_nonce_size(),
-            kdf_iterations: default_kdf_iterations(),
+            kdf_iterations: MIN_KDF_ITERATIONS,
             master_salt: String::new(),
         }
     }
@@ -113,18 +96,6 @@ pub struct EncryptedData {
     pub nonce: Vec<u8>,
     #[serde(with = "hex_serde")]
     pub ciphertext: Vec<u8>,
-    #[serde(default = "now_unix")]
-    pub created_at: u64,
-    #[serde(default)]
-    pub metadata: std::collections::BTreeMap<String, String>,
-}
-
-fn default_kdf_iterations() -> u32 {
-    MIN_KDF_ITERATIONS
-}
-
-fn default_nonce_size() -> usize {
-    AEAD_NONCE_LEN
 }
 
 mod hex_serde {
@@ -257,8 +228,6 @@ impl EncryptionRuntime {
             salt,
             nonce,
             ciphertext,
-            created_at: now_unix(),
-            metadata: Default::default(),
         };
         Ok(serde_json::to_vec(&envelope)?)
     }
@@ -316,28 +285,7 @@ pub fn validate_config(config: &EncryptionConfig) -> Result<()> {
     if !config.enabled {
         return Err(anyhow!("encryption is disabled in config"));
     }
-    if config.algorithm.is_empty() {
-        return Err(anyhow!("algorithm must be specified"));
-    }
     Algorithm::parse(&config.algorithm)?;
-    if !config.kdf.eq_ignore_ascii_case("pbkdf2") {
-        return Err(anyhow!(
-            "unsupported kdf '{}'; only pbkdf2 is supported",
-            config.kdf
-        ));
-    }
-    if config.key_size != AEAD_KEY_LEN {
-        return Err(anyhow!("key_size must be {} bytes", AEAD_KEY_LEN));
-    }
-    if config.nonce_size != AEAD_NONCE_LEN {
-        return Err(anyhow!("nonce_size must be {} bytes", AEAD_NONCE_LEN));
-    }
-    if config.salt_size < PER_BLOB_SALT_LEN {
-        return Err(anyhow!(
-            "salt_size must be at least {} bytes",
-            PER_BLOB_SALT_LEN
-        ));
-    }
     if config.kdf_iterations < MIN_KDF_ITERATIONS {
         return Err(anyhow!(
             "kdf_iterations must be at least {} (OWASP 2024 minimum for PBKDF2-HMAC-SHA256)",
@@ -443,12 +391,6 @@ pub mod utils {
     }
 }
 
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {
@@ -479,8 +421,6 @@ mod tests {
         let c = EncryptionConfig::default();
         assert!(!c.enabled);
         assert_eq!(c.algorithm, "aes-256-gcm");
-        assert_eq!(c.key_size, AEAD_KEY_LEN);
-        assert_eq!(c.nonce_size, AEAD_NONCE_LEN);
         assert_eq!(c.kdf_iterations, MIN_KDF_ITERATIONS);
     }
 
