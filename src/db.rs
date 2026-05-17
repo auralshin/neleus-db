@@ -200,7 +200,20 @@ impl Database {
         for _ in 0..DEFAULT_CAS_RETRIES {
             let parent = self.refs.head_get(head)?;
             let parents = parent.into_iter().collect::<Vec<_>>();
-            let state_root = self.resolve_state_root(head)?;
+
+            // Capture the staged state ref so we can detect a concurrent
+            // staged write between this snapshot and the ref-sync CAS below.
+            // Derive `state_root` from the same snapshot rather than calling
+            // `resolve_state_root` (which would re-read the ref and could
+            // observe a peer's write, producing a spurious mismatch later).
+            let staged_before = self.refs.state_get(head)?;
+            let state_root = match staged_before {
+                Some(s) => s,
+                None => match parent {
+                    Some(commit_hash) => self.commit_store.get_commit(commit_hash)?.state_root,
+                    None => self.state_store.empty_root()?,
+                },
+            };
             let candidate = self.commit_store.create_commit(
                 parents,
                 state_root,
@@ -209,13 +222,33 @@ impl Database {
                 message.to_string(),
             )?;
 
-            if !self.sync_state_ref_for_commit(head, state_root)? {
-                continue;
+            if !self
+                .refs
+                .state_compare_and_set(head, staged_before, state_root)?
+            {
+                // Either a peer committed (advancing both head + state ref),
+                // in which case we should retry against the new parent — or
+                // someone staged work without committing, in which case
+                // landing this commit would silently roll their work back.
+                // Distinguish by re-reading the head: if it moved, retry;
+                // otherwise fail loudly so the caller can react.
+                let parent_now = self.refs.head_get(head)?;
+                if parent_now != parent {
+                    continue;
+                }
+                return Err(anyhow::anyhow!(
+                    "concurrent state advance on head '{}': staged state changed during commit; \
+                     refusing to overwrite. Retry the commit against the updated state.",
+                    head
+                ));
             }
 
             if self.refs.head_compare_and_set(head, parent, candidate)? {
                 return Ok(candidate);
             }
+            // Head moved after we synced state. State ref now equals `state_root`,
+            // so the next iteration's `staged_before` will be `Some(state_root)`
+            // and the resolve will agree, making the next state CAS a no-op.
         }
 
         Err(anyhow::anyhow!(
@@ -326,18 +359,6 @@ impl Database {
         EncryptionRuntime::from_config(enc.clone(), password).ok().map(Arc::new)
     }
 
-    fn sync_state_ref_for_commit(&self, head: &str, state_root: Hash) -> Result<bool> {
-        for _ in 0..DEFAULT_CAS_RETRIES {
-            let expected_state = self.refs.state_get(head)?;
-            if self
-                .refs
-                .state_compare_and_set(head, expected_state, state_root)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
 }
 
 pub fn init(path: impl AsRef<Path>) -> Result<()> {
@@ -623,5 +644,106 @@ mod tests {
             .create_commit_at_head("main", "agent", "m1", vec![])
             .unwrap();
         assert_eq!(db.refs.head_get("main").unwrap(), Some(commit));
+    }
+
+    #[test]
+    fn commit_preserves_latest_staged_state_sequential() {
+        // Baseline: after staging v1 then v2, a commit must capture v2 — never
+        // a previously-observed staged value.
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let s1 = db.state_set_at_head("main", b"k", b"v1").unwrap();
+        let s2 = db.state_set_at_head("main", b"k", b"v2").unwrap();
+        assert_ne!(s1, s2);
+
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![])
+            .unwrap();
+
+        assert_eq!(db.refs.state_get("main").unwrap(), Some(s2));
+        let c = db.commit_store.get_commit(commit).unwrap();
+        assert_eq!(c.state_root, s2);
+        assert_eq!(
+            db.state_store.get(c.state_root, b"k").unwrap(),
+            Some(b"v2".to_vec())
+        );
+    }
+
+    #[test]
+    fn concurrent_staged_writes_never_silently_rolled_back() {
+        // Regression for issue #2: a commit must not silently roll back staged
+        // state. We run a writer that monotonically increases the stored value
+        // and a committer that races against it, while a watcher samples the
+        // state ref and flags any backwards movement. With the bug, the commit
+        // path would CAS the state ref to a stale value, which the watcher
+        // would observe as a decrease.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Arc::new(Database::open(&db_root).unwrap());
+
+        let _ = db.state_set_at_head("main", b"k", b"0").unwrap();
+        let _ = db
+            .create_commit_at_head("main", "init", "init", vec![])
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer_db = Arc::clone(&db);
+        let writer_stop = Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for i in 1..=150u32 {
+                if writer_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let v = i.to_string();
+                let _ = writer_db.state_set_at_head("main", b"k", v.as_bytes());
+            }
+        });
+
+        let watcher_db = Arc::clone(&db);
+        let watcher_stop = Arc::clone(&stop);
+        let watcher = std::thread::spawn(move || {
+            let mut last_seen: Option<u32> = None;
+            let mut violations: Vec<(u32, u32)> = Vec::new();
+            while !watcher_stop.load(Ordering::Relaxed) {
+                let n = match watcher_db.refs.state_get("main") {
+                    Ok(Some(root)) => match watcher_db.state_store.get(root, b"k") {
+                        Ok(Some(val)) => std::str::from_utf8(&val)
+                            .ok()
+                            .and_then(|s| s.parse::<u32>().ok()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    if let Some(prev) = last_seen
+                        && n < prev
+                    {
+                        violations.push((prev, n));
+                    }
+                    last_seen = Some(n);
+                }
+            }
+            violations
+        });
+
+        for _ in 0..150 {
+            let _ = db.create_commit_at_head("main", "agent", "m", vec![]);
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        let violations = watcher.join().unwrap();
+
+        assert!(
+            violations.is_empty(),
+            "state ref moved backwards (rollback bug): {:?}",
+            violations
+        );
     }
 }
