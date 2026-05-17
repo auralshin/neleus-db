@@ -7,11 +7,12 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Parser, Subcommand, ValueEnum};
 use neleus_db::canonical::from_cbor;
+use neleus_db::clock::now_unix;
 use neleus_db::commit::Commit;
 use neleus_db::db::Database;
 use neleus_db::hash::Hash;
 use neleus_db::index::{SearchHit, SearchIndexStore};
-use neleus_db::manifest::{ChunkManifest, ChunkingSpec, DocManifest, RunManifest, now_unix};
+use neleus_db::manifest::{ChunkManifest, ChunkingSpec, DocManifest, RunManifest};
 use neleus_db::state::{StateManifest, StateSegment};
 
 #[derive(Debug, Parser)]
@@ -312,6 +313,7 @@ fn main() -> Result<()> {
                     let prompt = db.blob_store.put(&fs::read(prompt_file.clone())?)?;
                     let (inputs, outputs) = parse_io_hashes(&io_hashes)?;
 
+                    let started_at = now_unix()?;
                     let run = RunManifest {
                         schema_version: 1,
                         model,
@@ -319,8 +321,8 @@ fn main() -> Result<()> {
                         tool_calls: vec![],
                         inputs,
                         outputs,
-                        started_at: now_unix(),
-                        ended_at: now_unix(),
+                        started_at,
+                        ended_at: now_unix()?,
                     };
                     let h = db.manifest_store.put_manifest(&run)?;
                     emit(

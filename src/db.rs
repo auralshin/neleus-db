@@ -1,14 +1,15 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::io;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::{cleanup_orphan_temps, write_atomic};
 use crate::blob_store::BlobStore;
+use crate::clock::now_unix;
 use crate::commit::CommitStore;
 use crate::encryption::{EncryptionConfig, EncryptionRuntime};
 use crate::hash::Hash;
@@ -66,7 +67,7 @@ impl Database {
             let cfg = Config {
                 schema_version: DB_CONFIG_SCHEMA_VERSION,
                 hashing: "blake3".into(),
-                created_at: now_unix(),
+                created_at: now_unix()?,
                 verify_on_read: false,
                 compression: None,
                 encryption: None,
@@ -439,13 +440,6 @@ fn build_encryption_runtime(config: &Config) -> Result<Option<Arc<EncryptionRunt
     )?;
     let runtime = EncryptionRuntime::from_config(enc.clone(), password)?;
     Ok(Some(Arc::new(runtime)))
-}
-
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock drift before epoch")
-        .as_secs()
 }
 
 /// Walk a CAS directory recursively and re-encrypt every file from

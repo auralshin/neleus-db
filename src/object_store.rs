@@ -80,7 +80,7 @@ impl ObjectStore {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
-        compression::decompress_if_compressed(&after_decrypt)
+        Ok(compression::decompress_if_compressed(&after_decrypt)?.into_owned())
     }
 
     pub fn get_typed_bytes(&self, tag: &[u8], hash: Hash) -> Result<Vec<u8>> {
@@ -100,7 +100,7 @@ impl ObjectStore {
                 ));
             }
         }
-        Ok(bytes)
+        Ok(bytes.into_owned())
     }
 
     pub fn exists(&self, hash: Hash) -> bool {

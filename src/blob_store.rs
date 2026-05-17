@@ -83,8 +83,8 @@ impl BlobStore {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
-        // Always try-decompress; backward-compatible because uncompressed blobs
-        // won't start with the zstd magic number.
+        // Always try-decompress; the helper returns a borrow when no
+        // decompression was needed, so the uncompressed path pays no copy.
         let bytes = compression::decompress_if_compressed(&after_decrypt)?;
         if self.verify_on_read {
             let computed = hash_blob(&bytes);
@@ -96,7 +96,7 @@ impl BlobStore {
                 ));
             }
         }
-        Ok(bytes)
+        Ok(bytes.into_owned())
     }
 
     pub fn exists(&self, hash: Hash) -> bool {

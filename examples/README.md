@@ -8,7 +8,6 @@ This directory contains runnable examples for common `neleus-db` workflows.
 cargo run --example 01_basic_blob_storage
 cargo run --example 02_state_and_commits
 cargo run --example 03_document_chunking
-cargo run --example 04_provenance_tracking
 cargo run --example 05_state_proofs
 ```
 
@@ -22,9 +21,6 @@ Shows versioned state roots, Git-like commits, head updates, and time-travel rea
 
 ### 03) Document chunking
 Shows deterministic fixed chunking via `DocManifest` and retrieving chunk blobs.
-
-### 04) Provenance tracking
-Shows claim/evidence tracking with `ProvenanceRecord` and `ProvenanceManifest`.
 
 ### 05) State proofs
 Shows membership, non-membership, and deletion proofs using `StateStore::proof` and `verify_proof`.

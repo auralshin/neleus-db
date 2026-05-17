@@ -1,11 +1,10 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::blob_store::BlobStore;
-use crate::hash::{Hash, hash_typed};
-use crate::merkle::{MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
+use crate::clock::now_unix;
+use crate::hash::Hash;
+use crate::merkle::{MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
 use crate::object_store::ObjectStore;
 
 const MANIFEST_TAG: &[u8] = b"manifest:";
@@ -103,10 +102,14 @@ impl ManifestStore {
             chunk_hashes.push(blob_store.put(&chunk)?);
         }
 
+        let created_at = match created_at {
+            Some(t) => t,
+            None => now_unix()?,
+        };
         let doc = DocManifest {
             schema_version: MANIFEST_SCHEMA_VERSION,
             source,
-            created_at: created_at.unwrap_or_else(now_unix),
+            created_at,
             chunking,
             chunks: chunk_hashes,
             original,
@@ -156,15 +159,15 @@ impl ManifestReferences for ChunkManifest {
     }
 }
 
-pub fn manifest_reference_leaf_hash(blob_hash: Hash) -> Hash {
-    hash_typed(MANIFEST_REF_LEAF_TAG, blob_hash.as_bytes())
+pub fn manifest_reference_leaf(blob_hash: Hash) -> MerkleLeaf {
+    MerkleLeaf::new(MANIFEST_REF_LEAF_TAG, blob_hash.as_bytes())
 }
 
 pub fn manifest_reference_root<T: ManifestReferences>(manifest: &T) -> Hash {
-    let leaves: Vec<Hash> = manifest
+    let leaves: Vec<MerkleLeaf> = manifest
         .referenced_blobs()
         .into_iter()
-        .map(manifest_reference_leaf_hash)
+        .map(manifest_reference_leaf)
         .collect();
     merkle_root(&leaves)
 }
@@ -175,12 +178,12 @@ pub fn prove_blob_inclusion<T: ManifestReferences>(
 ) -> Option<MerkleProof> {
     let refs = manifest.referenced_blobs();
     let idx = refs.iter().position(|h| *h == blob_hash)?;
-    let leaves: Vec<Hash> = refs.into_iter().map(manifest_reference_leaf_hash).collect();
+    let leaves: Vec<MerkleLeaf> = refs.into_iter().map(manifest_reference_leaf).collect();
     prove_inclusion(&leaves, idx)
 }
 
 pub fn verify_blob_inclusion(root: Hash, blob_hash: Hash, proof: &MerkleProof) -> bool {
-    verify_inclusion(root, manifest_reference_leaf_hash(blob_hash), proof)
+    verify_inclusion(root, manifest_reference_leaf(blob_hash), proof)
 }
 
 pub fn put_manifest<T: Serialize>(store: &ManifestStore, manifest: &T) -> Result<Hash> {
@@ -189,13 +192,6 @@ pub fn put_manifest<T: Serialize>(store: &ManifestStore, manifest: &T) -> Result
 
 pub fn get_manifest<T: DeserializeOwned>(store: &ManifestStore, hash: Hash) -> Result<T> {
     store.get_manifest(hash)
-}
-
-pub fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock drift before epoch")
-        .as_secs()
 }
 
 pub fn chunk_fixed(input: &[u8], chunk_size: usize, overlap: usize) -> Result<Vec<Vec<u8>>> {
@@ -350,13 +346,6 @@ mod tests {
         let doc: DocManifest = ms.get_manifest(hash).unwrap();
         assert_eq!(doc.chunks.len(), 3);
         assert_eq!(doc.created_at, 123);
-    }
-
-    #[test]
-    fn now_unix_progresses_or_stays() {
-        let a = now_unix();
-        let b = now_unix();
-        assert!(b >= a);
     }
 
     #[test]
