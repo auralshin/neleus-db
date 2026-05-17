@@ -332,13 +332,20 @@ impl Database {
 
     /// Re-encrypt all blobs and objects with a new password.
     ///
-    /// Holds an exclusive `meta/rotation.lock` while running, so concurrent
-    /// readers don't observe partially rewritten files. Per file, decryption
-    /// is attempted first with the OLD runtime: success → re-encrypt with
-    /// new. If old-key decrypt fails, the new runtime is tried; success
-    /// means the file was already rotated in a previous interrupted run, so
-    /// it's left alone. If both fail, the file is genuinely corrupt and the
-    /// rotation aborts rather than silently skipping the failure.
+    /// Holds an exclusive `meta/rotation.lock` while running, so a second
+    /// rotation cannot race this one. Per file, decryption is attempted
+    /// first with the OLD runtime: success → re-encrypt with the new. If
+    /// old-key decrypt fails, the new runtime is tried; success means the
+    /// file was already rotated in a previous interrupted run, so it's left
+    /// alone. If both fail, the file is genuinely corrupt and the rotation
+    /// aborts rather than silently skipping the failure.
+    ///
+    /// **Caller responsibility:** other `Database` handles opened before
+    /// this call hold an `EncryptionRuntime` derived from the *old* master
+    /// key. After rotation completes those handles can no longer decrypt
+    /// anything on disk and must be dropped; reopen with the new password.
+    /// File operations remain atomic during rotation, but cross-instance
+    /// coherence is not provided.
     ///
     /// Returns the number of files re-encrypted under the new key (i.e.,
     /// excludes already-rotated files).

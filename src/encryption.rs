@@ -67,15 +67,23 @@ pub struct EncryptionConfig {
     pub enabled: bool,
     pub algorithm: String,
     pub kdf: String,
+    /// Advisory only. AEAD key length is fixed at 32 bytes for both
+    /// supported algorithms; validation rejects any other value.
     pub key_size: usize,
+    /// Advisory only. Per-blob HKDF salt length is fixed at 16 bytes;
+    /// validation requires `salt_size >= 16`.
     pub salt_size: usize,
+    /// Advisory only. AEAD nonce length is fixed at 12 bytes; validation
+    /// rejects any other value.
     #[serde(default = "default_nonce_size")]
     pub nonce_size: usize,
     #[serde(default = "default_kdf_iterations")]
     pub kdf_iterations: u32,
     /// Long-lived random salt for master-key derivation. Persisted in
     /// `meta/config.json`. Hex-encoded so the config remains human-readable.
-    /// Set on first enabling of encryption; never rotated.
+    /// Set on first open of an encryption-enabled database; never rotated.
+    /// Rotating the *password* (via `Database::rotate_encryption_key`)
+    /// rewrites every ciphertext but leaves `master_salt` unchanged.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub master_salt: String,
 }
