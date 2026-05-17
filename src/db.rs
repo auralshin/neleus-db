@@ -102,7 +102,16 @@ impl Database {
             Duration::from_secs(10),
         )?;
 
-        let (config, migrated) = load_and_migrate_config(&cfg_path)?;
+        let (mut config, mut migrated) = load_and_migrate_config(&cfg_path)?;
+        // Lazily generate the master_salt for any encryption config that
+        // pre-dates the master-key flow. Persisted before the runtime is
+        // built so the very first encrypted write can decrypt on next open.
+        if let Some(enc) = config.encryption.as_mut()
+            && enc.enabled
+            && crate::encryption::ensure_master_salt(enc)?
+        {
+            migrated = true;
+        }
         if migrated {
             let bytes = serde_json::to_vec_pretty(&config)?;
             write_atomic(&cfg_path, &bytes)?;
@@ -120,14 +129,15 @@ impl Database {
             root.join("objects"),
             config.verify_on_read,
             compress,
-            encryption,
+            encryption.clone(),
         );
         let wal = Wal::new(root.join("wal"));
         let refs = RefsStore::new(root.join("refs"), wal.clone());
         let state_store = StateStore::new(object_store.clone(), blob_store.clone(), wal.clone());
         let manifest_store = ManifestStore::new(object_store.clone());
         let commit_store = CommitStore::new(object_store.clone());
-        let index_store = SearchIndexStore::new(root.join("index"));
+        let index_store =
+            SearchIndexStore::with_encryption(root.join("index"), encryption.clone());
 
         blob_store.ensure_dir()?;
         object_store.ensure_dir()?;
@@ -322,39 +332,65 @@ impl Database {
 
     /// Re-encrypt all blobs and objects with a new password.
     ///
-    /// Encryption must already be enabled in the database config.  The new
-    /// password is used to produce new per-blob ciphertext; the KDF algorithm
-    /// and iteration count stay the same.  Writes are atomic (temp → rename)
-    /// so a crash mid-rotation leaves at most one file in the old format; the
-    /// next call to `rotate_encryption_key` with either password will fix it.
+    /// Holds an exclusive `meta/rotation.lock` while running, so a second
+    /// rotation cannot race this one. Per file, decryption is attempted
+    /// first with the OLD runtime: success → re-encrypt with the new. If
+    /// old-key decrypt fails, the new runtime is tried; success means the
+    /// file was already rotated in a previous interrupted run, so it's left
+    /// alone. If both fail, the file is genuinely corrupt and the rotation
+    /// aborts rather than silently skipping the failure.
     ///
-    /// Returns the number of files successfully re-encrypted.
+    /// **Caller responsibility:** other `Database` handles opened before
+    /// this call hold an `EncryptionRuntime` derived from the *old* master
+    /// key. After rotation completes those handles can no longer decrypt
+    /// anything on disk and must be dropped; reopen with the new password.
+    /// File operations remain atomic during rotation, but cross-instance
+    /// coherence is not provided.
+    ///
+    /// Returns the number of files re-encrypted under the new key (i.e.,
+    /// excludes already-rotated files).
     pub fn rotate_encryption_key(&self, new_password: &str) -> Result<usize> {
         let enc_config = self
             .config
             .encryption
             .as_ref()
             .filter(|e| e.enabled)
-            .ok_or_else(|| {
-                anyhow::anyhow!("encryption is not enabled; nothing to rotate")
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("encryption is not enabled; nothing to rotate"))?;
 
         if new_password.is_empty() {
             return Err(anyhow::anyhow!("new password cannot be empty"));
         }
+
+        let old_runtime = self
+            .encryption_runtime()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rotate_encryption_key needs the current runtime; \
+                     set NELEUS_DB_ENCRYPTION_PASSWORD"
+                )
+            })?;
 
         let new_runtime = Arc::new(EncryptionRuntime::from_config(
             enc_config.clone(),
             new_password.to_string(),
         )?);
 
-        let mut count = 0usize;
+        // Serialize concurrent rotations and block any reader that takes the
+        // same lock. (Regular reads do not take this lock today, so this
+        // primarily protects against two rotations racing.)
+        let _rotation_lock = acquire_lock(
+            self.root.join("meta").join("rotation.lock"),
+            Duration::from_secs(30),
+        )?;
 
+        let mut count = 0usize;
         for dir in [self.root.join("blobs"), self.root.join("objects")] {
-            count += reencrypt_cas_dir(&dir, &self.encryption_runtime(), new_runtime.clone())?;
+            count += reencrypt_cas_dir(&dir, &old_runtime, &new_runtime)?;
         }
 
-        // Persist the new config (algorithm/iterations unchanged; salt is per-blob).
+        // Persist the config (algorithm/iterations unchanged; master_salt is
+        // long-lived and must not be rotated together with the password —
+        // otherwise old ciphertext on disk becomes unreadable).
         let cfg_path = self.root.join("meta").join("config.json");
         let bytes = serde_json::to_vec_pretty(&self.config)?;
         crate::atomic::write_atomic(&cfg_path, &bytes)?;
@@ -366,7 +402,9 @@ impl Database {
         // Re-derive from stored config + env var (same as Database::open).
         let enc = self.config.encryption.as_ref().filter(|e| e.enabled)?;
         let password = std::env::var("NELEUS_DB_ENCRYPTION_PASSWORD").ok()?;
-        EncryptionRuntime::from_config(enc.clone(), password).ok().map(Arc::new)
+        EncryptionRuntime::from_config(enc.clone(), password)
+            .ok()
+            .map(Arc::new)
     }
 
 }
@@ -432,13 +470,18 @@ fn now_unix() -> u64 {
         .as_secs()
 }
 
-/// Walk a CAS directory recursively and re-encrypt every file with `new_runtime`.
-/// Files that fail to decrypt with the old runtime are skipped (they may already
-/// use the new key from a previous partial rotation).
+/// Walk a CAS directory recursively and re-encrypt every file from
+/// `old_runtime` to `new_runtime`.
+///
+/// Decryption with the new runtime is tried as a fallback before declaring
+/// failure, so files left in the new format by a previously-interrupted
+/// rotation are recognized and left alone. A file that decrypts with
+/// neither key is genuinely corrupt; the rotation aborts with an error
+/// rather than silently masking it.
 fn reencrypt_cas_dir(
     dir: &Path,
-    old_runtime: &Option<Arc<EncryptionRuntime>>,
-    new_runtime: Arc<EncryptionRuntime>,
+    old_runtime: &Arc<EncryptionRuntime>,
+    new_runtime: &Arc<EncryptionRuntime>,
 ) -> Result<usize> {
     let mut count = 0usize;
     let entries = match fs::read_dir(dir) {
@@ -451,10 +494,9 @@ fn reencrypt_cas_dir(
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            count += reencrypt_cas_dir(&path, old_runtime, new_runtime.clone())?;
+            count += reencrypt_cas_dir(&path, old_runtime, new_runtime)?;
             continue;
         }
-        // Skip non-content files (e.g. temp files left by atomic writes).
         let is_content = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -466,19 +508,21 @@ fn reencrypt_cas_dir(
 
         let raw = fs::read(&path)?;
 
-        // Decrypt with old key, or pass through if no old runtime.
-        let plaintext = match old_runtime {
-            Some(rt) => match rt.decrypt(&raw) {
-                Ok(p) => p,
-                Err(_) => {
-                    // May already be encrypted with the new key; skip.
+        let plaintext = match old_runtime.decrypt(&raw) {
+            Ok(p) => p,
+            Err(_) => {
+                // Old key failed — was this file already rotated?
+                if new_runtime.decrypt(&raw).is_ok() {
+                    // Yes; leave it. Resumes a previously-interrupted run.
                     continue;
                 }
-            },
-            None => raw,
+                return Err(anyhow::anyhow!(
+                    "rotation aborted: {} decrypts with neither old nor new key (likely corrupted)",
+                    path.display()
+                ));
+            }
         };
 
-        // Re-encrypt with the new key.
         let new_ciphertext = new_runtime.encrypt(&plaintext)?;
         crate::atomic::write_atomic(&path, &new_ciphertext)?;
         count += 1;
@@ -774,6 +818,160 @@ mod tests {
             violations.is_empty(),
             "state ref moved backwards (rollback bug): {:?}",
             violations
+        );
+    }
+
+    // ---------- Issue #3: encryption rebuild ----------
+
+    /// Serialize encryption tests that touch the global
+    /// `NELEUS_DB_ENCRYPTION_PASSWORD` env var. Cargo runs tests in parallel
+    /// by default and `std::env::set_var` is process-global.
+    fn encryption_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static M: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        M.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Build an encrypted DB from scratch: write an encryption-enabled config
+    /// *before* the first open, so every object the DB writes (including the
+    /// empty state root materialized by init) is encrypted under `password`.
+    /// Returns the open Database; caller holds the encryption_test_lock for
+    /// the duration.
+    fn init_encrypted_db(path: &Path, password: &str) -> Database {
+        use crate::encryption::EncryptionConfig;
+
+        fs::create_dir_all(path.join("blobs")).unwrap();
+        fs::create_dir_all(path.join("objects")).unwrap();
+        fs::create_dir_all(path.join("refs").join("heads")).unwrap();
+        fs::create_dir_all(path.join("refs").join("states")).unwrap();
+        fs::create_dir_all(path.join("index")).unwrap();
+        fs::create_dir_all(path.join("wal")).unwrap();
+        fs::create_dir_all(path.join("meta")).unwrap();
+
+        let cfg = Config {
+            schema_version: DB_CONFIG_SCHEMA_VERSION,
+            hashing: "blake3".into(),
+            created_at: 0,
+            verify_on_read: false,
+            compression: None,
+            encryption: Some(EncryptionConfig {
+                enabled: true,
+                algorithm: "aes-256-gcm".into(),
+                ..EncryptionConfig::default()
+            }),
+        };
+        write_atomic(
+            &path.join("meta").join("config.json"),
+            &serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+        // SAFETY: parallel tests touching this env var are serialized via
+        // `encryption_test_lock`.
+        unsafe { std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", password) };
+        let db = Database::open(path).unwrap();
+        // Materialize the empty state root under encryption.
+        let _ = db.state_store.empty_root().unwrap();
+        db
+    }
+
+    /// Issue #3: search index file must not contain plaintext chunk text
+    /// when encryption is enabled. Previously the index was written via raw
+    /// `write_atomic`, bypassing the encryption layer.
+    #[test]
+    fn search_index_is_encrypted_on_disk_when_encryption_enabled() {
+        use crate::manifest::{ChunkingSpec, DocManifest};
+
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let db = init_encrypted_db(&db_root, "index-test-password");
+
+        // Add a doc manifest with distinctive plaintext.
+        let needle = b"SECRET-NEEDLE-XYZZY-PLAINTEXT-CHUNK";
+        let chunk_hash = db.blob_store.put(needle).unwrap();
+        let original_hash = db.blob_store.put(needle).unwrap();
+        let doc = DocManifest {
+            schema_version: 1,
+            source: "test".into(),
+            created_at: 0,
+            chunking: ChunkingSpec {
+                method: "fixed".into(),
+                chunk_size: needle.len(),
+                overlap: 0,
+            },
+            chunks: vec![chunk_hash],
+            original: original_hash,
+        };
+        let manifest_hash = db.manifest_store.put_manifest(&doc).unwrap();
+
+        let _ = db.state_set_at_head("main", b"seed", b"v").unwrap();
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![manifest_hash])
+            .unwrap();
+        db.ensure_index_ready(commit).unwrap();
+
+        let path = db_root
+            .join("index")
+            .join(commit.to_string())
+            .join("search_index.json");
+        let raw = fs::read(&path).unwrap();
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "plaintext chunk text leaked into on-disk search index"
+        );
+
+        // Reads through the store still succeed.
+        let parsed = db.index_store.read_index(commit).unwrap();
+        assert!(parsed.chunks.iter().any(|c| c.chunk_hash == chunk_hash));
+    }
+
+    /// Issue #3: rotation must read what it wrote — pre-rotation blobs are
+    /// decryptable with the new password after a successful rotation.
+    #[test]
+    fn rotate_encryption_key_preserves_round_trip() {
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let db = init_encrypted_db(&db_root, "old-password");
+
+        let h = db.blob_store.put(b"secret-payload").unwrap();
+        assert_eq!(db.blob_store.get(h).unwrap(), b"secret-payload");
+
+        let rotated = db.rotate_encryption_key("new-strong-password").unwrap();
+        assert!(rotated > 0, "expected at least one file rotated");
+
+        // Reopen with the new password.
+        drop(db);
+        // SAFETY: serialized via `encryption_test_lock`.
+        unsafe {
+            std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "new-strong-password")
+        };
+        let db = Database::open(&db_root).unwrap();
+        assert_eq!(db.blob_store.get(h).unwrap(), b"secret-payload");
+    }
+
+    /// Issue #3: rotation must fail loudly on a genuinely-corrupted file
+    /// rather than silently skip it.
+    #[test]
+    fn rotate_encryption_key_aborts_on_corruption() {
+        use crate::cas::CasStore;
+
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let db = init_encrypted_db(&db_root, "old-password");
+
+        let h = db.blob_store.put(b"victim").unwrap();
+        let blob_path = CasStore::new(db_root.join("blobs")).path_for(h);
+
+        // Overwrite the on-disk ciphertext with garbage that decrypts with
+        // neither old nor new key.
+        fs::write(&blob_path, b"this is not a valid envelope").unwrap();
+
+        let err = db.rotate_encryption_key("new-password").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rotation aborted"),
+            "expected rotation-abort error, got: {msg}"
         );
     }
 }

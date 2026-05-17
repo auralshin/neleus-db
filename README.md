@@ -235,10 +235,12 @@ Example config snippet:
     "key_size": 32,
     "salt_size": 16,
     "nonce_size": 12,
-    "kdf_iterations": 210000
+    "kdf_iterations": 600000
   }
 }
 ```
+
+`master_salt` is generated automatically on the first open of an encryption-enabled database and added to `config.json`. Do not edit or rotate it manually — every existing ciphertext on disk depends on it. Rotate the *password* via `Database::rotate_encryption_key` instead.
 
 ## Testing
 
