@@ -1,10 +1,10 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::atomic::build_temp_name;
+use crate::atomic::{build_temp_name, maybe_sync_dir, maybe_sync_file};
 use crate::hash::Hash;
 
 #[derive(Clone, Debug)]
@@ -64,7 +64,7 @@ impl CasStore {
                 .with_context(|| format!("failed creating temp file {}", tmp.display()))?;
             f.write_all(bytes)
                 .with_context(|| format!("failed writing temp file {}", tmp.display()))?;
-            f.sync_all()
+            maybe_sync_file(&f)
                 .with_context(|| format!("failed syncing temp file {}", tmp.display()))?;
         }
 
@@ -75,9 +75,7 @@ impl CasStore {
 
         match link_result {
             Ok(()) => {
-                File::open(parent)
-                    .with_context(|| format!("failed opening parent dir {}", parent.display()))?
-                    .sync_all()
+                maybe_sync_dir(parent)
                     .with_context(|| format!("failed syncing parent dir {}", parent.display()))?;
                 Ok(())
             }

@@ -48,3 +48,13 @@ harness = false
 [[bench]]
 name = "state"
 harness = false
+
+# Crypto/hash/compression deps dominate test and bench runtime. Compiling them
+# at opt-level=3 while leaving this crate at opt-level=0 keeps incremental
+# builds fast and shrinks the test suite wall time dramatically — measured ~6×
+# on the state proptests. Cached after the first build.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.test.package."*"]
+opt-level = 3

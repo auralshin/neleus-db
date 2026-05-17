@@ -20,6 +20,12 @@ use crate::manifest::{ChunkManifest, DocManifest, ManifestStore};
 /// from `serde_json::to_vec_pretty` to canonical DAG-CBOR so the returned
 /// `IndexVersionHash` is byte-stable across reserialization cycles and
 /// reproducible across machines.
+///
+/// `semantic_doc_len` was rekeyed from `BTreeMap<String, u32>` to
+/// `BTreeMap<Hash, u32>` to remove a `to_string()` allocation per posting per
+/// query term on the BM25 hot path. The on-disk encoding is unchanged
+/// (`Hash` still serializes as the same hex string, in the same map order),
+/// so existing v2 indexes remain readable without a rebuild.
 const INDEX_SCHEMA_VERSION: u32 = 2;
 const INDEX_TAG: &[u8] = b"index:";
 
@@ -46,7 +52,7 @@ pub struct SearchIndex {
     pub chunks: Vec<IndexChunk>,
     pub semantic_docs: u32,
     pub avg_doc_len: f32,
-    pub semantic_doc_len: BTreeMap<String, u32>,
+    pub semantic_doc_len: BTreeMap<Hash, u32>,
     pub semantic_doc_freq: BTreeMap<String, u32>,
     pub semantic_postings: BTreeMap<String, Vec<Posting>>,
     pub vector_dim: Option<usize>,
@@ -55,7 +61,7 @@ pub struct SearchIndex {
 type SemanticTables = (
     u32,
     f32,
-    BTreeMap<String, u32>,
+    BTreeMap<Hash, u32>,
     BTreeMap<String, u32>,
     BTreeMap<String, Vec<Posting>>,
 );
@@ -396,7 +402,7 @@ fn semantic_search_index(index: &SearchIndex, query: &str, top_k: usize) -> Vec<
             for posting in postings {
                 let dl = *index
                     .semantic_doc_len
-                    .get(&posting.chunk_hash.to_string())
+                    .get(&posting.chunk_hash)
                     .unwrap_or(&0) as f32;
                 let tf = posting.tf as f32;
                 let norm = k1 * (1.0 - b + b * (dl / avg_dl));
@@ -489,7 +495,7 @@ fn vector_search_index(
 }
 
 fn build_semantic_tables(chunks: &[IndexChunk]) -> SemanticTables {
-    let mut doc_len: BTreeMap<String, u32> = BTreeMap::new();
+    let mut doc_len: BTreeMap<Hash, u32> = BTreeMap::new();
     let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
     let mut postings: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
 
@@ -510,7 +516,7 @@ fn build_semantic_tables(chunks: &[IndexChunk]) -> SemanticTables {
 
         let len = tf.values().copied().sum::<u32>();
         total_len += len;
-        doc_len.insert(chunk.chunk_hash.to_string(), len);
+        doc_len.insert(chunk.chunk_hash, len);
 
         let mut unique = BTreeSet::new();
         for (term, term_tf) in tf {
@@ -810,7 +816,7 @@ mod tests {
         let mut doc_freq: BTreeMap<String, u32> = BTreeMap::new();
         let mut postings: BTreeMap<String, Vec<Posting>> = BTreeMap::new();
         for c in &chunks {
-            doc_len.insert(c.chunk_hash.to_string(), 2);
+            doc_len.insert(c.chunk_hash, 2);
             *doc_freq.entry("common".into()).or_insert(0) += 1;
             postings
                 .entry("common".into())

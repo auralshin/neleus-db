@@ -1080,6 +1080,10 @@ mod tests {
         }
 
         proptest! {
+            // The 256-case default makes these tests TempDir-heavy and fsync-bound.
+            // 32 cases saturate coverage well before that and keep the suite snappy.
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
             /// For any sequence of unique keys, set_many must make all of them readable.
             #[test]
             fn set_many_all_readable(

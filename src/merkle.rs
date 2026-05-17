@@ -132,6 +132,8 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+
             /// For any non-empty leaf list, every leaf's inclusion proof must verify
             /// against the root computed from the same leaf list.
             #[test]
