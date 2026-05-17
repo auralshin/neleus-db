@@ -138,12 +138,13 @@ impl Database {
         let _report: WalRecoveryReport = wal.recover_refs(refs.root())?;
 
         // Remove orphan atomic-write temp files left by dead processes.
-        // Held under the recovery lock, so no concurrent writer is producing
-        // matching names. Live PIDs (including peers and our own) are skipped.
+        // Recursive under blobs/objects (sharded) and refs (`feature/foo`
+        // namespaces create subdirectories). Live PIDs (peers writing now,
+        // or our own) are skipped by `cleanup_orphan_temps`.
         let _ = cleanup_orphan_temps(&root.join("blobs"), true)?;
         let _ = cleanup_orphan_temps(&root.join("objects"), true)?;
-        let _ = cleanup_orphan_temps(&root.join("refs").join("heads"), false)?;
-        let _ = cleanup_orphan_temps(&root.join("refs").join("states"), false)?;
+        let _ = cleanup_orphan_temps(&root.join("refs").join("heads"), true)?;
+        let _ = cleanup_orphan_temps(&root.join("refs").join("states"), true)?;
         let _ = cleanup_orphan_temps(&root.join("meta"), false)?;
 
         Ok(Self {
@@ -639,6 +640,26 @@ mod tests {
         let read_root = db.resolve_state_root("main").unwrap();
         assert_eq!(root, read_root);
         assert_eq!(db.state_store.get(root, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    /// Regression for issue #4: orphan temp files under a nested ref
+    /// namespace (e.g. `refs/heads/feature/`) must be cleaned up by
+    /// `Database::open`. Previously the walk under refs/ wasn't recursive,
+    /// so disk leaked once `feature/foo`-style names were allowed.
+    #[test]
+    fn open_cleans_orphan_temp_under_nested_ref_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+
+        let nested_dir = db_root.join("refs").join("heads").join("feature");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let orphan = nested_dir.join(format!(".foo.tmp-{}-1-0", i32::MAX as u32));
+        fs::write(&orphan, b"partial").unwrap();
+        assert!(orphan.exists());
+
+        let _db = Database::open(&db_root).unwrap();
+        assert!(!orphan.exists(), "nested orphan temp survived open");
     }
 
     #[test]

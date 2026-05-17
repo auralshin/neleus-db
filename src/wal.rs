@@ -143,7 +143,15 @@ impl Wal {
             match entry.op {
                 WalOp::RefHeadSet => {
                     if let WalPayload::RefUpdate { name, hash } = entry.payload {
-                        validate_ref_name(&name)?;
+                        // A stricter validator may now reject names that an
+                        // older writer accepted. Treat such entries as
+                        // malformed-on-replay and roll back rather than
+                        // failing `Database::open` outright.
+                        if validate_ref_name(&name).is_err() {
+                            self.end(&path)?;
+                            report.rolled_back += 1;
+                            continue;
+                        }
                         write_atomic(
                             &refs_root.join("heads").join(name),
                             format!("{hash}\n").as_bytes(),
@@ -155,7 +163,11 @@ impl Wal {
                 }
                 WalOp::RefStateSet => {
                     if let WalPayload::RefUpdate { name, hash } = entry.payload {
-                        validate_ref_name(&name)?;
+                        if validate_ref_name(&name).is_err() {
+                            self.end(&path)?;
+                            report.rolled_back += 1;
+                            continue;
+                        }
                         write_atomic(
                             &refs_root.join("states").join(name),
                             format!("{hash}\n").as_bytes(),
@@ -285,6 +297,37 @@ mod tests {
             "WAL filename collision under burst"
         );
         assert_eq!(wal.pending().unwrap().len(), 1000);
+    }
+
+    /// Regression: a WAL entry written under the previous (laxer) ref-name
+    /// validator must not block `Database::open` after a validator tightening.
+    /// `recover_refs` rolls back invalid-on-replay entries instead of
+    /// propagating the error.
+    #[test]
+    fn wal_rolls_back_ref_entry_with_newly_invalid_name() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::new(dir.path().join("wal"));
+        wal.ensure_dir().unwrap();
+
+        // `-flag-like` is rejected by the new validator. Construct the
+        // entry directly (bypassing `make_ref_entry` if it validated) so we
+        // simulate a stale on-disk entry from an older build.
+        let entry = WalEntry {
+            schema_version: WAL_SCHEMA_VERSION,
+            op: WalOp::RefHeadSet,
+            payload: WalPayload::RefUpdate {
+                name: "-flag-like".into(),
+                hash: hash_blob(b"h"),
+            },
+        };
+        let raw = to_cbor(&entry).unwrap();
+        let path = dir.path().join("wal").join("1-1-0-refheadset.wal");
+        fs::write(&path, raw).unwrap();
+
+        let report = wal.recover_refs(&dir.path().join("refs")).unwrap();
+        assert_eq!(report.replayed, 0);
+        assert_eq!(report.rolled_back, 1);
+        assert!(wal.pending().unwrap().is_empty());
     }
 
     /// Regression: state WAL entries are forensic only and must always be

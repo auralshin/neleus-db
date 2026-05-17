@@ -101,7 +101,15 @@ pub fn cleanup_orphan_temps(root: &Path, recursive: bool) -> Result<usize> {
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        let file_type = entry.file_type()?;
+        // A concurrent peer's atomic write may rename a temp away between
+        // `read_dir` and our `file_type` call. Treat NotFound as benign.
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(e).context(format!("failed stat'ing {}", path.display()));
+            }
+        };
 
         if file_type.is_dir() {
             if recursive {
