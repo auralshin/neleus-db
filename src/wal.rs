@@ -1,15 +1,29 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic::write_atomic;
 use crate::canonical::{from_cbor, to_cbor};
 use crate::hash::Hash;
+use crate::refs::validate_ref_name;
 
 const WAL_SCHEMA_VERSION: u32 = 1;
+
+/// Per-process counter appended to WAL filenames. Combined with PID and a
+/// nanosecond timestamp, this guarantees uniqueness even under bursts that
+/// share a wall-clock nanosecond.
+static WAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn wal_filename(op: &str) -> Result<String> {
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let pid = std::process::id();
+    let seq = WAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(format!("{ts}-{pid}-{seq}-{op}.wal"))
+}
 
 #[derive(Clone, Debug)]
 pub struct Wal {
@@ -61,9 +75,8 @@ impl Wal {
 
     pub fn begin_entry(&self, entry: &WalEntry) -> Result<PathBuf> {
         self.ensure_dir()?;
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let safe_op = format!("{:?}", entry.op).to_lowercase();
-        let path = self.root.join(format!("{ts}-{safe_op}.wal"));
+        let path = self.root.join(wal_filename(&safe_op)?);
         let bytes = to_cbor(entry)?;
         write_atomic(&path, &bytes)
             .with_context(|| format!("failed to write WAL entry {}", path.display()))?;
@@ -72,9 +85,8 @@ impl Wal {
 
     pub fn begin(&self, op: &str, payload: &[u8]) -> Result<PathBuf> {
         self.ensure_dir()?;
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let safe_op = op.replace('/', "_");
-        let path = self.root.join(format!("{ts}-{safe_op}.wal"));
+        let path = self.root.join(wal_filename(&safe_op)?);
         write_atomic(&path, payload)
             .with_context(|| format!("failed to write WAL entry {}", path.display()))?;
         Ok(path)
@@ -154,8 +166,19 @@ impl Wal {
                     }
                 }
                 WalOp::StateSet | WalOp::StateDel | WalOp::StateCompact => {
-                    // Immutable state objects are content addressed; ref mutation is recovered
-                    // separately, so an interrupted state mutation WAL can be safely discarded.
+                    // State WAL entries are forensic only and are NEVER replayed.
+                    //
+                    // State objects are content-addressed and immutable; an interrupted
+                    // state mutation has at most written partial garbage objects (which
+                    // are unreachable, since no ref points at them) and never advanced
+                    // the state ref. The real commit point is the ref CAS, which is
+                    // recovered via the `RefStateSet` arm above.
+                    //
+                    // If a future change ever needs to replay state ops, it MUST also
+                    // confirm idempotency — applying the recorded mutation twice when a
+                    // prior partial run already produced the resulting object would
+                    // succeed in CAS (no-op) but a partial state graph could leave
+                    // orphans. Replay is a separate, deliberate design choice.
                     report.rolled_back += 1;
                 }
             }
@@ -184,16 +207,6 @@ impl Wal {
             payload: WalPayload::StateMutation { root, key_len },
         }
     }
-}
-
-fn validate_ref_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        return Err(anyhow!("reference name cannot be empty"));
-    }
-    if name.starts_with('/') || name.contains("..") || name.contains('\0') {
-        return Err(anyhow!("unsafe reference name in WAL: {name}"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -248,6 +261,50 @@ mod tests {
 
         let report = wal.recover_refs(&dir.path().join("refs")).unwrap();
         assert_eq!(report.rolled_back, 1);
+        assert!(wal.pending().unwrap().is_empty());
+    }
+
+    /// Regression for issue #4: WAL filenames must be unique even when
+    /// many entries are begun in rapid succession. The pre-fix scheme
+    /// included only `{nanos}-{op}` and could collide on bursts.
+    #[test]
+    fn wal_begin_produces_unique_filenames_under_burst() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::new(dir.path().join("wal"));
+        wal.ensure_dir().unwrap();
+
+        let mut paths = Vec::new();
+        for _ in 0..1000 {
+            let p = wal.begin("op", b"x").unwrap();
+            paths.push(p);
+        }
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            unique.len(),
+            paths.len(),
+            "WAL filename collision under burst"
+        );
+        assert_eq!(wal.pending().unwrap().len(), 1000);
+    }
+
+    /// Regression: state WAL entries are forensic only and must always be
+    /// rolled back on recovery. A future change that replays them would
+    /// break the invariant; this test fails loudly if that ever happens.
+    #[test]
+    fn state_wal_entries_are_always_rolled_back() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::new(dir.path().join("wal"));
+        wal.ensure_dir().unwrap();
+
+        let dummy_root = hash_blob(b"r");
+        for op in [WalOp::StateSet, WalOp::StateDel, WalOp::StateCompact] {
+            let entry = Wal::make_state_entry(op, dummy_root, 1);
+            let _ = wal.begin_entry(&entry).unwrap();
+        }
+
+        let report = wal.recover_refs(&dir.path().join("refs")).unwrap();
+        assert_eq!(report.replayed, 0);
+        assert_eq!(report.rolled_back, 3);
         assert!(wal.pending().unwrap().is_empty());
     }
 }

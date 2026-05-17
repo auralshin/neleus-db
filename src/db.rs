@@ -7,7 +7,7 @@ use std::io;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::atomic::write_atomic;
+use crate::atomic::{cleanup_orphan_temps, write_atomic};
 use crate::blob_store::BlobStore;
 use crate::commit::CommitStore;
 use crate::encryption::{EncryptionConfig, EncryptionRuntime};
@@ -136,6 +136,15 @@ impl Database {
         index_store.ensure_dir()?;
 
         let _report: WalRecoveryReport = wal.recover_refs(refs.root())?;
+
+        // Remove orphan atomic-write temp files left by dead processes.
+        // Held under the recovery lock, so no concurrent writer is producing
+        // matching names. Live PIDs (including peers and our own) are skipped.
+        let _ = cleanup_orphan_temps(&root.join("blobs"), true)?;
+        let _ = cleanup_orphan_temps(&root.join("objects"), true)?;
+        let _ = cleanup_orphan_temps(&root.join("refs").join("heads"), false)?;
+        let _ = cleanup_orphan_temps(&root.join("refs").join("states"), false)?;
+        let _ = cleanup_orphan_temps(&root.join("meta"), false)?;
 
         Ok(Self {
             root,

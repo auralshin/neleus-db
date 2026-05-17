@@ -158,12 +158,57 @@ fn read_hash(path: PathBuf) -> Result<Option<Hash>> {
     Ok(Some(h))
 }
 
-fn validate_ref_name(name: &str) -> Result<()> {
+/// Maximum number of `/`-separated components in a ref name. Caps directory
+/// depth created under `refs/heads/` and `refs/states/`.
+const MAX_REF_DEPTH: usize = 5;
+
+/// Whitelist-based ref-name validation. Mirrors a strict subset of git's
+/// refspec rules (`git check-ref-format`):
+///
+/// - non-empty
+/// - characters limited to `A-Za-z0-9_-/.`
+/// - no leading `-` (avoids confusion with CLI flags)
+/// - no leading or trailing `/`
+/// - no consecutive `/`
+/// - at most `MAX_REF_DEPTH` `/`-separated components
+/// - no `..` substring (path traversal)
+/// - no trailing `.` and no `.lock` suffix (mirrors git)
+///
+/// Tightening from previous (laxer) behavior: names like `feature/foo`
+/// still pass, while names like `name//other`, `~weird`, or arbitrarily
+/// nested `a/b/c/d/e/f/g` are now rejected. Untrusted ref names cannot
+/// produce surprising directory hierarchies under `refs/`.
+pub(crate) fn validate_ref_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("reference name cannot be empty"));
     }
-    if name.starts_with('/') || name.contains("..") || name.contains('\0') {
+    if name.starts_with('/') || name.ends_with('/') {
+        return Err(anyhow!("reference name has leading/trailing '/': {name}"));
+    }
+    if name.starts_with('-') {
+        return Err(anyhow!("reference name cannot start with '-': {name}"));
+    }
+    if name.contains("..") || name.contains("//") || name.contains('\0') {
         return Err(anyhow!("unsafe reference name: {name}"));
+    }
+    if name.ends_with('.') || name.ends_with(".lock") {
+        return Err(anyhow!("reference name has reserved suffix: {name}"));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.'))
+    {
+        return Err(anyhow!(
+            "reference name contains disallowed characters: {name}"
+        ));
+    }
+    let depth = name.split('/').count();
+    if depth > MAX_REF_DEPTH {
+        return Err(anyhow!(
+            "reference name exceeds max depth {} (got {}): {name}",
+            MAX_REF_DEPTH,
+            depth,
+        ));
     }
     Ok(())
 }
@@ -211,6 +256,63 @@ mod tests {
         let s = store(&tmp);
         let h = hash_blob(b"x");
         assert!(s.head_set("../bad", h).is_err());
+    }
+
+    /// Regression for issue #4: ref-name validator rejects a known-bad set.
+    #[test]
+    fn validate_ref_name_rejects_unsafe_inputs() {
+        for bad in [
+            "",
+            "/leading",
+            "trailing/",
+            "double//slash",
+            "../escape",
+            "ab..cd",
+            "with\0null",
+            "-flag-like",
+            "trailing.",
+            "ends.lock",
+            "has spaces",
+            "weird~char",
+            "weird?char",
+            "weird*char",
+            "a/b/c/d/e/f", // depth 6 > MAX_REF_DEPTH
+        ] {
+            assert!(
+                super::validate_ref_name(bad).is_err(),
+                "validator must reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_ref_name_accepts_canonical_names() {
+        for good in [
+            "main",
+            "dev",
+            "feature/foo",
+            "release/v1.0",
+            "user_42/topic-x",
+            "a/b/c/d/e", // depth 5 == MAX_REF_DEPTH
+        ] {
+            assert!(
+                super::validate_ref_name(good).is_ok(),
+                "validator must accept: {good:?}"
+            );
+        }
+    }
+
+    /// Creating a ref with a `/` produces a subdirectory under refs/heads/.
+    /// This is the intended git-style namespacing; verify it still works
+    /// post-tightening.
+    #[test]
+    fn slash_in_ref_name_creates_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let h = hash_blob(b"x");
+        s.head_set("feature/foo", h).unwrap();
+        assert!(tmp.path().join("refs/heads/feature/foo").exists());
+        assert_eq!(s.head_get("feature/foo").unwrap(), Some(h));
     }
 
     #[test]
