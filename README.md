@@ -9,7 +9,7 @@
   
 # 🔱 Neleus DB
 
-## Local-first Merkle-DAG database for AI agents, reproducible runs, and verifiable state
+## Verifiable memory and audit trails for AI agents
 
   A high-performance, content-addressed database designed for AI agent workflows with cryptographic proofs and immutable versioning.
 
@@ -33,6 +33,7 @@
 - [Integrity and determinism](#integrity-and-determinism)
 - [Reliability and security](#reliability-and-security)
 - [Testing](#testing)
+- [Python SDK](#python-sdk)
 - [Integration guide](#integration-guide)
 - [Design document](#design-document)
 - [Contributing](#contributing)
@@ -42,12 +43,17 @@
 
 AI agent systems need more than a key-value store:
 
-- deterministic replay from immutable inputs
+- auditable, state-replayable runs from immutable content-addressed inputs
 - versioned state snapshots with commit history
-- integrity proofs for auditability
+- integrity proofs for every claim and retrieved chunk
 - local operation without network dependencies
 
 `neleus-db` is built around those guarantees.
+
+> **On reproducibility:** neleus-db captures all inputs, retrieved context, and provider
+> metadata needed for replay. Because hosted LLMs are non-deterministic and may change
+> over time, runs are *auditable and state-replayable* rather than bit-for-bit reproducible.
+> Equivalent outputs require equivalent model, parameters, and runtime conditions.
 
 ## Who should use this
 
@@ -63,11 +69,14 @@ AI agent systems need more than a key-value store:
 - Versioned segmented state store with Merkle commitments
 - Membership and non-membership state proofs
 - Git-like commit graph (`parents`, `author`, `message`, `state_root`, `manifests`)
+- **`RunManifest`** — captures provider, model, parameters, system prompt, inputs, outputs, and retrieved RAG chunks in one signed, Merkle-linked record
+- **`ProvenanceRecord`** — agent claims with evidence, confidence scores, and `RunManifest` back-links
 - WAL + atomic file writes + automatic WAL recovery on open
 - Lock-file protection for multi-process mutable operations
 - Optional verify-on-read integrity checks
-- Encryption at rest (AES-256-GCM / ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256)
+- Encryption at rest for blobs and objects (AES-256-GCM / ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256)
 - Native semantic and vector search as rebuildable derived indexes
+- **Python SDK** — `with neleus.run(...) as run:` context manager for zero-friction agent auditing
 
 ## Architecture at a glance
 
@@ -217,7 +226,12 @@ Canonical encoding:
 - optional verify-on-read mode for blobs and typed objects
 - authenticated encryption support for persisted payloads
 
-To enable encryption at rest, set `meta/config.json` with an enabled encryption block and provide
+When encryption is enabled, **blobs and objects** are encrypted at rest with the configured
+algorithm (AES-256-GCM or ChaCha20-Poly1305). WAL files, search indexes, metadata, and key
+paths have separate leakage considerations — review the security notes before using this with
+sensitive data in regulated environments.
+
+To enable encryption, set `meta/config.json` with an enabled encryption block and provide
 `NELEUS_DB_ENCRYPTION_PASSWORD` when running the CLI.
 
 Example config snippet:
@@ -244,6 +258,32 @@ cargo test
 ```
 
 The suite covers determinism, state semantics, proof verification/tampering, WAL recovery, integrity checks, compaction behavior, and CLI-facing flows.
+
+## Python SDK
+
+Copy `sdk/python/neleus.py` alongside your project and add the neleus-db binary to `PATH`:
+
+```python
+import neleus
+
+with neleus.run(
+    db="./neleus_db",
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    agent_id="policy-reviewer-v1",
+    model_parameters={"max_tokens": 1024, "temperature": 0.0},
+) as run:
+    run.system_prompt("You are a policy analyst.")
+    run.prompt(user_question)
+    run.retrieved_chunks(chunk_hashes)   # RAG audit link
+
+    response = anthropic_client.messages.create(...)
+
+    run.output(response.content[0].text)
+# auto-commits here — every input, chunk, and output is content-addressed
+```
+
+See [`examples/06_claude_run.py`](examples/06_claude_run.py) for a full working example.
 
 ## Integration guide
 

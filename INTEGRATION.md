@@ -1,13 +1,15 @@
 # Integration Guide
 
-This guide covers how to integrate `neleus-db` from Rust, TypeScript/JavaScript, Go, and Python.
+This guide covers how to integrate `neleus-db` from Rust, Python, TypeScript/JavaScript, and Go.
 
 ## Integration modes
 
 `neleus-db` supports two integration modes:
 
-- Embedded Rust library API (best performance, direct typed access)
-- CLI process interface (best for non-Rust stacks)
+- **Embedded Rust library API** — best performance, direct typed access, no subprocess overhead
+- **CLI process interface** — best for non-Rust stacks; parse `--json` output
+
+---
 
 ## 1) Rust integration (library mode)
 
@@ -19,54 +21,112 @@ neleus-db = { path = "../neleus-db" }
 anyhow = "1"
 ```
 
-### Minimal workflow
+### Minimal agent run workflow
 
 ```rust
 use anyhow::Result;
-use neleus_db::{Database, manifest::{RunManifest, ToolCallRef, now_unix}};
+use neleus_db::{Database, manifest::{RunManifest, MANIFEST_SCHEMA_VERSION}};
 
 fn main() -> Result<()> {
     Database::init("./neleus_db")?;
     let db = Database::open("./neleus_db")?;
 
     let head = "main";
-    let base_root = db
-        .refs
-        .state_get(head)?
-        .unwrap_or(db.state_store.empty_root()?);
 
-    let new_root = db.state_store.set(base_root, b"agent/session/1/status", b"done")?;
-    db.refs.state_set(head, new_root)?;
+    // Store the prompt blob.
+    let prompt = db.blob_store.put(b"Summarise this codebase.")?;
 
-    let prompt = db.blob_store.put(b"summarize this file")?;
-    let ts = now_unix();
-    let run_manifest = RunManifest {
-        schema_version: 1,
-        model: "gpt-4.1".into(),
+    // Optionally store the system prompt and model parameters as separate blobs.
+    let system_prompt_hash = db.blob_store.put(b"You are a code analyst.")?;
+    let params_json = serde_json::to_vec(&serde_json::json!({"max_tokens": 1024, "temperature": 0.0}))?;
+    let model_parameters_hash = db.blob_store.put(&params_json)?;
+
+    // ... make the model call ...
+    let output = db.blob_store.put(b"The codebase implements a Merkle-DAG store.")?;
+
+    let now = neleus_db::clock::now_unix()?;
+    let run = RunManifest {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        model: "claude-sonnet-4-6".into(),
         prompt,
-        tool_calls: Vec::<ToolCallRef>::new(),
+        tool_calls: vec![],
         inputs: vec![],
-        outputs: vec![],
-        started_at: ts,
-        ended_at: ts,
+        outputs: vec![output],
+        started_at: now,
+        ended_at: now,
+        provider: Some("anthropic".into()),
+        system_prompt: Some(system_prompt_hash),
+        model_parameters: Some(model_parameters_hash),
+        retrieved_chunks: vec![],          // populate from RAG search results
+        sdk_version: Some("neleus-rs/0.1".into()),
+        agent_id: Some("code-analyst-v1".into()),
     };
-    let manifest_hash = db.manifest_store.put_manifest(&run_manifest)?;
+    let manifest_hash = db.manifest_store.put_manifest(&run)?;
 
-    let parents = db.refs.head_get(head)?.map(|h| vec![h]).unwrap_or_default();
-    let commit_hash = db.commit_store.create_commit(
-        parents,
-        new_root,
-        vec![manifest_hash],
-        "agent1".into(),
-        "run complete".into(),
-    )?;
-    db.refs.head_set(head, commit_hash)?;
+    let commit_hash = db.create_commit_at_head(head, "agent1", "analysis run", vec![manifest_hash])?;
 
+    println!("commit: {commit_hash}");
     Ok(())
 }
 ```
 
-## 2) Cross-language integration (CLI mode)
+> **On replayability:** neleus-db captures all inputs, retrieved context, and provider metadata
+> needed to reconstruct a run. Because hosted LLMs are non-deterministic and may change over
+> time, runs are *auditable and state-replayable* rather than bit-for-bit reproducible.
+
+---
+
+## 2) Python SDK (recommended for Python stacks)
+
+Copy [`sdk/python/neleus.py`](sdk/python/neleus.py) next to your project. Requires the
+`neleus-db` binary on `PATH`.
+
+```python
+import neleus
+
+with neleus.run(
+    db="./neleus_db",
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    agent_id="policy-reviewer-v1",
+    model_parameters={"max_tokens": 1024, "temperature": 0.0},
+) as run:
+    run.system_prompt("You are a policy analyst.")
+    run.prompt(user_question)
+    run.retrieved_chunks(chunk_hashes)   # closes the RAG audit loop
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": user_question}],
+    )
+    run.output(response.content[0].text)
+# auto-commits here — manifest hash available at run.manifest_hash
+```
+
+See [`examples/06_claude_run.py`](examples/06_claude_run.py) for a complete working example
+including document ingestion, semantic search, and state proofs.
+
+### Auto-commit vs explicit commit
+
+```python
+# Auto-commit on __exit__ (default):
+with neleus.run(...) as run:
+    ...
+
+# Explicit commit with a custom message:
+with neleus.run(...) as run:
+    ...
+    manifest_hash = run.commit(message="policy Q&A — run 42")
+
+# Abort (no commit):
+with neleus.run(...) as run:
+    run.abort()
+```
+
+---
+
+## 3) Cross-language CLI integration
 
 Use the `neleus-db` binary as a local subprocess and parse `--json` output.
 
@@ -85,97 +145,119 @@ For `state` and `proof` commands, select key encoding explicitly:
 - `--key-encoding hex`
 - `--key-encoding base64`
 
-### Common command sequence
+### Capturing a model run from the CLI
 
 ```bash
-neleus-db --db ./neleus_db --json db init ./neleus_db
-neleus-db --db ./neleus_db --json state set main my-key ./value.bin --key-encoding utf8
-neleus-db --db ./neleus_db --json state get main my-key --key-encoding utf8
-neleus-db --db ./neleus_db --json commit new --head main --author agent1 --message "snapshot"
+# 1. Store the prompt blob
+PROMPT_HASH=$(neleus-db --db ./neleus_db --json blob put ./prompt.txt | jq -r .hash)
+
+# 2. Store the system prompt
+SP_HASH=$(neleus-db --db ./neleus_db --json blob put ./system.txt | jq -r .hash)
+
+# 3. (After the model call) store the output
+OUT_HASH=$(neleus-db --db ./neleus_db --json blob put ./output.txt | jq -r .hash)
+
+# 4. Create a run manifest with full metadata
+MANIFEST=$(neleus-db --db ./neleus_db --json manifest put-run \
+  --model claude-sonnet-4-6 \
+  --provider anthropic \
+  --prompt-file ./prompt.txt \
+  --system-prompt-file ./system.txt \
+  --io-hashes "out:$OUT_HASH" \
+  --param max_tokens=1024 \
+  --param temperature=0 \
+  --agent-id policy-reviewer-v1 \
+  --retrieved-chunk "$CHUNK_HASH_1" \
+  --retrieved-chunk "$CHUNK_HASH_2" | jq -r .manifest_hash)
+
+# 5. Commit
+neleus-db --db ./neleus_db --json commit new \
+  --head main --author agent1 --message "policy run" \
+  --manifest "$MANIFEST"
 ```
 
-## TypeScript / JavaScript example
+### TypeScript / JavaScript
 
 ```ts
 import { execFileSync } from "node:child_process";
 
-function run(args: string[]) {
+function nb(args: string[]) {
   const out = execFileSync(
     "neleus-db",
     ["--db", "./neleus_db", "--json", ...args],
-    {
-      encoding: "utf8",
-    },
+    { encoding: "utf8" },
   );
   return JSON.parse(out);
 }
 
-const blob = run(["blob", "put", "./input.txt"]);
+const blob = nb(["blob", "put", "./input.txt"]);
 console.log(blob.hash);
 ```
 
-## Python example
-
-```python
-import json
-import subprocess
-
-def run(args):
-    out = subprocess.check_output(
-        ["neleus-db", "--db", "./neleus_db", "--json"] + args,
-        text=True,
-    )
-    return json.loads(out)
-
-res = run(["log", "main"])
-print(res)
-```
-
-## Go example
+### Go
 
 ```go
 package main
 
 import (
- "encoding/json"
- "fmt"
- "os/exec"
+    "encoding/json"
+    "fmt"
+    "os/exec"
 )
 
-func run(args ...string) (map[string]any, error) {
- base := []string{"--db", "./neleus_db", "--json"}
- cmd := exec.Command("neleus-db", append(base, args...)...)
- out, err := cmd.Output()
- if err != nil {
-  return nil, err
- }
- var v map[string]any
- if err := json.Unmarshal(out, &v); err != nil {
-  return nil, err
- }
- return v, nil
+func nb(args ...string) (map[string]any, error) {
+    base := []string{"--db", "./neleus_db", "--json"}
+    cmd := exec.Command("neleus-db", append(base, args...)...)
+    out, err := cmd.Output()
+    if err != nil { return nil, err }
+    var v map[string]any
+    return v, json.Unmarshal(out, &v)
 }
 
 func main() {
- v, err := run("log", "main")
- if err != nil {
-  panic(err)
- }
- fmt.Println(v)
+    v, err := nb("log", "main")
+    if err != nil { panic(err) }
+    fmt.Println(v)
 }
 ```
 
+---
+
+## Encryption scope
+
+When encryption is enabled, **blobs and objects** (including run manifests, state segments, and
+commits) are encrypted at rest with the configured AEAD algorithm. The following are **not
+encrypted** by default and may leak information in regulated environments:
+
+| Path | Encrypted? |
+|------|-----------|
+| `blobs/**` | Yes |
+| `objects/**` | Yes |
+| `index/<commit>/search_index.cbor` | Yes (since v3, issue #10) |
+| `refs/heads/*`, `refs/states/*` | No — contain only hashes |
+| `wal/*.wal` | No — contain only hashes and op codes |
+| `meta/config.json` | No — contains algorithm config, not data |
+| Key paths (`memory/last-summary`) | No — stored as filenames in refs |
+
+For highly sensitive workloads, keep the DB on an encrypted volume and restrict filesystem access.
+
+---
+
 ## Operational guidance
 
-- Canonical source of truth is blobs/objects + commits; derived indexes can be rebuilt.
-- Use commit hashes as durable checkpoints in your application metadata.
-- For high-throughput non-Rust usage, wrap CLI or library in a local sidecar (HTTP/gRPC) to avoid process startup overhead per request.
-- Enable verify-on-read in environments where stronger integrity guarantees are required.
+- Canonical truth lives in `blobs/` + `objects/` + commits; derived indexes can always be rebuilt.
+- Use commit hashes as durable checkpoints in application metadata.
+- For high-throughput non-Rust usage, wrap the library or CLI in a local sidecar to amortise
+  process-startup overhead across requests.
+- Enable `verify_on_read` in environments where stronger integrity guarantees are required.
 
 ## Suggested integration pattern for agent systems
 
-1. Store large input/output artifacts in `blob_store`.
-2. Keep lightweight pointers/flags in `state_store`.
-3. Emit `RunManifest` and `DocManifest` for traceability.
-4. Commit every meaningful step (`commit_store.create_commit` + `refs.head_set`).
-5. Build/rebuild search indexes from commit heads (`index build`).
+```text
+1. Ingest documents → DocManifest (chunks + embeddings)
+2. Query → search semantic/vector → top-k chunk hashes
+3. Model call → RunManifest (prompt, system_prompt, model_parameters, retrieved_chunks, outputs)
+4. Claim → ProvenanceRecord (claim_text, evidence → chunk hashes, confidence, run_manifest)
+5. Commit → links RunManifest + ProvenanceManifest into the Merkle DAG
+6. Proof → prove chunk was retrieved; prove claim links to this run; export audit bundle
+```
