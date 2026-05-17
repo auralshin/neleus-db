@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_atomic;
 use crate::blob_store::BlobStore;
 use crate::commit::{CommitHash, CommitStore};
+use crate::encryption::EncryptionRuntime;
 use crate::hash::{Hash, hash_typed};
 use crate::manifest::{ChunkManifest, DocManifest, ManifestStore};
 
@@ -67,11 +69,29 @@ pub struct SearchHit {
 #[derive(Debug, Clone)]
 pub struct SearchIndexStore {
     root: PathBuf,
+    encryption: Option<Arc<EncryptionRuntime>>,
 }
 
 impl SearchIndexStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            encryption: None,
+        }
+    }
+
+    /// Build a store that routes all on-disk index bytes through `runtime`
+    /// when encryption is enabled. Required to avoid leaking plaintext chunk
+    /// text in `index/<commit>/search_index.json` for databases with
+    /// `encryption.enabled = true`.
+    pub fn with_encryption(
+        root: impl Into<PathBuf>,
+        encryption: Option<Arc<EncryptionRuntime>>,
+    ) -> Self {
+        Self {
+            root: root.into(),
+            encryption,
+        }
     }
 
     pub fn ensure_dir(&self) -> Result<()> {
@@ -195,8 +215,14 @@ impl SearchIndexStore {
 
     pub fn read_index(&self, commit: CommitHash) -> Result<SearchIndex> {
         let path = self.index_path(commit);
-        let bytes = fs::read(&path)
+        let raw = fs::read(&path)
             .with_context(|| format!("missing index for {} at {}", commit, path.display()))?;
+        let bytes = match &self.encryption {
+            Some(rt) => rt.decrypt(&raw).with_context(|| {
+                format!("failed decrypting index {}", path.display())
+            })?,
+            None => raw,
+        };
         let index: SearchIndex = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed decoding index {}", path.display()))?;
         if index.schema_version != INDEX_SCHEMA_VERSION {
@@ -238,7 +264,13 @@ impl SearchIndexStore {
         let path = self.index_path(index.commit);
 
         let bytes = serde_json::to_vec_pretty(index)?;
-        write_atomic(&path, &bytes)?;
+        // The returned IndexVersionHash is derived from the plaintext index
+        // bytes so it remains stable regardless of whether encryption is on.
+        let on_disk = match &self.encryption {
+            Some(rt) => rt.encrypt(&bytes)?,
+            None => bytes.clone(),
+        };
+        write_atomic(&path, &on_disk)?;
 
         Ok(hash_typed(INDEX_TAG, &bytes))
     }
