@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,7 +13,9 @@ use neleus_db::commit::Commit;
 use neleus_db::db::Database;
 use neleus_db::hash::Hash;
 use neleus_db::index::{SearchHit, SearchIndexStore};
-use neleus_db::manifest::{ChunkManifest, ChunkingSpec, DocManifest, RunManifest};
+use neleus_db::manifest::{
+    ChunkManifest, ChunkingSpec, DocManifest, RunManifest, MANIFEST_SCHEMA_VERSION,
+};
 use neleus_db::state::{StateManifest, StateSegment};
 
 #[derive(Debug, Parser)]
@@ -90,6 +93,9 @@ enum BlobCommands {
     Get { hash: String, out_file: PathBuf },
 }
 
+// PutRun carries many optional string fields; boxing here adds complexity with no runtime
+// benefit since ManifestCommands is instantiated exactly once per CLI invocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum ManifestCommands {
     PutDoc {
@@ -109,6 +115,34 @@ enum ManifestCommands {
         prompt_file: PathBuf,
         #[arg(long = "io-hashes")]
         io_hashes: Vec<String>,
+        /// AI provider name, e.g. `anthropic` or `openai`.
+        #[arg(long)]
+        provider: Option<String>,
+        /// File containing the system prompt bytes.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
+        /// JSON file with model sampling parameters, e.g. `{"temperature": 0.2}`.
+        #[arg(long)]
+        params_json: Option<PathBuf>,
+        /// Individual model parameter as `key=value`; may be repeated.
+        /// Numbers and booleans are type-inferred; anything else is stored as a string.
+        #[arg(long = "param")]
+        params: Vec<String>,
+        /// Hash of a chunk blob retrieved from the knowledge base for this run; may be repeated.
+        #[arg(long = "retrieved-chunk")]
+        retrieved_chunks: Vec<String>,
+        /// SDK version string, e.g. `anthropic-python/0.40.0`.
+        #[arg(long)]
+        sdk_version: Option<String>,
+        /// Logical agent name or version, e.g. `policy-reviewer-v1`.
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Unix timestamp for run start; defaults to the time of this call.
+        #[arg(long)]
+        started_at: Option<u64>,
+        /// Unix timestamp for run end; defaults to the time of this call.
+        #[arg(long)]
+        ended_at: Option<u64>,
     },
 }
 
@@ -309,20 +343,47 @@ fn main() -> Result<()> {
                     model,
                     prompt_file,
                     io_hashes,
+                    provider,
+                    system_prompt_file,
+                    params_json,
+                    params,
+                    retrieved_chunks,
+                    sdk_version,
+                    agent_id,
+                    started_at,
+                    ended_at,
                 } => {
                     let prompt = db.blob_store.put(&fs::read(prompt_file.clone())?)?;
                     let (inputs, outputs) = parse_io_hashes(&io_hashes)?;
 
-                    let started_at = now_unix()?;
+                    let system_prompt = system_prompt_file
+                        .map(|p| db.blob_store.put(&fs::read(p)?))
+                        .transpose()?;
+
+                    let model_parameters =
+                        build_model_parameters_blob(&db, params_json, &params)?;
+
+                    let retrieved_chunk_hashes = retrieved_chunks
+                        .iter()
+                        .map(|s| s.parse::<Hash>())
+                        .collect::<Result<Vec<_>, _>>()?;
+
+                    let now = now_unix()?;
                     let run = RunManifest {
-                        schema_version: 1,
+                        schema_version: MANIFEST_SCHEMA_VERSION,
                         model,
                         prompt,
                         tool_calls: vec![],
                         inputs,
                         outputs,
-                        started_at,
-                        ended_at: now_unix()?,
+                        started_at: started_at.unwrap_or(now),
+                        ended_at: ended_at.unwrap_or_else(|| now_unix().unwrap_or(now)),
+                        provider,
+                        system_prompt,
+                        model_parameters,
+                        retrieved_chunks: retrieved_chunk_hashes,
+                        sdk_version,
+                        agent_id,
                     };
                     let h = db.manifest_store.put_manifest(&run)?;
                     emit(
@@ -654,6 +715,51 @@ fn resolve_query_text(query: Option<String>, query_file: Option<PathBuf>) -> Res
         (Some(_), Some(_)) => Err(anyhow!("provide either --query or --query-file, not both")),
         (None, None) => Err(anyhow!("provide one of --query or --query-file")),
     }
+}
+
+/// Build a content-addressed model-parameters blob from CLI flags.
+///
+/// Parameters come from two sources that are merged (file values take lower precedence
+/// than individual `--param` flags so the CLI caller can override specific keys):
+/// - `params_json`: a path to a JSON object file
+/// - `params`: repeated `key=value` strings (values are type-inferred as JSON scalars)
+///
+/// Keys are sorted before serialization so identical parameter sets always hash identically.
+/// Returns `None` when both sources are empty.
+///
+/// # Errors
+/// Returns an error if the JSON file is not a valid object, or if a `key=value` entry
+/// has no `=` separator.
+fn build_model_parameters_blob(
+    db: &neleus_db::db::Database,
+    params_json: Option<PathBuf>,
+    params: &[String],
+) -> Result<Option<Hash>> {
+    if params_json.is_none() && params.is_empty() {
+        return Ok(None);
+    }
+
+    let mut map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+
+    if let Some(path) = params_json {
+        let raw = fs::read(path)?;
+        let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&raw)
+            .map_err(|e| anyhow!("--params-json must be a JSON object: {e}"))?;
+        map.extend(obj);
+    }
+
+    for kv in params {
+        let (key, raw_val) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--param must be key=value, got: {kv}"))?;
+        // Try to parse as a JSON scalar (number, bool, null); fall back to string.
+        let value: serde_json::Value = serde_json::from_str(raw_val)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_val.to_string()));
+        map.insert(key.to_string(), value);
+    }
+
+    let json_bytes = serde_json::to_vec(&map)?;
+    Ok(Some(db.blob_store.put(&json_bytes)?))
 }
 
 fn parse_io_hashes(values: &[String]) -> Result<(Vec<Hash>, Vec<Hash>)> {

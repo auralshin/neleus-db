@@ -9,7 +9,8 @@ use crate::object_store::ObjectStore;
 
 const MANIFEST_TAG: &[u8] = b"manifest:";
 const MANIFEST_REF_LEAF_TAG: &[u8] = b"manifest_leaf:";
-const MANIFEST_SCHEMA_VERSION: u32 = 1;
+// v2 adds provider-metadata and RAG audit fields to RunManifest.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkingSpec {
@@ -44,16 +45,43 @@ pub struct DocManifest {
     pub original: Hash,
 }
 
+/// A single AI model invocation: all inputs, outputs, retrieved context, and provider metadata.
+///
+/// Fields added in schema v2 use `skip_serializing_if` so v1 on-disk records are unaffected.
+/// A v1 record decoded into this struct will have all new fields set to their defaults.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub schema_version: u32,
+    /// Model identifier, e.g. `"claude-sonnet-4-6"`.
     pub model: String,
+    /// Content-addressed blob of the primary user message.
     pub prompt: Hash,
     pub tool_calls: Vec<ToolCallRef>,
     pub inputs: Vec<Hash>,
     pub outputs: Vec<Hash>,
     pub started_at: u64,
     pub ended_at: u64,
+    /// Provider name, e.g. `"anthropic"` or `"openai"` (v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Content-addressed blob of the system prompt bytes (v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<Hash>,
+    /// Content-addressed blob of a sorted-keys JSON object containing model sampling parameters
+    /// (e.g. `{"max_tokens": 1024, "temperature": 0.2}`). Stored separately so identical
+    /// parameter sets deduplicate across runs (v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_parameters: Option<Hash>,
+    /// Hashes of `ChunkManifest` blobs retrieved from the knowledge base for this run.
+    /// Closes the RAG audit loop: query → chunks → prompt → output → commit (v2+).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieved_chunks: Vec<Hash>,
+    /// Caller-supplied SDK identifier, e.g. `"anthropic-python/0.40.0"` (v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sdk_version: Option<String>,
+    /// Logical agent name or version, e.g. `"policy-reviewer-v1"` (v2+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,26 +94,50 @@ impl ManifestStore {
         Self { objects }
     }
 
+    /// Serialize and store any manifest type, returning its content-addressed hash.
+    ///
+    /// # Errors
+    /// Returns an error if DAG-CBOR serialization or the object store write fails.
     pub fn put_manifest<T: Serialize>(&self, manifest: &T) -> Result<Hash> {
         self.objects.put_serialized(MANIFEST_TAG, manifest)
     }
 
+    /// Retrieve and deserialize a manifest by hash.
+    ///
+    /// # Errors
+    /// Returns an error if the hash is not found or the bytes cannot be deserialized as `T`.
     pub fn get_manifest<T: DeserializeOwned>(&self, hash: Hash) -> Result<T> {
         self.objects.get_deserialized_typed(MANIFEST_TAG, hash)
     }
 
+    /// Typed retrieval for [`DocManifest`].
     pub fn get_doc_manifest(&self, hash: Hash) -> Result<DocManifest> {
         self.get_manifest(hash)
     }
 
+    /// Typed retrieval for [`RunManifest`].
     pub fn get_run_manifest(&self, hash: Hash) -> Result<RunManifest> {
         self.get_manifest(hash)
     }
 
+    /// Typed retrieval for [`ChunkManifest`].
     pub fn get_chunk_manifest(&self, hash: Hash) -> Result<ChunkManifest> {
         self.get_manifest(hash)
     }
 
+    /// Chunk `input_bytes`, store each chunk and the original as blobs, then store a
+    /// [`DocManifest`] linking them all.
+    ///
+    /// # Arguments
+    /// - `blob_store`: where raw chunk bytes are written
+    /// - `source`: human-readable origin path or URI
+    /// - `input_bytes`: full document bytes to chunk
+    /// - `chunking`: chunk size and overlap parameters
+    /// - `created_at`: Unix timestamp override; uses the current time when `None`
+    ///
+    /// # Errors
+    /// Returns an error if chunking parameters are invalid, a blob write fails, or
+    /// the system clock is set before the Unix epoch.
     pub fn put_doc_manifest_from_bytes(
         &self,
         blob_store: &BlobStore,
@@ -118,6 +170,10 @@ impl ManifestStore {
     }
 }
 
+/// Enumerate the content-addressed blobs that a manifest directly references.
+///
+/// The returned hashes are used to build the Merkle proof tree, so every blob
+/// a verifier needs to check must appear here.
 pub trait ManifestReferences {
     fn referenced_blobs(&self) -> Vec<Hash>;
 }
@@ -135,8 +191,17 @@ impl ManifestReferences for RunManifest {
     fn referenced_blobs(&self) -> Vec<Hash> {
         let mut out = Vec::new();
         out.push(self.prompt);
+        if let Some(h) = self.system_prompt {
+            out.push(h);
+        }
+        if let Some(h) = self.model_parameters {
+            out.push(h);
+        }
         out.extend(self.inputs.iter().copied());
         out.extend(self.outputs.iter().copied());
+        // Retrieved chunks are part of the Merkle proof so callers can prove
+        // which knowledge-base chunks were in scope for this run.
+        out.extend(self.retrieved_chunks.iter().copied());
         for call in &self.tool_calls {
             if let Some(h) = call.input {
                 out.push(h);
@@ -159,10 +224,12 @@ impl ManifestReferences for ChunkManifest {
     }
 }
 
+/// Build a domain-separated Merkle leaf for a single referenced blob.
 pub fn manifest_reference_leaf(blob_hash: Hash) -> MerkleLeaf {
     MerkleLeaf::new(MANIFEST_REF_LEAF_TAG, blob_hash.as_bytes())
 }
 
+/// Compute the Merkle root over all blobs referenced by `manifest`.
 pub fn manifest_reference_root<T: ManifestReferences>(manifest: &T) -> Hash {
     let leaves: Vec<MerkleLeaf> = manifest
         .referenced_blobs()
@@ -172,6 +239,9 @@ pub fn manifest_reference_root<T: ManifestReferences>(manifest: &T) -> Hash {
     merkle_root(&leaves)
 }
 
+/// Generate a Merkle inclusion proof for `blob_hash` within `manifest`'s reference set.
+///
+/// Returns `None` if `blob_hash` is not among the manifest's referenced blobs.
 pub fn prove_blob_inclusion<T: ManifestReferences>(
     manifest: &T,
     blob_hash: Hash,
@@ -182,18 +252,25 @@ pub fn prove_blob_inclusion<T: ManifestReferences>(
     prove_inclusion(&leaves, idx)
 }
 
+/// Verify a Merkle inclusion proof for `blob_hash` against `root`.
 pub fn verify_blob_inclusion(root: Hash, blob_hash: Hash, proof: &MerkleProof) -> bool {
     verify_inclusion(root, manifest_reference_leaf(blob_hash), proof)
 }
 
+/// Free-function alias for [`ManifestStore::put_manifest`].
 pub fn put_manifest<T: Serialize>(store: &ManifestStore, manifest: &T) -> Result<Hash> {
     store.put_manifest(manifest)
 }
 
+/// Free-function alias for [`ManifestStore::get_manifest`].
 pub fn get_manifest<T: DeserializeOwned>(store: &ManifestStore, hash: Hash) -> Result<T> {
     store.get_manifest(hash)
 }
 
+/// Split `input` into fixed-size chunks of `chunk_size` bytes with `overlap` bytes of overlap.
+///
+/// # Errors
+/// Returns an error if `chunk_size` is zero or `overlap >= chunk_size`.
 pub fn chunk_fixed(input: &[u8], chunk_size: usize, overlap: usize) -> Result<Vec<Vec<u8>>> {
     if chunk_size == 0 {
         return Err(anyhow!("chunk_size must be > 0"));
@@ -319,6 +396,12 @@ mod tests {
             outputs: vec![bs.put(b"out").unwrap()],
             started_at: 10,
             ended_at: 20,
+            provider: Some("anthropic".into()),
+            system_prompt: None,
+            model_parameters: None,
+            retrieved_chunks: vec![],
+            sdk_version: Some("anthropic-python/0.40.0".into()),
+            agent_id: Some("test-agent-v1".into()),
         };
 
         let h = ms.put_manifest(&run).unwrap();
@@ -392,6 +475,12 @@ mod tests {
             outputs: vec![output],
             started_at: 1,
             ended_at: 2,
+            provider: None,
+            system_prompt: None,
+            model_parameters: None,
+            retrieved_chunks: vec![],
+            sdk_version: None,
+            agent_id: None,
         };
         let _h = ms.put_manifest(&run).unwrap();
 
@@ -413,9 +502,87 @@ mod tests {
             outputs: vec![],
             started_at: 1,
             ended_at: 2,
+            provider: None,
+            system_prompt: None,
+            model_parameters: None,
+            retrieved_chunks: vec![],
+            sdk_version: None,
+            agent_id: None,
         };
         let missing = bs.put(b"missing").unwrap();
         assert!(prove_blob_inclusion(&run, missing).is_none());
     }
 
+    #[test]
+    fn retrieved_chunks_included_in_reference_proof() {
+        // RAG audit: retrieved chunks must appear in referenced_blobs so callers
+        // can generate Merkle proofs that a specific chunk was in scope for a run.
+        let tmp = TempDir::new().unwrap();
+        let (ms, bs) = manifest_store(&tmp);
+
+        let prompt = bs.put(b"prompt").unwrap();
+        let chunk = bs.put(b"retrieved-chunk").unwrap();
+        let run = RunManifest {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            model: "m".into(),
+            prompt,
+            tool_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            started_at: 1,
+            ended_at: 2,
+            provider: None,
+            system_prompt: None,
+            model_parameters: None,
+            retrieved_chunks: vec![chunk],
+            sdk_version: None,
+            agent_id: None,
+        };
+        let _h = ms.put_manifest(&run).unwrap();
+
+        let root = manifest_reference_root(&run);
+        let proof = prove_blob_inclusion(&run, chunk).unwrap();
+        assert!(verify_blob_inclusion(root, chunk, &proof));
+    }
+
+    #[test]
+    fn v1_run_manifest_deserializes_with_new_fields_defaulted() {
+        // v1 on-disk records (no new fields) must decode correctly with all v2
+        // fields set to their defaults (None / empty Vec).
+        use crate::canonical::{from_cbor, to_cbor};
+
+        #[derive(Serialize)]
+        struct RunManifestV1 {
+            schema_version: u32,
+            model: String,
+            prompt: Hash,
+            tool_calls: Vec<ToolCallRef>,
+            inputs: Vec<Hash>,
+            outputs: Vec<Hash>,
+            started_at: u64,
+            ended_at: u64,
+        }
+
+        let v1 = RunManifestV1 {
+            schema_version: 1,
+            model: "legacy-model".into(),
+            prompt: Hash::zero(),
+            tool_calls: vec![],
+            inputs: vec![],
+            outputs: vec![],
+            started_at: 0,
+            ended_at: 0,
+        };
+        let bytes = to_cbor(&v1).unwrap();
+        let decoded: RunManifest = from_cbor(&bytes).unwrap();
+
+        assert_eq!(decoded.model, "legacy-model");
+        assert_eq!(decoded.schema_version, 1);
+        assert!(decoded.provider.is_none());
+        assert!(decoded.system_prompt.is_none());
+        assert!(decoded.model_parameters.is_none());
+        assert!(decoded.retrieved_chunks.is_empty());
+        assert!(decoded.sdk_version.is_none());
+        assert!(decoded.agent_id.is_none());
+    }
 }
