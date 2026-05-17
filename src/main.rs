@@ -377,7 +377,10 @@ fn main() -> Result<()> {
                         inputs,
                         outputs,
                         started_at: started_at.unwrap_or(now),
-                        ended_at: ended_at.unwrap_or_else(|| now_unix().unwrap_or(now)),
+                        ended_at: match ended_at {
+                            Some(t) => t,
+                            None => now_unix()?,
+                        },
                         provider,
                         system_prompt,
                         model_parameters,

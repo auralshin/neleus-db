@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::clock::now_unix;
 use crate::hash::Hash;
 use crate::manifest::ManifestStore;
 
@@ -75,10 +75,9 @@ impl ProvenanceRecord {
         agent_id: String,
         confidence: f32,
     ) -> Self {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        // Silent fallback to 0 mirrors prior behavior — provenance metadata is
+        // recorded best-effort; a broken clock shouldn't fail claim creation.
+        let timestamp = now_unix().unwrap_or(0);
         Self {
             schema_version: PROVENANCE_SCHEMA_VERSION,
             claim_id,
@@ -149,10 +148,7 @@ pub struct ProvenanceManifest {
 impl ProvenanceManifest {
     /// Create an empty manifest for `agent_id`.
     pub fn new(agent_id: impl Into<String>) -> Self {
-        let created_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let created_at = now_unix().unwrap_or(0);
         Self {
             schema_version: PROVENANCE_SCHEMA_VERSION,
             agent_id: agent_id.into(),
