@@ -17,6 +17,16 @@ impl Drop for FileLockGuard {
     }
 }
 
+/// Acquire an advisory lock by exclusive-creating a marker file.
+///
+/// **Single-host only.** Stale-lock detection relies on `kill(pid, 0)` to
+/// check liveness, which only works for processes on the same machine.
+/// On NFS or any shared filesystem accessed by multiple hosts, a lock held
+/// by a peer on another host will appear "stale" here because we cannot
+/// signal it; this primitive is therefore unsafe for cross-host concurrency.
+/// For cross-host coordination, use OS advisory locks (`flock` /
+/// `LockFileEx`) — which are also released automatically on process death —
+/// or an external lease service.
 pub fn acquire_lock(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLockGuard> {
     let path = path.as_ref().to_path_buf();
     if let Some(parent) = path.parent() {
@@ -91,7 +101,7 @@ fn parse_pid(contents: &str) -> Option<u32> {
 }
 
 #[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
+pub(crate) fn process_is_alive(pid: u32) -> bool {
     // SAFETY: kill(pid, 0) does not send a signal; it only performs existence/permission checks.
     let rc = unsafe { libc::kill(pid as i32, 0) };
     if rc == 0 {
@@ -102,7 +112,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_is_alive(_pid: u32) -> bool {
+pub(crate) fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
@@ -136,7 +146,10 @@ mod tests {
     fn stale_lock_is_recovered() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join("x.lock");
-        fs::write(&p, "pid=999999\ncreated_at=1\n").unwrap();
+        // Use i32::MAX as the dead PID. Linux's max PID is at most 2^22
+        // (~4M) and macOS defaults are far lower, so this value cannot
+        // collide with any real process.
+        fs::write(&p, format!("pid={}\ncreated_at=1\n", i32::MAX)).unwrap();
         let _g = acquire_lock(&p, Duration::from_millis(80)).unwrap();
         assert!(p.exists());
     }
