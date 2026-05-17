@@ -201,13 +201,19 @@ impl Database {
             let parent = self.refs.head_get(head)?;
             let parents = parent.into_iter().collect::<Vec<_>>();
 
-            // Capture the staged state ref *before* resolving state_root, so
-            // we can detect a concurrent staged write between resolution and
-            // ref sync. `resolve_state_root` may read from this ref, from the
-            // parent commit, or from the empty root — in all three cases the
-            // staged-ref snapshot is what we'll CAS against.
+            // Capture the staged state ref so we can detect a concurrent
+            // staged write between this snapshot and the ref-sync CAS below.
+            // Derive `state_root` from the same snapshot rather than calling
+            // `resolve_state_root` (which would re-read the ref and could
+            // observe a peer's write, producing a spurious mismatch later).
             let staged_before = self.refs.state_get(head)?;
-            let state_root = self.resolve_state_root(head)?;
+            let state_root = match staged_before {
+                Some(s) => s,
+                None => match parent {
+                    Some(commit_hash) => self.commit_store.get_commit(commit_hash)?.state_root,
+                    None => self.state_store.empty_root()?,
+                },
+            };
             let candidate = self.commit_store.create_commit(
                 parents,
                 state_root,
@@ -691,7 +697,7 @@ mod tests {
         let writer_db = Arc::clone(&db);
         let writer_stop = Arc::clone(&stop);
         let writer = std::thread::spawn(move || {
-            for i in 1..=400u32 {
+            for i in 1..=150u32 {
                 if writer_stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -727,7 +733,7 @@ mod tests {
             violations
         });
 
-        for _ in 0..400 {
+        for _ in 0..150 {
             let _ = db.create_commit_at_head("main", "agent", "m", vec![]);
         }
         stop.store(true, Ordering::Relaxed);

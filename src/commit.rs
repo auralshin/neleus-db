@@ -36,7 +36,12 @@ pub struct Commit {
     /// `hash_typed(COMMIT_PAYLOAD_TAG, &to_cbor(&unsigned))` where `unsigned`
     /// is this commit with `signature` and `payload_hash` both set to `None`.
     /// Present only on signed commits; verifiers MUST re-derive and compare.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` keeps unsigned commits byte-identical to commits
+    /// produced by code that predates this field: `None` is encoded by
+    /// omitting the key rather than by an explicit `null`. Without this,
+    /// adding the field would change every existing unsigned commit's hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<Hash>,
 }
 
@@ -220,6 +225,59 @@ mod tests {
 
         let state = StateStore::new(objects, blobs.clone(), Wal::new(tmp.path().join("wal")));
         (commit_store, state, blobs)
+    }
+
+    /// Regression: adding `payload_hash` to `Commit` must NOT change the
+    /// CBOR encoding of an unsigned commit, because that would change every
+    /// existing commit hash on disk. `skip_serializing_if = "Option::is_none"`
+    /// on `payload_hash` keeps the unsigned shape byte-identical to commits
+    /// produced by code that predated the field.
+    #[test]
+    fn unsigned_commit_cbor_omits_payload_hash() {
+        #[derive(serde::Serialize)]
+        struct LegacyCommit {
+            schema_version: u32,
+            parents: Vec<CommitHash>,
+            timestamp: u64,
+            author: String,
+            message: String,
+            state_root: StateRoot,
+            manifests: Vec<Hash>,
+            signature: Option<CommitSignature>,
+        }
+
+        let state_root = hash_typed(b"any:", b"r");
+        let manifest = hash_typed(b"any:", b"m");
+
+        let new_form = Commit {
+            schema_version: COMMIT_SCHEMA_VERSION,
+            parents: vec![],
+            timestamp: 1700000000,
+            author: "agent".into(),
+            message: "msg".into(),
+            state_root,
+            manifests: vec![manifest],
+            signature: None,
+            payload_hash: None,
+        };
+
+        let legacy_form = LegacyCommit {
+            schema_version: COMMIT_SCHEMA_VERSION,
+            parents: vec![],
+            timestamp: 1700000000,
+            author: "agent".into(),
+            message: "msg".into(),
+            state_root,
+            manifests: vec![manifest],
+            signature: None,
+        };
+
+        let new_bytes = to_cbor(&new_form).unwrap();
+        let legacy_bytes = to_cbor(&legacy_form).unwrap();
+        assert_eq!(
+            new_bytes, legacy_bytes,
+            "unsigned commit encoding must match the pre-payload_hash shape"
+        );
     }
 
     #[test]
