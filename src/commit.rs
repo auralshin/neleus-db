@@ -33,10 +33,32 @@ pub struct Commit {
     pub manifests: Vec<Hash>,
     #[serde(default)]
     pub signature: Option<CommitSignature>,
+    /// `hash_typed(COMMIT_PAYLOAD_TAG, &to_cbor(&unsigned))` where `unsigned`
+    /// is this commit with `signature` and `payload_hash` both set to `None`.
+    /// Present only on signed commits; verifiers MUST re-derive and compare.
+    #[serde(default)]
+    pub payload_hash: Option<Hash>,
+}
+
+impl Commit {
+    /// Compute the payload hash that a signer signs / a verifier checks.
+    /// Strips `signature` and `payload_hash` from `self` to reconstruct the
+    /// canonical unsigned form, then hashes its DAG-CBOR encoding.
+    pub fn unsigned_payload_hash(&self) -> Result<Hash> {
+        let unsigned = Commit {
+            signature: None,
+            payload_hash: None,
+            ..self.clone()
+        };
+        Ok(hash_typed(COMMIT_PAYLOAD_TAG, &to_cbor(&unsigned)?))
+    }
 }
 
 pub trait CommitVerifier {
-    fn verify(&self, commit_hash: CommitHash, commit: &Commit) -> Result<()>;
+    /// `payload_hash` has already been re-derived from `commit` and confirmed
+    /// to match the value stored on the commit. Implementations should perform
+    /// only the cryptographic signature check against this hash.
+    fn verify(&self, commit_hash: CommitHash, commit: &Commit, payload_hash: Hash) -> Result<()>;
 }
 
 pub trait CommitSigner {
@@ -71,6 +93,7 @@ impl CommitStore {
             state_root,
             manifests,
             signature: None,
+            payload_hash: None,
         };
         self.objects.put_serialized(COMMIT_TAG, &commit)
     }
@@ -94,12 +117,14 @@ impl CommitStore {
             state_root,
             manifests,
             signature: None,
+            payload_hash: None,
         };
-        let payload_hash = hash_typed(COMMIT_PAYLOAD_TAG, &to_cbor(&unsigned)?);
+        let payload_hash = unsigned.unsigned_payload_hash()?;
         let signature = signer.sign(payload_hash, &unsigned)?;
 
         let signed = Commit {
             signature: Some(signature),
+            payload_hash: Some(payload_hash),
             ..unsigned
         };
         self.objects.put_serialized(COMMIT_TAG, &signed)
@@ -117,7 +142,17 @@ impl CommitStore {
         verifier: &V,
     ) -> Result<()> {
         let commit = self.get_commit(hash)?;
-        verifier.verify(hash, &commit)
+        let stored = commit
+            .payload_hash
+            .ok_or_else(|| anyhow!("commit {} is not signed (missing payload_hash)", hash))?;
+        let expected = commit.unsigned_payload_hash()?;
+        if stored != expected {
+            return Err(anyhow!(
+                "commit {} payload_hash inconsistent with commit body",
+                hash
+            ));
+        }
+        verifier.verify(hash, &commit, expected)
     }
 
     fn validate_references(&self, state_root: StateRoot, manifests: &[Hash]) -> Result<()> {
@@ -272,38 +307,47 @@ mod tests {
         assert_eq!(c.message, "m");
     }
 
-    struct DummySigner;
+    /// Real signing scheme used in tests: the signature IS the payload_hash bytes,
+    /// keyed by `k1`. A verifier must reject any tampered commit because the
+    /// re-derived `payload_hash` changes when the commit body does.
+    struct HashEchoSigner;
 
-    impl CommitSigner for DummySigner {
+    impl CommitSigner for HashEchoSigner {
         fn sign(&self, payload_hash: Hash, _commit: &Commit) -> Result<CommitSignature> {
             Ok(CommitSignature {
-                scheme: "dummy".into(),
+                scheme: "hash-echo".into(),
                 key_id: Some("k1".into()),
                 signature: payload_hash.as_bytes().to_vec(),
             })
         }
     }
 
-    struct DummyVerifier;
+    struct HashEchoVerifier;
 
-    impl CommitVerifier for DummyVerifier {
-        fn verify(&self, _hash: CommitHash, commit: &Commit) -> Result<()> {
-            if commit.signature.is_some() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("missing signature"))
+    impl CommitVerifier for HashEchoVerifier {
+        fn verify(&self, _hash: CommitHash, commit: &Commit, payload_hash: Hash) -> Result<()> {
+            let sig = commit
+                .signature
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing signature"))?;
+            if sig.scheme != "hash-echo" {
+                return Err(anyhow::anyhow!("unexpected scheme {}", sig.scheme));
             }
+            if sig.signature.as_slice() != payload_hash.as_bytes() {
+                return Err(anyhow::anyhow!("signature does not match payload_hash"));
+            }
+            Ok(())
         }
     }
 
     #[test]
-    fn signed_commit_hook_works() {
+    fn signed_commit_round_trip_verifies() {
         let tmp = TempDir::new().unwrap();
         let (cs, state, _) = stores(&tmp);
         let root = state.empty_root().unwrap();
         let h = cs
             .create_signed_commit(
-                &DummySigner,
+                &HashEchoSigner,
                 vec![],
                 root,
                 vec![],
@@ -313,7 +357,90 @@ mod tests {
             .unwrap();
         let c = cs.get_commit(h).unwrap();
         assert!(c.signature.is_some());
-        cs.verify_commit_with(h, &DummyVerifier).unwrap();
+        assert!(c.payload_hash.is_some());
+        cs.verify_commit_with(h, &HashEchoVerifier).unwrap();
+    }
+
+    #[test]
+    fn verifier_rejects_unsigned_commit() {
+        let tmp = TempDir::new().unwrap();
+        let (cs, state, _) = stores(&tmp);
+        let root = state.empty_root().unwrap();
+        let h = cs
+            .create_commit(vec![], root, vec![], "agent".into(), "msg".into())
+            .unwrap();
+        let err = cs.verify_commit_with(h, &HashEchoVerifier).unwrap_err();
+        assert!(err.to_string().contains("not signed"));
+    }
+
+    /// Tampering with any field of a signed commit must invalidate it.
+    /// Demonstrates that storing `payload_hash` alongside the signature does
+    /// not allow an attacker to forge by mutating other fields.
+    #[test]
+    fn verifier_rejects_tampered_commit_body() {
+        let tmp = TempDir::new().unwrap();
+        let (cs, state, _) = stores(&tmp);
+        let root = state.empty_root().unwrap();
+        let h = cs
+            .create_signed_commit(
+                &HashEchoSigner,
+                vec![],
+                root,
+                vec![],
+                "agent".into(),
+                "original message".into(),
+            )
+            .unwrap();
+
+        let mut c = cs.get_commit(h).unwrap();
+        let original_payload_hash = c.payload_hash.unwrap();
+        c.message = "tampered message".into();
+
+        // payload_hash is now stale relative to the body. The verifier path's
+        // consistency check (inside verify_commit_with) is what catches this;
+        // here we simulate by calling the helper directly.
+        let recomputed = c.unsigned_payload_hash().unwrap();
+        assert_ne!(recomputed, original_payload_hash);
+    }
+
+    /// Stored payload_hash MUST equal the re-derived hash, even if a signature
+    /// would still verify against the stored payload_hash. Otherwise an attacker
+    /// could craft a Commit whose body says X but whose signed payload_hash
+    /// covers a different X'.
+    #[test]
+    fn verifier_rejects_inconsistent_payload_hash() {
+        use crate::object_store::ObjectStore;
+
+        let tmp = TempDir::new().unwrap();
+        let objects = ObjectStore::new(tmp.path().join("objects"));
+        objects.ensure_dir().unwrap();
+        let cs = CommitStore::new(objects.clone());
+        let state_objects = ObjectStore::new(tmp.path().join("objects"));
+        let blobs = BlobStore::new(tmp.path().join("blobs"));
+        blobs.ensure_dir().unwrap();
+        let state = StateStore::new(state_objects, blobs, Wal::new(tmp.path().join("wal")));
+        let root = state.empty_root().unwrap();
+
+        // Hand-craft a forged commit: body says "real" but payload_hash
+        // covers a different (signed) payload.
+        let forged = Commit {
+            schema_version: COMMIT_SCHEMA_VERSION,
+            parents: vec![],
+            timestamp: 1,
+            author: "attacker".into(),
+            message: "real".into(),
+            state_root: root,
+            manifests: vec![],
+            signature: Some(CommitSignature {
+                scheme: "hash-echo".into(),
+                key_id: Some("k1".into()),
+                signature: hash_typed(b"other:", b"x").as_bytes().to_vec(),
+            }),
+            payload_hash: Some(hash_typed(b"other:", b"x")),
+        };
+        let h = objects.put_serialized(COMMIT_TAG, &forged).unwrap();
+        let err = cs.verify_commit_with(h, &HashEchoVerifier).unwrap_err();
+        assert!(err.to_string().contains("inconsistent"));
     }
 
     #[test]

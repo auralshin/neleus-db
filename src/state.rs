@@ -529,6 +529,19 @@ fn new_state_manifest(segments: Vec<Hash>) -> StateManifest {
     }
 }
 
+/// Repair in-memory views of manifests written by older code paths.
+///
+/// Older versions stored manifests without `segments_merkle_root`, which
+/// deserializes as `Hash::zero()`. Recomputing the correct value here lets
+/// `verify_proof` validate proofs against the right root regardless of the
+/// stored manifest's age.
+///
+/// The correction is **in-memory only**: persisting it would change the
+/// manifest's hash and orphan every commit/ref pointing at the old one,
+/// which requires a full state-root chain rewrite. That migration is
+/// deferred (see issue #2's PR description). Repeated loads of a legacy
+/// manifest pay this O(n) hash-walk; it is acceptable because manifests
+/// are small and the cost is bounded by `segments.len()`.
 fn migrate_manifest(manifest: &mut StateManifest) {
     if manifest.schema_version == 0 {
         manifest.schema_version = STATE_SCHEMA_VERSION;
@@ -994,6 +1007,48 @@ mod tests {
         assert_eq!(
             hash_state_object(&m).unwrap(),
             hash_state_object(&m).unwrap()
+        );
+    }
+
+    /// Regression for issue #2: a manifest stored by older code that omitted
+    /// `segments_merkle_root` (deserializes as `Hash::zero()`) must still
+    /// support proof verification once `migrate_manifest` repairs it.
+    #[test]
+    fn migrate_manifest_repairs_zero_segments_root() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+
+        // Stage a real segment via the normal path so its bytes live in the
+        // object store.
+        let value_hash = s.blobs.put(b"v").unwrap();
+        let segment = StateSegment::from_entries(vec![SegmentEntry {
+            key: b"k".to_vec(),
+            value: ValueRef::Value(value_hash),
+        }])
+        .unwrap();
+        let segment_hash = s.store_segment(&segment).unwrap();
+
+        // Hand-craft the legacy manifest shape: schema_version=0,
+        // segments_merkle_root=Hash::zero(), but real segments.
+        let broken = StateManifest {
+            schema_version: 0,
+            segments: vec![segment_hash],
+            segments_merkle_root: Hash::zero(),
+        };
+        let broken_root = s.store_manifest(&broken).unwrap();
+
+        // Loading must succeed and produce a corrected manifest in memory.
+        let loaded = s.load_manifest(broken_root).unwrap();
+        let expected_root = merkle_root(&manifest_segment_leaves(&loaded.segments));
+        assert_eq!(loaded.segments_merkle_root, expected_root);
+        assert_eq!(loaded.schema_version, STATE_SCHEMA_VERSION);
+
+        // Functional check: get() returns the value and proof verifies.
+        assert_eq!(s.get(broken_root, b"k").unwrap(), Some(b"v".to_vec()));
+        let proof = s.proof(broken_root, b"k").unwrap();
+        assert!(
+            s.verify_proof(broken_root, b"k", &proof),
+            "proof against legacy manifest must verify after migration"
         );
     }
 

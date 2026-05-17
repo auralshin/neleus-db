@@ -99,14 +99,17 @@ Commit {
   message,
   state_root,
   manifests,
-  signature?: CommitSignature
+  signature?: CommitSignature,
+  payload_hash?: Hash
 }
 ```
 
+`payload_hash` is `hash_typed("commit_payload:", dag_cbor(unsigned_commit))` where `unsigned_commit` is the commit with both `signature` and `payload_hash` cleared. It is recorded on signed commits so verifiers can re-derive what was actually signed and check the cryptographic signature against it.
+
 Extension hooks:
 
-- `trait CommitSigner`
-- `trait CommitVerifier`
+- `trait CommitSigner` — produces a signature over a payload hash supplied by `create_signed_commit`.
+- `trait CommitVerifier` — receives `(commit_hash, &Commit, payload_hash)`. The caller (`CommitStore::verify_commit_with`) re-derives the payload hash and checks it matches the value stored on the commit before invoking the verifier, so implementations only need to perform the cryptographic signature check against the supplied hash. Verifiers must reject unsigned commits and commits whose body has been tampered.
 
 `create_signed_commit` uses these hooks without forcing a specific crypto backend.
 
