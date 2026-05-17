@@ -231,16 +231,12 @@ Example config snippet:
   "encryption": {
     "enabled": true,
     "algorithm": "aes-256-gcm",
-    "kdf": "pbkdf2",
-    "key_size": 32,
-    "salt_size": 16,
-    "nonce_size": 12,
     "kdf_iterations": 600000
   }
 }
 ```
 
-`master_salt` is generated automatically on the first open of an encryption-enabled database and added to `config.json`. Do not edit or rotate it manually — every existing ciphertext on disk depends on it. Rotate the *password* via `Database::rotate_encryption_key` instead.
+`master_salt` is generated automatically on the first open of an encryption-enabled database and added to `config.json`. Do not edit or rotate it manually — every existing ciphertext on disk depends on it. Rotate the *password* via `Database::rotate_encryption_key` instead. The AEAD parameters (key size, nonce size, per-blob salt size) are not user-configurable; they are fixed by the algorithm choice.
 
 ## Testing
 

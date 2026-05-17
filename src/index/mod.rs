@@ -170,6 +170,7 @@ impl SearchIndexStore {
         };
 
         let mut chunk_vec: Vec<IndexChunk> = chunks.values().cloned().collect();
+        // BM25 scoring relies on this ordering — see `semantic_search_index`.
         chunk_vec.sort_by(|a, b| a.chunk_hash.cmp(&b.chunk_hash));
 
         let (semantic_docs, avg_doc_len, semantic_doc_len, semantic_doc_freq, semantic_postings) =
