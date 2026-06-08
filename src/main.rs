@@ -85,6 +85,41 @@ enum DbCommands {
         #[arg(long, default_value = "NELEUS_DB_NEW_ENCRYPTION_PASSWORD")]
         new_password_env: String,
     },
+    /// Export the database (--db) into a single self-contained pack file.
+    /// Cold copy: quiesce writers (or open the DB once) before packing.
+    Pack {
+        /// Destination pack file.
+        out: PathBuf,
+        /// zstd-compress the pack stream (smaller for plaintext databases).
+        #[arg(long)]
+        compress: bool,
+    },
+    /// Restore a database directory (--db) from a pack file.
+    Unpack {
+        /// Source pack file.
+        input: PathBuf,
+        /// Overwrite the target directory if it already exists.
+        #[arg(long)]
+        force: bool,
+        /// Check the pack's integrity and structure without writing anything.
+        #[arg(long)]
+        verify_only: bool,
+    },
+    /// Consolidate loose blobs/objects into pack files, reclaiming the per-file
+    /// disk and inode overhead. Crash-safe; already-packed objects are untouched.
+    Repack,
+    /// List the internal pack files under blobs/ and objects/.
+    Packs,
+    /// Reclaim objects unreachable from any ref. Dry-run by default — pass
+    /// --prune to actually delete.
+    Gc {
+        /// Delete unreachable objects (default: report only).
+        #[arg(long)]
+        prune: bool,
+        /// Protect objects modified within this many seconds of the run start.
+        #[arg(long, default_value_t = 3600)]
+        grace_secs: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -285,6 +320,118 @@ fn main() -> Result<()> {
                     json_output,
                     serde_json::json!({"status": "ok", "files_reencrypted": count}),
                     &format!("reencrypted {count} files"),
+                )?;
+            }
+            DbCommands::Pack { out, compress } => {
+                let stats = neleus_db::pack::pack(&db_path, &out, compress)?;
+                emit(
+                    json_output,
+                    serde_json::json!({"status": "ok", "pack": out, "entries": stats.entries, "bytes": stats.bytes, "compressed": compress}),
+                    &format!(
+                        "packed {} files ({} bytes) -> {}",
+                        stats.entries,
+                        stats.bytes,
+                        out.display()
+                    ),
+                )?;
+            }
+            DbCommands::Unpack {
+                input,
+                force,
+                verify_only,
+            } => {
+                if verify_only {
+                    let stats = neleus_db::pack::verify(&input)?;
+                    emit(
+                        json_output,
+                        serde_json::json!({"status": "ok", "verified": input, "entries": stats.entries, "bytes": stats.bytes}),
+                        &format!(
+                            "verified {} ({} entries, {} stored bytes)",
+                            input.display(),
+                            stats.entries,
+                            stats.bytes
+                        ),
+                    )?;
+                } else {
+                    let stats = neleus_db::pack::unpack(&input, &db_path, force)?;
+                    emit(
+                        json_output,
+                        serde_json::json!({"status": "ok", "db": db_path, "entries": stats.entries, "bytes": stats.bytes}),
+                        &format!(
+                            "unpacked {} files ({} bytes) -> {}",
+                            stats.entries,
+                            stats.bytes,
+                            db_path.display()
+                        ),
+                    )?;
+                }
+            }
+            DbCommands::Repack => {
+                let db = Database::open(&db_path)?;
+                let s = db.repack()?;
+                emit(
+                    json_output,
+                    serde_json::json!({
+                        "status": "ok",
+                        "packed_objects": s.packed_objects(),
+                        "reclaimed_loose": s.reclaimed_loose(),
+                        "pack_bytes": s.pack_bytes(),
+                    }),
+                    &format!(
+                        "repacked {} objects ({} bytes), removed {} loose files",
+                        s.packed_objects(),
+                        s.pack_bytes(),
+                        s.reclaimed_loose()
+                    ),
+                )?;
+            }
+            DbCommands::Packs => {
+                let mut groups = serde_json::Map::new();
+                let mut lines = Vec::new();
+                for store in ["blobs", "objects"] {
+                    let packs = neleus_db::packstore::list_packs(&db_path.join(store))?;
+                    let list: Vec<_> = packs
+                        .iter()
+                        .map(|p| serde_json::json!({"id": p.id, "entries": p.entries, "bytes": p.bytes}))
+                        .collect();
+                    for p in &packs {
+                        lines.push(format!("{store}/pack-{} {} objects ({} bytes)", p.id, p.entries, p.bytes));
+                    }
+                    groups.insert(store.to_string(), serde_json::Value::Array(list));
+                }
+                let text = if lines.is_empty() {
+                    "no pack files".to_string()
+                } else {
+                    lines.join("\n")
+                };
+                emit(
+                    json_output,
+                    serde_json::json!({"status": "ok", "packs": groups}),
+                    &text,
+                )?;
+            }
+            DbCommands::Gc { prune, grace_secs } => {
+                let db = Database::open(&db_path)?;
+                let stats =
+                    neleus_db::gc::gc(&db, prune, std::time::Duration::from_secs(grace_secs))?;
+                emit(
+                    json_output,
+                    serde_json::json!({
+                        "status": "ok",
+                        "pruned": stats.pruned,
+                        "reachable": stats.reachable,
+                        "unreachable": stats.unreachable,
+                        "reclaimed_bytes": stats.reclaimed_bytes,
+                        "skipped_recent": stats.skipped_recent,
+                    }),
+                    &format!(
+                        "{} {} unreachable objects ({} bytes), {} reachable, {} protected by grace",
+                        if stats.pruned { "pruned" } else { "would prune" },
+                        stats.unreachable,
+                        stats.reclaimed_bytes,
+                        stats.reachable,
+                        stats.skipped_recent
+                    ),
                 )?;
             }
         },

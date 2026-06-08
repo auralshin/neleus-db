@@ -1,20 +1,39 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 
 use crate::atomic::{build_temp_name, maybe_sync_dir, maybe_sync_file};
 use crate::hash::Hash;
+use crate::packstore::PackSet;
 
 #[derive(Clone, Debug)]
 pub struct CasStore {
     root: PathBuf,
+    /// Lazily-loaded index over `pack/*.idx`, shared across clones. A repack by
+    /// this or another process is observed only by stores constructed *after*
+    /// it (reopen the `Database` to pick one up) — the same reopen contract as
+    /// encryption-key rotation.
+    packs: Arc<OnceLock<PackSet>>,
 }
 
 impl CasStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            packs: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// Pack index for this root, loaded on first use. A corrupt or incomplete
+    /// pack degrades to an empty set so other reads keep working; the affected
+    /// objects then surface as ordinary "missing object" errors. Tooling that
+    /// wants loud detection calls [`PackSet::load`] directly.
+    fn packs(&self) -> &PackSet {
+        self.packs
+            .get_or_init(|| PackSet::load(&self.root).unwrap_or_default())
     }
 
     pub fn root(&self) -> &Path {
@@ -29,7 +48,7 @@ impl CasStore {
     }
 
     pub fn exists(&self, hash: Hash) -> bool {
-        self.path_for(hash).exists()
+        self.path_for(hash).exists() || self.packs().contains(hash)
     }
 
     /// Write `bytes` under `hash`, treating the store as a content-addressed
@@ -41,7 +60,9 @@ impl CasStore {
     /// writer overwrite, leaving non-deterministic ciphertext on disk.
     pub fn put_existing_hash(&self, hash: Hash, bytes: &[u8]) -> Result<()> {
         let path = self.path_for(hash);
-        if path.exists() {
+        // Already loose, or already packed — either way the content is durable
+        // and a second copy would just be redundant.
+        if path.exists() || self.packs().contains(hash) {
             return Ok(());
         }
         let parent = path
@@ -91,9 +112,16 @@ impl CasStore {
 
     pub fn get(&self, hash: Hash) -> Result<Vec<u8>> {
         let path = self.path_for(hash);
-        let bytes = fs::read(&path)
-            .with_context(|| format!("missing CAS object {} ({})", hash, path.display()))?;
-        Ok(bytes)
+        match fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            // Loose miss: fall back to packs before declaring the object gone.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match self.packs().get(hash)? {
+                Some(bytes) => Ok(bytes),
+                None => Err(anyhow!("missing CAS object {} ({})", hash, path.display())),
+            },
+            Err(e) => Err(e)
+                .with_context(|| format!("reading CAS object {} ({})", hash, path.display())),
+        }
     }
 
     pub fn ensure_dir(&self) -> Result<()> {

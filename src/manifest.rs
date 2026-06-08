@@ -125,6 +125,13 @@ impl ManifestStore {
         self.get_manifest(hash)
     }
 
+    /// Canonical (decoded) manifest bytes — decrypted, decompressed, and
+    /// integrity-checked, but not yet deserialized into a concrete type. Used
+    /// by garbage collection to identify a manifest's exact type by round-trip.
+    pub fn raw_manifest_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
+        self.objects.get_typed_bytes(MANIFEST_TAG, hash)
+    }
+
     /// Chunk `input_bytes`, store each chunk and the original as blobs, then store a
     /// [`DocManifest`] linking them all.
     ///

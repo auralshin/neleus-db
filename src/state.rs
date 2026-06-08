@@ -505,6 +505,31 @@ impl StateStore {
         let segment: StateSegment = from_cbor(&bytes)?;
         Ok(segment)
     }
+
+    /// Every hash reachable from state `root`: the manifest object, each
+    /// segment object, and the value blob behind every live entry. The state
+    /// store owns its own DAG shape, so garbage collection asks it rather than
+    /// re-deriving the layout. Object and blob hashes are returned together —
+    /// callers sweep the right store by hash, and the two hash-spaces are
+    /// disjoint (different domain tags), so no classification is needed.
+    pub fn reachable_from(&self, root: StateRoot) -> Result<Vec<Hash>> {
+        let manifest = self.load_manifest_or_empty(root)?;
+        let mut out = Vec::new();
+        // An unmaterialized empty root has no object on disk to protect.
+        if self.objects.exists(root) {
+            out.push(root);
+        }
+        for seg_hash in &manifest.segments {
+            out.push(*seg_hash);
+            let segment = self.load_segment(*seg_hash)?;
+            for entry in &segment.entries {
+                if let ValueRef::Value(h) = &entry.value {
+                    out.push(*h);
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl StateSegment {

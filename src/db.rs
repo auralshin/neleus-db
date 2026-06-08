@@ -38,6 +38,27 @@ pub struct Database {
     pub config: Config,
 }
 
+/// Outcome of [`Database::repack`]: per-store consolidation totals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RepackSummary {
+    pub blobs: crate::packstore::RepackStats,
+    pub objects: crate::packstore::RepackStats,
+}
+
+impl RepackSummary {
+    pub fn packed_objects(&self) -> usize {
+        self.blobs.packed_objects + self.objects.packed_objects
+    }
+
+    pub fn reclaimed_loose(&self) -> usize {
+        self.blobs.reclaimed_loose + self.objects.reclaimed_loose
+    }
+
+    pub fn pack_bytes(&self) -> u64 {
+        self.blobs.pack_bytes + self.objects.pack_bytes
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     pub schema_version: u32,
@@ -391,6 +412,29 @@ impl Database {
         crate::atomic::write_atomic(&cfg_path, &bytes)?;
 
         Ok(count)
+    }
+
+    /// Consolidate loose objects under `blobs/` and `objects/` into pack files,
+    /// removing the loose copies. Reclaims the per-file disk-block and inode
+    /// overhead of a store that has accumulated many tiny objects (chunks,
+    /// manifests, state segments).
+    ///
+    /// Crash-safe: each pack is fsynced before any loose copy is deleted, so a
+    /// crash mid-run leaves both forms and loses nothing. Held under
+    /// `meta/repack.lock` so two repacks cannot race. Already-packed objects are
+    /// left untouched.
+    ///
+    /// **Visibility:** reads through *this* handle may have cached an older
+    /// (empty) pack index; reopen the `Database` after a repack to observe the
+    /// new packs, the same contract as [`Self::rotate_encryption_key`].
+    pub fn repack(&self) -> Result<RepackSummary> {
+        let _lock = acquire_lock(
+            self.root.join("meta").join("repack.lock"),
+            Duration::from_secs(30),
+        )?;
+        let blobs = crate::packstore::pack_loose(&self.root.join("blobs"))?;
+        let objects = crate::packstore::pack_loose(&self.root.join("objects"))?;
+        Ok(RepackSummary { blobs, objects })
     }
 
     fn encryption_runtime(&self) -> Option<Arc<EncryptionRuntime>> {
@@ -918,5 +962,86 @@ mod tests {
             msg.contains("rotation aborted"),
             "expected rotation-abort error, got: {msg}"
         );
+    }
+
+    // ---------- repack / pack-aware reads ----------
+
+    fn loose_count(cas_root: &Path) -> usize {
+        crate::packstore::loose_objects(cas_root).unwrap().len()
+    }
+
+    #[test]
+    fn repack_consolidates_and_reads_survive() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let blob = db.blob_store.put(b"packed-payload").unwrap();
+        let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![])
+            .unwrap();
+
+        let summary = db.repack().unwrap();
+        assert!(summary.packed_objects() > 0);
+        assert!(summary.reclaimed_loose() > 0);
+        assert_eq!(loose_count(&db_root.join("blobs")), 0);
+        assert_eq!(loose_count(&db_root.join("objects")), 0);
+
+        // Reopen and read everything back through the pack-aware path.
+        let db2 = Database::open(&db_root).unwrap();
+        assert_eq!(db2.blob_store.get(blob).unwrap(), b"packed-payload");
+        let root = db2.resolve_state_root("main").unwrap();
+        assert_eq!(db2.state_store.get(root, b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(db2.commit_store.get_commit(commit).unwrap().author, "agent");
+    }
+
+    #[test]
+    fn put_after_repack_does_not_reloose_packed_object() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+        let db = Database::open(&db_root).unwrap();
+
+        let blob = db.blob_store.put(b"dup").unwrap();
+        db.repack().unwrap();
+
+        // A fresh handle sees the pack; re-putting identical content must not
+        // recreate a loose file (exists() is pack-aware).
+        let db2 = Database::open(&db_root).unwrap();
+        let again = db2.blob_store.put(b"dup").unwrap();
+        assert_eq!(again, blob);
+        assert_eq!(loose_count(&db_root.join("blobs")), 0);
+    }
+
+    #[test]
+    fn repack_preserves_encrypted_reads_and_packs_ciphertext() {
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let needle = b"SECRET-PACKED-PLAINTEXT-NEEDLE";
+        let db = init_encrypted_db(&db_root, "pack-enc-pw");
+        let h = db.blob_store.put(needle).unwrap();
+        db.repack().unwrap();
+        drop(db);
+
+        // The pack holds verbatim ciphertext — no plaintext leaked.
+        let pack_dir = db_root.join("blobs").join(crate::packstore::PACK_DIR);
+        let pack = fs::read_dir(&pack_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().and_then(|e| e.to_str()) == Some("pack"))
+            .unwrap();
+        let raw = fs::read(&pack).unwrap();
+        assert!(
+            !raw.windows(needle.len()).any(|w| w == needle),
+            "plaintext leaked into pack file"
+        );
+
+        // SAFETY: serialized via encryption_test_lock.
+        unsafe { std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "pack-enc-pw") };
+        let db = Database::open(&db_root).unwrap();
+        assert_eq!(db.blob_store.get(h).unwrap(), needle);
     }
 }
