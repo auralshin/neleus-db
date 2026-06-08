@@ -14,7 +14,7 @@ use neleus_db::db::Database;
 use neleus_db::hash::Hash;
 use neleus_db::index::{SearchHit, SearchIndexStore};
 use neleus_db::manifest::{
-    ChunkManifest, ChunkingSpec, DocManifest, RunManifest, MANIFEST_SCHEMA_VERSION,
+    ChunkManifest, ChunkingSpec, DocManifest, MANIFEST_SCHEMA_VERSION, RunManifest,
 };
 use neleus_db::state::{StateManifest, StateSegment};
 
@@ -77,7 +77,9 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum DbCommands {
-    Init { path: PathBuf },
+    Init {
+        path: PathBuf,
+    },
     /// Re-encrypt all blobs and objects with a new password.
     /// The new password is read from the environment variable given by --new-password-env.
     /// The current password must still be set in NELEUS_DB_ENCRYPTION_PASSWORD.
@@ -311,9 +313,8 @@ fn main() -> Result<()> {
                 )?;
             }
             DbCommands::Reencrypt { new_password_env } => {
-                let new_password = std::env::var(&new_password_env).map_err(|_| {
-                    anyhow!("environment variable {new_password_env} is not set")
-                })?;
+                let new_password = std::env::var(&new_password_env)
+                    .map_err(|_| anyhow!("environment variable {new_password_env} is not set"))?;
                 let db = Database::open(&db_path)?;
                 let count = db.rotate_encryption_key(&new_password)?;
                 emit(
@@ -395,7 +396,10 @@ fn main() -> Result<()> {
                         .map(|p| serde_json::json!({"id": p.id, "entries": p.entries, "bytes": p.bytes}))
                         .collect();
                     for p in &packs {
-                        lines.push(format!("{store}/pack-{} {} objects ({} bytes)", p.id, p.entries, p.bytes));
+                        lines.push(format!(
+                            "{store}/pack-{} {} objects ({} bytes)",
+                            p.id, p.entries, p.bytes
+                        ));
                     }
                     groups.insert(store.to_string(), serde_json::Value::Array(list));
                 }
@@ -426,7 +430,11 @@ fn main() -> Result<()> {
                     }),
                     &format!(
                         "{} {} unreachable objects ({} bytes), {} reachable, {} protected by grace",
-                        if stats.pruned { "pruned" } else { "would prune" },
+                        if stats.pruned {
+                            "pruned"
+                        } else {
+                            "would prune"
+                        },
                         stats.unreachable,
                         stats.reclaimed_bytes,
                         stats.reachable,
@@ -507,8 +515,7 @@ fn main() -> Result<()> {
                         .map(|p| db.blob_store.put(&fs::read(p)?))
                         .transpose()?;
 
-                    let model_parameters =
-                        build_model_parameters_blob(&db, params_json, &params)?;
+                    let model_parameters = build_model_parameters_blob(&db, params_json, &params)?;
 
                     let retrieved_chunk_hashes = retrieved_chunks
                         .iter()

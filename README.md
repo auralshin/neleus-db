@@ -173,6 +173,18 @@ cargo run -- --db /tmp/neleus_db proof state main 6b6579 --key-encoding hex
 - `log <head>`
 - `proof state <head> <key> [--key-encoding utf8|hex|base64]`
 
+Storage maintenance:
+
+- `db repack` — consolidate loose blobs/objects into pack files (reclaims per-file disk/inode overhead; crash-safe)
+- `db packs` — list the pack files under `blobs/` and `objects/`
+- `db gc [--prune] [--grace-secs <n>]` — reclaim objects unreachable from any ref; **dry-run by default**, `--prune` deletes. `--grace-secs` (default `3600`) protects objects modified that recently, so in-flight writes aren't swept.
+
+Backup and transport (single self-contained file):
+
+- `db pack <out> [--compress]` — export the whole DB to one file; `--compress` zstd-frames the stream
+- `db unpack <input> [--force] [--verify-only]` — restore a DB from a pack; `--verify-only` checks integrity/structure without writing
+- `db reencrypt [--new-password-env <VAR>]` — rotate the encryption key
+
 Global flags:
 
 - `--db <path>` (default: `./neleus_db`)
@@ -186,21 +198,31 @@ Global flags:
 - `state` - segmented persistent KV + proofs + compaction
 - `commit` - commit objects + signing/verifier hooks
 - `refs` - atomic refs and staged roots
-- `db` - open/init, schema migration, WAL recovery orchestration
+- `db` - open/init, schema migration, WAL recovery orchestration, `repack`
 - `index` - derived semantic/vector index build and query
+- `packstore` - loose-object consolidation into pack files + pack-aware reads
+- `gc` - reachability mark-and-sweep (fail-closed) over commits, state, and manifests
+- `pack` - single-file whole-DB backup/restore with integrity footer
 
 ## Data layout
 
 ```text
 <db_root>/
-  blobs/aa/bb/<fullhash>
+  blobs/aa/bb/<fullhash>          # loose objects (sharded by hash prefix)
+  blobs/pack/pack-<id>.{pack,idx} # consolidated objects after `db repack`
   objects/cc/dd/<fullhash>
+  objects/pack/pack-<id>.{pack,idx}
   refs/heads/<name>
   refs/states/<name>
   index/<commit_hash>/search_index.json
   wal/*.wal
   meta/config.json
 ```
+
+Reads check the loose path first, then fall back to packs. `db repack` moves
+loose objects into a pack and removes the loose copies; `db gc --prune` drops
+objects unreachable from any ref (sweeping loose files and rewriting packs).
+Both store the verbatim on-disk bytes, so packing/GC need no encryption password.
 
 ## Integrity and determinism
 

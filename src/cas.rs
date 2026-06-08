@@ -12,10 +12,8 @@ use crate::packstore::PackSet;
 #[derive(Clone, Debug)]
 pub struct CasStore {
     root: PathBuf,
-    /// Lazily-loaded index over `pack/*.idx`, shared across clones. A repack by
-    /// this or another process is observed only by stores constructed *after*
-    /// it (reopen the `Database` to pick one up) — the same reopen contract as
-    /// encryption-key rotation.
+    /// Pack index, lazily loaded and shared across clones. A repack is seen only
+    /// by stores built after it (reopen the `Database` to refresh).
     packs: Arc<OnceLock<PackSet>>,
 }
 
@@ -27,10 +25,8 @@ impl CasStore {
         }
     }
 
-    /// Pack index for this root, loaded on first use. A corrupt or incomplete
-    /// pack degrades to an empty set so other reads keep working; the affected
-    /// objects then surface as ordinary "missing object" errors. Tooling that
-    /// wants loud detection calls [`PackSet::load`] directly.
+    /// Pack index for this root, loaded on first use. A corrupt/incomplete pack
+    /// degrades to an empty set; affected objects then read as "missing".
     fn packs(&self) -> &PackSet {
         self.packs
             .get_or_init(|| PackSet::load(&self.root).unwrap_or_default())
@@ -60,8 +56,7 @@ impl CasStore {
     /// writer overwrite, leaving non-deterministic ciphertext on disk.
     pub fn put_existing_hash(&self, hash: Hash, bytes: &[u8]) -> Result<()> {
         let path = self.path_for(hash);
-        // Already loose, or already packed — either way the content is durable
-        // and a second copy would just be redundant.
+        // Already loose or packed — don't write a redundant second copy.
         if path.exists() || self.packs().contains(hash) {
             return Ok(());
         }
@@ -105,8 +100,9 @@ impl CasStore {
                 // valid for this content hash; we discard ours and return Ok.
                 Ok(())
             }
-            Err(e) => Err(e)
-                .with_context(|| format!("failed linking CAS object {}", path.display())),
+            Err(e) => {
+                Err(e).with_context(|| format!("failed linking CAS object {}", path.display()))
+            }
         }
     }
 
@@ -119,8 +115,9 @@ impl CasStore {
                 Some(bytes) => Ok(bytes),
                 None => Err(anyhow!("missing CAS object {} ({})", hash, path.display())),
             },
-            Err(e) => Err(e)
-                .with_context(|| format!("reading CAS object {} ({})", hash, path.display())),
+            Err(e) => {
+                Err(e).with_context(|| format!("reading CAS object {} ({})", hash, path.display()))
+            }
         }
     }
 

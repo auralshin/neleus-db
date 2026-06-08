@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use crate::blob_store::BlobStore;
 use crate::canonical::from_cbor;
 use crate::hash::{Hash, hash_typed};
-use crate::merkle::{MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
+use crate::merkle::{
+    MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion,
+};
 use crate::object_store::ObjectStore;
 use crate::wal::{Wal, WalOp};
 
@@ -506,16 +508,13 @@ impl StateStore {
         Ok(segment)
     }
 
-    /// Every hash reachable from state `root`: the manifest object, each
-    /// segment object, and the value blob behind every live entry. The state
-    /// store owns its own DAG shape, so garbage collection asks it rather than
-    /// re-deriving the layout. Object and blob hashes are returned together —
-    /// callers sweep the right store by hash, and the two hash-spaces are
-    /// disjoint (different domain tags), so no classification is needed.
+    /// Every hash reachable from state `root`: the manifest, its segments, and
+    /// each live entry's value blob. GC asks the state store rather than
+    /// re-deriving the DAG shape.
     pub fn reachable_from(&self, root: StateRoot) -> Result<Vec<Hash>> {
         let manifest = self.load_manifest_or_empty(root)?;
         let mut out = Vec::new();
-        // An unmaterialized empty root has no object on disk to protect.
+        // Unmaterialized empty root has no object on disk.
         if self.objects.exists(root) {
             out.push(root);
         }
@@ -589,7 +588,11 @@ fn manifest_segment_leaf(segment_hash: Hash) -> MerkleLeaf {
 }
 
 fn manifest_segment_leaves(segments: &[Hash]) -> Vec<MerkleLeaf> {
-    segments.iter().copied().map(manifest_segment_leaf).collect()
+    segments
+        .iter()
+        .copied()
+        .map(manifest_segment_leaf)
+        .collect()
 }
 
 fn entry_leaf(entry: &SegmentEntry) -> MerkleLeaf {
@@ -1024,7 +1027,10 @@ mod tests {
         let h1 = s.empty_root().unwrap();
 
         let cas_path = CasStore::new(tmp.path().join("objects")).path_for(h1);
-        assert!(cas_path.exists(), "first empty_root call must store the object");
+        assert!(
+            cas_path.exists(),
+            "first empty_root call must store the object"
+        );
         std::fs::remove_file(&cas_path).unwrap();
 
         let h2 = s.empty_root().unwrap();

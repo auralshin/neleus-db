@@ -51,10 +51,8 @@ struct WalkEntry {
 
 /// Export `db_root` into a single self-contained pack file at `out_file`.
 ///
-/// With `compress`, each entry's bytes are zstd-framed (format v2); this shrinks
-/// packs of plaintext databases but gains little on an already-compressed or
-/// encrypted DB whose on-disk bytes are near-incompressible. `bytes` in the
-/// returned stats is always the logical (uncompressed) size.
+/// `compress` zstd-frames each entry (format v2); helps plaintext DBs, little
+/// for encrypted ones. `bytes` in the stats is always the logical size.
 pub fn pack(db_root: &Path, out_file: &Path, compress: bool) -> Result<PackStats> {
     if !db_root.join("meta").join("config.json").exists() {
         bail!(
@@ -241,8 +239,7 @@ pub fn verify(pack_file: &Path) -> Result<PackStats> {
         let mut path_buf = vec![0u8; path_len];
         read_hashed(&mut r, &mut h, &mut path_buf)?;
         let rel = String::from_utf8(path_buf).map_err(|_| anyhow!("invalid utf-8 path in pack"))?;
-        // Reject path traversal here too, so verify flags a malicious pack
-        // before anyone runs the real restore.
+        // Flag a malicious pack before any real restore runs.
         safe_join(Path::new("verify"), &rel)?;
         let _mode = read_u32_hashed(&mut r, &mut h)?;
         let data_len = read_u64_hashed(&mut r, &mut h)?;
@@ -296,9 +293,7 @@ fn restore_into<R: Read>(
         if let Some(parent) = dest.parent() {
             create_dir_all_hardened(parent)?;
         }
-        // `data_len` is the stored length: raw bytes (v1) or the zstd frame
-        // length (v2). The compressed path buffers and inflates per entry; the
-        // raw path streams.
+        // v2 buffers + inflates per entry; v1 streams.
         let written = if compressed {
             write_file_compressed(r, h, &dest, data_len)?
         } else {
@@ -398,7 +393,11 @@ fn write_file_streamed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64
         let want = remaining.min(buf.len() as u64) as usize;
         let n = r.read(&mut buf[..want])?;
         if n == 0 {
-            bail!("pack truncated while reading {} bytes for {}", len, dest.display());
+            bail!(
+                "pack truncated while reading {} bytes for {}",
+                len,
+                dest.display()
+            );
         }
         w.write_all(&buf[..n])?;
         h.update(&buf[..n]);
@@ -412,8 +411,12 @@ fn write_file_streamed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64
 /// write the original bytes to `dest`. Returns the inflated size.
 fn write_file_compressed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64) -> Result<u64> {
     let mut framed = vec![0u8; len as usize];
-    r.read_exact(&mut framed)
-        .map_err(|e| anyhow!("pack truncated reading {len} bytes for {}: {e}", dest.display()))?;
+    r.read_exact(&mut framed).map_err(|e| {
+        anyhow!(
+            "pack truncated reading {len} bytes for {}: {e}",
+            dest.display()
+        )
+    })?;
     h.update(&framed);
     let raw = compression::decompress_if_compressed(&framed)?;
     let file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
@@ -582,7 +585,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src_db");
         make_db(&src);
-        let blob_h = Database::open(&src).unwrap().blob_store.put(b"hello world").unwrap();
+        let blob_h = Database::open(&src)
+            .unwrap()
+            .blob_store
+            .put(b"hello world")
+            .unwrap();
 
         let pack_file = tmp.path().join("out.neleus");
         pack(&src, &pack_file, false).unwrap();
@@ -672,7 +679,8 @@ mod tests {
         make_db(&src);
         fs::write(src.join("meta").join("recovery.lock"), b"pid=1").unwrap();
         fs::write(
-            src.join("blobs").join(format!(".x.tmp-{}-1-0", i32::MAX as u32)),
+            src.join("blobs")
+                .join(format!(".x.tmp-{}-1-0", i32::MAX as u32)),
             b"orphan",
         )
         .unwrap();
@@ -689,7 +697,10 @@ mod tests {
                 .join(format!(".x.tmp-{}-1-0", i32::MAX as u32))
                 .exists()
         );
-        assert_eq!(fs::read(dst.join("wal").join("pending.wal")).unwrap(), b"wal-bytes");
+        assert_eq!(
+            fs::read(dst.join("wal").join("pending.wal")).unwrap(),
+            b"wal-bytes"
+        );
     }
 
     #[cfg(unix)]

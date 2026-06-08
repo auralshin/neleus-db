@@ -1,32 +1,18 @@
-//! Loose-object consolidation for a single content-addressed (`CasStore`) root.
-//!
-//! A content-addressed store keeps every object as its own sharded file
-//! (`ab/cd/<hash>`). An agent DB that records lots of small contexts — chunks,
-//! manifests, state segments — accumulates thousands of tiny files, one disk
-//! block each. A *pack* consolidates many of those into two files:
+//! Loose-object consolidation for one content-addressed (`CasStore`) root.
 //!
 //! ```text
-//! pack/pack-<id>.pack   magic "NELPACK1" | u32 ver | u32 count
-//!                       per entry (sorted by hash): 32B hash | u64 len | data
-//!                       footer: 32B BLAKE3 over everything above
-//! pack/pack-<id>.idx    magic "NELIDX01" | u32 ver | u32 count
-//!                       per entry (sorted by hash): 32B hash | u64 offset | u64 len
-//!                       footer: 32B BLAKE3 over everything above
+//! pack/pack-<id>.pack   "NELPACK1" | u32 ver | u32 count
+//!                       per entry (hash-sorted): 32B hash | u64 len | data
+//!                       footer: 32B BLAKE3 over the above
+//! pack/pack-<id>.idx    "NELIDX01" | u32 ver | u32 count
+//!                       per entry (hash-sorted): 32B hash | u64 offset | u64 len
+//!                       footer: 32B BLAKE3 over the above
 //! ```
 //!
-//! `<id>` is the `.pack` footer hex, so identical object sets pack to identical
-//! bytes and the same name. `offset` is the byte position of an entry's data
-//! within the `.pack`, so a reader seeks straight to it.
-//!
-//! Packing happens **below the crypto boundary**: the bytes copied are the
-//! verbatim on-disk bytes (already compressed/encrypted), so packing needs no
-//! password and round-trips ciphertext exactly. The hash is still the content
-//! address, so a packed object reads back identically to its loose form.
-//!
-//! Consolidation is crash-safe: [`pack_loose`] writes and fsyncs the pack
-//! *before* deleting any loose copy, so a crash mid-delete leaves both — the
-//! loose file still satisfies reads and the pack covers the rest. No window
-//! loses data.
+//! `<id>` = the `.pack` footer hex, so identical object sets pack identically.
+//! Bytes are copied verbatim from disk (below the crypto boundary), so packing
+//! needs no password. Crash-safe: the pack is fsynced before any loose copy is
+//! deleted, so a crash mid-delete leaves both forms readable.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -76,22 +62,15 @@ pub struct RepackStats {
     pub reclaimed_loose: usize,
 }
 
-/// In-memory index over every pack under one CAS root's `pack/` dir.
-///
-/// Built once and consulted on a loose-file miss. A pack written by this or
-/// another process is observed by `PackSet`s loaded *after* it — reopen the
-/// store (or the `Database`) to pick up a concurrent repack, the same contract
-/// as encryption-key rotation.
+/// In-memory index over a CAS root's `pack/` dir, consulted on a loose miss.
+/// A repack is seen only by `PackSet`s loaded after it; reopen to refresh.
 #[derive(Debug, Default)]
 pub struct PackSet {
     entries: std::collections::HashMap<Hash, PackLoc>,
 }
 
 impl PackSet {
-    /// Load every `pack/*.idx` under `cas_root`. A pack whose `.idx` is corrupt
-    /// or whose `.pack` is missing is rejected loudly rather than silently
-    /// dropped — callers that prefer resilience over strictness can fall back
-    /// to an empty set (see `CasStore`).
+    /// Load every `pack/*.idx`. Bails on a corrupt `.idx` or missing `.pack`.
     pub fn load(cas_root: &Path) -> Result<Self> {
         let dir = cas_root.join(PACK_DIR);
         let mut entries = std::collections::HashMap::new();
@@ -109,10 +88,7 @@ impl PackSet {
             }
             let pack_path = Arc::new(path.with_extension("pack"));
             if !pack_path.exists() {
-                bail!(
-                    "pack index {} has no matching .pack file",
-                    path.display()
-                );
+                bail!("pack index {} has no matching .pack file", path.display());
             }
             load_idx_into(&path, &pack_path, &mut entries)?;
         }
@@ -141,8 +117,7 @@ impl PackSet {
         self.entries.iter().map(|(h, l)| (*h, l.len)).collect()
     }
 
-    /// Read the verbatim on-disk bytes of a packed object, or `None` if not
-    /// present in any loaded pack.
+    /// Verbatim on-disk bytes of a packed object, or `None` if not packed.
     pub fn get(&self, hash: Hash) -> Result<Option<Vec<u8>>> {
         let Some(loc) = self.entries.get(&hash) else {
             return Ok(None);
@@ -151,8 +126,12 @@ impl PackSet {
             .with_context(|| format!("opening pack {}", loc.pack_path.display()))?;
         f.seek(SeekFrom::Start(loc.offset))?;
         let mut buf = vec![0u8; loc.len as usize];
-        f.read_exact(&mut buf)
-            .with_context(|| format!("reading packed object {hash} from {}", loc.pack_path.display()))?;
+        f.read_exact(&mut buf).with_context(|| {
+            format!(
+                "reading packed object {hash} from {}",
+                loc.pack_path.display()
+            )
+        })?;
         Ok(Some(buf))
     }
 }
@@ -172,11 +151,17 @@ fn load_idx_into(
         bail!("pack index integrity check failed: {}", idx_path.display());
     }
     if &body[0..8] != IDX_MAGIC {
-        bail!("not a neleus pack index (bad magic): {}", idx_path.display());
+        bail!(
+            "not a neleus pack index (bad magic): {}",
+            idx_path.display()
+        );
     }
     let version = u32::from_le_bytes(body[8..12].try_into().unwrap());
     if version != FORMAT_VERSION {
-        bail!("unsupported pack index version {version}: {}", idx_path.display());
+        bail!(
+            "unsupported pack index version {version}: {}",
+            idx_path.display()
+        );
     }
     let count = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
     let mut p = 16usize;
@@ -254,11 +239,8 @@ fn walk_shards(cas_root: &Path, out: &mut Vec<(Hash, PathBuf)>) -> Result<()> {
 }
 
 /// Consolidate every loose object under `cas_root` into one new pack, then
-/// remove the loose copies. No-op (zero stats) when nothing is loose.
-///
-/// Already-packed objects are untouched; only loose files are swept, so
-/// repeated calls accumulate one pack per call. The new pack is fsynced before
-/// any loose file is deleted.
+/// remove the loose copies. Already-packed objects are untouched, so repeated
+/// calls accumulate one pack each. No-op when nothing is loose.
 pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
     let mut loose = loose_objects(cas_root)?;
     if loose.is_empty() {
@@ -271,10 +253,12 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
     fs::create_dir_all(&pack_dir)
         .with_context(|| format!("creating pack dir {}", pack_dir.display()))?;
 
-    // Stream loose file -> pack, one file in memory at a time.
+    // One file in memory at a time.
     let sources = loose.iter().map(|(h, path)| {
         let path = path.clone();
-        (*h, move || fs::read(&path).with_context(|| format!("reading {}", path.display())))
+        (*h, move || {
+            fs::read(&path).with_context(|| format!("reading {}", path.display()))
+        })
     });
     let info = write_pack(&pack_dir, loose.len(), sources)?;
 
@@ -296,12 +280,9 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
     })
 }
 
-/// Rewrite packs to retain only objects in `live`, dropping the rest. Used by
-/// GC's prune path to reclaim garbage that was already packed.
-///
-/// A pack with no dead entries is left as-is. A pack with some dead entries is
-/// rewritten to a fresh pack holding just the live ones; a pack with no live
-/// entries is removed outright. Returns `(objects_removed, bytes_removed)`.
+/// Drop packed objects not in `live` (GC's prune of already-packed garbage). A
+/// fully-live pack is left as-is; a partially-dead one is rewritten to keep only
+/// the live entries; a fully-dead one is removed. Returns `(removed, bytes)`.
 pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(usize, u64)> {
     let pack_dir = cas_root.join(PACK_DIR);
     let read_dir = match fs::read_dir(&pack_dir) {
@@ -340,10 +321,8 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
             removed_bytes += loc.len;
         }
 
-        let live_locs: Vec<(Hash, PackLoc)> = map
-            .into_iter()
-            .filter(|(h, _)| live.contains(h))
-            .collect();
+        let live_locs: Vec<(Hash, PackLoc)> =
+            map.into_iter().filter(|(h, _)| live.contains(h)).collect();
 
         if !live_locs.is_empty() {
             let mut ordered = live_locs;
@@ -368,8 +347,8 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
     Ok((removed_objects, removed_bytes))
 }
 
-/// Count packed objects (and their bytes) not in `live`, without modifying any
-/// pack. The non-mutating, dry-run counterpart to [`rewrite_packs_keeping`].
+/// Dry-run counterpart to [`rewrite_packs_keeping`]: count packed objects not in
+/// `live` without modifying any pack.
 pub fn packed_garbage(cas_root: &Path, live: &HashSet<Hash>) -> Result<(usize, u64)> {
     let packs = PackSet::load(cas_root)?;
     let mut count = 0usize;
@@ -425,15 +404,16 @@ pub fn list_packs(cas_root: &Path) -> Result<Vec<PackInfo>> {
     Ok(out)
 }
 
-/// Write `count` objects (yielded in hash-sorted order by `sources`) into a new
-/// pack + index under `pack_dir`. Each source is a thunk producing that
-/// object's verbatim bytes, so only one object is held in memory at a time.
+/// Write `count` hash-sorted objects into a new pack + index. Each source is a
+/// thunk, so only one object is held in memory at a time.
 fn write_pack<I, F>(pack_dir: &Path, count: usize, sources: I) -> Result<PackInfo>
 where
     I: IntoIterator<Item = (Hash, F)>,
     F: FnOnce() -> Result<Vec<u8>>,
 {
-    let count_u32: u32 = count.try_into().map_err(|_| anyhow!("too many objects to pack"))?;
+    let count_u32: u32 = count
+        .try_into()
+        .map_err(|_| anyhow!("too many objects to pack"))?;
 
     let pack_tmp = pack_dir.join(build_temp_name("pack")?);
     let mut w = BufWriter::new(

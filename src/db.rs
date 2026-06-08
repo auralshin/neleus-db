@@ -152,8 +152,7 @@ impl Database {
         let state_store = StateStore::new(object_store.clone(), blob_store.clone(), wal.clone());
         let manifest_store = ManifestStore::new(object_store.clone());
         let commit_store = CommitStore::new(object_store.clone());
-        let index_store =
-            SearchIndexStore::with_encryption(root.join("index"), encryption.clone());
+        let index_store = SearchIndexStore::with_encryption(root.join("index"), encryption.clone());
 
         blob_store.ensure_dir()?;
         object_store.ensure_dir()?;
@@ -377,14 +376,12 @@ impl Database {
             return Err(anyhow::anyhow!("new password cannot be empty"));
         }
 
-        let old_runtime = self
-            .encryption_runtime()
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "rotate_encryption_key needs the current runtime; \
+        let old_runtime = self.encryption_runtime().ok_or_else(|| {
+            anyhow::anyhow!(
+                "rotate_encryption_key needs the current runtime; \
                      set NELEUS_DB_ENCRYPTION_PASSWORD"
-                )
-            })?;
+            )
+        })?;
 
         let new_runtime = Arc::new(EncryptionRuntime::from_config(
             enc_config.clone(),
@@ -414,22 +411,15 @@ impl Database {
         Ok(count)
     }
 
-    /// Consolidate loose objects under `blobs/` and `objects/` into pack files,
-    /// removing the loose copies. Reclaims the per-file disk-block and inode
-    /// overhead of a store that has accumulated many tiny objects (chunks,
-    /// manifests, state segments).
+    /// Consolidate loose `blobs/` and `objects/` into pack files, removing the
+    /// loose copies. Crash-safe (pack fsynced before any delete) and held under
+    /// `meta/maintenance.lock` so repack and GC can't run at once.
     ///
-    /// Crash-safe: each pack is fsynced before any loose copy is deleted, so a
-    /// crash mid-run leaves both forms and loses nothing. Held under
-    /// `meta/repack.lock` so two repacks cannot race. Already-packed objects are
-    /// left untouched.
-    ///
-    /// **Visibility:** reads through *this* handle may have cached an older
-    /// (empty) pack index; reopen the `Database` after a repack to observe the
-    /// new packs, the same contract as [`Self::rotate_encryption_key`].
+    /// Reopen the `Database` afterwards to observe the new packs — this handle
+    /// may have cached an older index ([`Self::rotate_encryption_key`] contract).
     pub fn repack(&self) -> Result<RepackSummary> {
         let _lock = acquire_lock(
-            self.root.join("meta").join("repack.lock"),
+            self.root.join("meta").join("maintenance.lock"),
             Duration::from_secs(30),
         )?;
         let blobs = crate::packstore::pack_loose(&self.root.join("blobs"))?;
@@ -445,7 +435,6 @@ impl Database {
             .ok()
             .map(Arc::new)
     }
-
 }
 
 pub fn init(path: impl AsRef<Path>) -> Result<()> {
@@ -931,9 +920,7 @@ mod tests {
         // Reopen with the new password.
         drop(db);
         // SAFETY: serialized via `encryption_test_lock`.
-        unsafe {
-            std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "new-strong-password")
-        };
+        unsafe { std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "new-strong-password") };
         let db = Database::open(&db_root).unwrap();
         assert_eq!(db.blob_store.get(h).unwrap(), b"secret-payload");
     }
@@ -993,7 +980,10 @@ mod tests {
         let db2 = Database::open(&db_root).unwrap();
         assert_eq!(db2.blob_store.get(blob).unwrap(), b"packed-payload");
         let root = db2.resolve_state_root("main").unwrap();
-        assert_eq!(db2.state_store.get(root, b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            db2.state_store.get(root, b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
         assert_eq!(db2.commit_store.get_commit(commit).unwrap().author, "agent");
     }
 

@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use crate::blob_store::BlobStore;
 use crate::clock::now_unix;
 use crate::hash::Hash;
-use crate::merkle::{MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion};
+use crate::merkle::{
+    MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion,
+};
 use crate::object_store::ObjectStore;
 
 const MANIFEST_TAG: &[u8] = b"manifest:";
@@ -125,9 +127,8 @@ impl ManifestStore {
         self.get_manifest(hash)
     }
 
-    /// Canonical (decoded) manifest bytes — decrypted, decompressed, and
-    /// integrity-checked, but not yet deserialized into a concrete type. Used
-    /// by garbage collection to identify a manifest's exact type by round-trip.
+    /// Canonical manifest bytes (decrypted/decompressed, not yet deserialized).
+    /// GC uses these to identify a manifest's exact type by round-trip.
     pub fn raw_manifest_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
         self.objects.get_typed_bytes(MANIFEST_TAG, hash)
     }

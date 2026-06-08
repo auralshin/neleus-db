@@ -1,33 +1,18 @@
 //! Garbage collection: reclaim objects unreachable from any ref.
 //!
-//! Reachability is marked from two root sets — every commit under
-//! `refs/heads/*` and every staged state root under `refs/states/*` — and walks
-//! the whole DAG:
+//! Marks from `refs/heads/*` commits and `refs/states/*` roots, walking:
 //!
 //! ```text
 //! commit ── parents ──▶ commit
 //!   ├─ state_root ─▶ StateManifest ─▶ StateSegment ─▶ value blob
-//!   └─ manifests  ─▶ {Doc,Run,Chunk,Provenance}Manifest ─▶ blobs
-//!                       Provenance ─▶ run_manifest (recurse) + evidence blobs
+//!   └─ manifests  ─▶ {Doc,Run,Chunk,Provenance}Manifest ─▶ blobs / nested objects
 //! ```
 //!
-//! **Object and blob hashes share one reachable set.** The two hash-spaces are
-//! disjoint (different domain tags), so a hash protects whichever store
-//! actually holds it and nothing else — no object-vs-blob classification is
-//! needed, and over-marking is impossible to get wrong.
-//!
-//! **Fail-closed.** A reachable manifest is accepted as a concrete type only if
-//! that type *round-trips byte-for-byte* (`to_cbor(parse(bytes)) == bytes`), so
-//! a future or unknown manifest variant can never be silently misread as a
-//! known one and have its blobs dropped. If anything reachable cannot be read
-//! or classified, GC aborts and prunes nothing.
-//!
-//! **Grace period.** Loose objects modified within `grace` of the run start are
-//! skipped, so an object written-but-not-yet-referenced by a concurrent writer
-//! is not swept out from under it.
-//!
-//! Pruning is opt-in: with `prune == false` the walk runs and reports what
-//! *would* be removed without touching disk.
+//! Object and blob hashes share one reachable set — their hash-spaces are
+//! disjoint, so a hash protects only the store that holds it. Fail-closed: a
+//! manifest is classified only if its type round-trips byte-for-byte, else GC
+//! aborts. A grace period skips objects newer than the run start. Pruning is
+//! opt-in (`prune == false` reports without touching disk).
 
 use std::collections::HashSet;
 use std::fs;
@@ -58,12 +43,12 @@ pub struct GcStats {
     pub pruned: bool,
 }
 
-/// Mark from refs, then sweep unreachable objects from `blobs/` and `objects/`
-/// (both loose files and packs). Dry run unless `prune`. Held under
-/// `meta/gc.lock` so it cannot race another GC.
+/// Mark from refs, then sweep unreachable objects (loose and packed) from both
+/// stores. Dry run unless `prune`. Held under `meta/maintenance.lock` (shared
+/// with repack) so the two never run at once.
 pub fn gc(db: &Database, prune: bool, grace: Duration) -> Result<GcStats> {
     let _lock = acquire_lock(
-        db.root.join("meta").join("gc.lock"),
+        db.root.join("meta").join("maintenance.lock"),
         Duration::from_secs(30),
     )?;
     let start = SystemTime::now();
@@ -75,10 +60,10 @@ pub fn gc(db: &Database, prune: bool, grace: Duration) -> Result<GcStats> {
         pruned: prune,
         ..Default::default()
     };
-    // Both stores sweep against the same set; disjoint hash-spaces mean a blob
-    // hash never matches an object file and vice versa.
+    // Same set sweeps both stores (disjoint hash-spaces).
     for store in ["objects", "blobs"] {
-        let (n, bytes, skipped) = sweep_store(&db.root.join(store), &reachable, prune, start, grace)?;
+        let (n, bytes, skipped) =
+            sweep_store(&db.root.join(store), &reachable, prune, start, grace)?;
         stats.unreachable += n;
         stats.reclaimed_bytes += bytes;
         stats.skipped_recent += skipped;
@@ -86,14 +71,12 @@ pub fn gc(db: &Database, prune: bool, grace: Duration) -> Result<GcStats> {
     Ok(stats)
 }
 
-/// Walk the whole reachable DAG, returning every reachable hash. Returns an
-/// error (and so prunes nothing) if any reachable object cannot be read or, for
-/// a manifest, classified — the fail-closed guarantee.
+/// Walk the reachable DAG. Fails (pruning nothing) if any reachable object
+/// can't be read or, for a manifest, classified.
 fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
     let mut reach = HashSet::new();
 
-    // The empty state root is a structural constant (every fresh head resolves
-    // to it); keep it live so GC never churns it.
+    // Empty state root is a structural constant; keep it live.
     mark_state(db, db.state_store.empty_root()?, &mut reach)?;
 
     // Commits, transitively through parents.
@@ -123,8 +106,7 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
 
 fn mark_state(db: &Database, root: Hash, reach: &mut HashSet<Hash>) -> Result<()> {
     if reach.contains(&root) && db.object_store.exists(root) {
-        // Root already walked; its segments/values are in the set.
-        return Ok(());
+        return Ok(()); // already walked
     }
     let hashes = db
         .state_store
@@ -134,16 +116,16 @@ fn mark_state(db: &Database, root: Hash, reach: &mut HashSet<Hash>) -> Result<()
     Ok(())
 }
 
-/// Mark a manifest object and everything it references. Recurses into
-/// `ProvenanceManifest` back-links to `RunManifest`s.
+/// Mark a referenced hash and walk what it points at. A raw blob terminates
+/// (its `object_store.exists` is false); an object manifest is classified and
+/// its references walked recursively, so a nested object (e.g. a `ChunkManifest`
+/// carried in `RunManifest.retrieved_chunks`) gets its own children marked too.
 fn mark_manifest(db: &Database, hash: Hash, reach: &mut HashSet<Hash>) -> Result<()> {
     if !reach.insert(hash) {
         return Ok(());
     }
-    // A reference whose object does not exist is a dangling/placeholder link
-    // (e.g. a provenance record with a zero `run_manifest`, or a blob-store
-    // hash). Marking the hash already protects whatever it points at; there is
-    // no manifest object here to classify.
+    // Not an object: a raw blob (already marked) or a dangling link
+    // (e.g. a zero run_manifest). Nothing to walk.
     if !db.object_store.exists(hash) {
         return Ok(());
     }
@@ -155,22 +137,28 @@ fn mark_manifest(db: &Database, hash: Hash, reach: &mut HashSet<Hash>) -> Result
 
     let mut matched = false;
     if let Some(doc) = exact_type::<DocManifest>(&bytes) {
-        reach.extend(doc.referenced_blobs());
+        for h in doc.referenced_blobs() {
+            mark_manifest(db, h, reach)?;
+        }
         matched = true;
     }
     if let Some(run) = exact_type::<RunManifest>(&bytes) {
-        reach.extend(run.referenced_blobs());
+        for h in run.referenced_blobs() {
+            mark_manifest(db, h, reach)?;
+        }
         matched = true;
     }
     if let Some(chunk) = exact_type::<ChunkManifest>(&bytes) {
-        reach.extend(chunk.referenced_blobs());
+        for h in chunk.referenced_blobs() {
+            mark_manifest(db, h, reach)?;
+        }
         matched = true;
     }
     if let Some(prov) = exact_type::<ProvenanceManifest>(&bytes) {
         matched = true;
         for record in &prov.records {
             for evidence in &record.evidence {
-                reach.insert(evidence.source_blob);
+                mark_manifest(db, evidence.source_blob, reach)?;
             }
             mark_manifest(db, record.run_manifest, reach)?;
         }
@@ -185,9 +173,8 @@ fn mark_manifest(db: &Database, hash: Hash, reach: &mut HashSet<Hash>) -> Result
     Ok(())
 }
 
-/// Decode `bytes` as `T` only if `T` captures it exactly — i.e. re-serializing
-/// reproduces the canonical bytes. Guards against a future manifest variant
-/// being silently read as a known type that omits some of its referenced blobs.
+/// Decode `bytes` as `T` only if `T` round-trips to the same bytes — guards a
+/// future manifest variant from being read as a known type that drops blobs.
 fn exact_type<T>(bytes: &[u8]) -> Option<T>
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
@@ -197,9 +184,8 @@ where
     (reencoded == bytes).then_some(value)
 }
 
-/// Read every ref file under `dir` (recursively) and parse its hash. Temp and
-/// lock dotfiles are skipped; a non-dotfile that fails to parse is corruption
-/// and aborts.
+/// Parse every ref hash under `dir` (recursive). Dotfiles (temps/locks) are
+/// skipped; a non-dotfile that won't parse is corruption and aborts.
 fn collect_refs(dir: &Path) -> Result<Vec<Hash>> {
     let mut out = Vec::new();
     collect_refs_into(dir, &mut out)?;
@@ -272,7 +258,9 @@ fn sweep_store(
             match fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!("gc: removing {}", path.display())),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("gc: removing {}", path.display()));
+                }
             }
         }
     }
@@ -301,7 +289,7 @@ fn within_grace(modified: SystemTime, start: SystemTime, grace: Duration) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::ChunkingSpec;
+    use crate::manifest::{ChunkManifest, ChunkingSpec, MANIFEST_SCHEMA_VERSION, RunManifest};
     use tempfile::TempDir;
 
     const NO_GRACE: Duration = Duration::from_secs(0);
@@ -325,13 +313,18 @@ mod tests {
                 &db.blob_store,
                 "src".into(),
                 b"reachable-document-bytes",
-                ChunkingSpec { method: "fixed".into(), chunk_size: 8, overlap: 0 },
+                ChunkingSpec {
+                    method: "fixed".into(),
+                    chunk_size: 8,
+                    overlap: 0,
+                },
                 Some(0),
             )
             .unwrap();
         let reachable_chunk = db.manifest_store.get_doc_manifest(doc).unwrap().chunks[0];
         let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
-        db.create_commit_at_head("main", "agent", "m", vec![doc]).unwrap();
+        db.create_commit_at_head("main", "agent", "m", vec![doc])
+            .unwrap();
 
         // Unreachable: a loose blob nothing points at.
         let orphan = db.blob_store.put(b"orphan-bytes-xyz").unwrap();
@@ -345,7 +338,10 @@ mod tests {
         assert!(pruned.unreachable >= 1);
 
         assert!(!db.blob_store.exists(orphan), "orphan must be gone");
-        assert!(db.blob_store.exists(reachable_chunk), "reachable chunk kept");
+        assert!(
+            db.blob_store.exists(reachable_chunk),
+            "reachable chunk kept"
+        );
         assert_eq!(db.blob_store.get(reachable_chunk).unwrap().len(), 8);
     }
 
@@ -367,7 +363,8 @@ mod tests {
         let (root, db) = open_db(&tmp);
 
         let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
-        db.create_commit_at_head("main", "agent", "m", vec![]).unwrap();
+        db.create_commit_at_head("main", "agent", "m", vec![])
+            .unwrap();
         let orphan = db.blob_store.put(b"packed-orphan").unwrap();
 
         db.repack().unwrap();
@@ -383,7 +380,10 @@ mod tests {
         // The reachable commit + state are still readable.
         assert!(db.refs.head_get("main").unwrap().is_some());
         let sroot = db.resolve_state_root("main").unwrap();
-        assert_eq!(db.state_store.get(sroot, b"k").unwrap(), Some(b"v".to_vec()));
+        assert_eq!(
+            db.state_store.get(sroot, b"k").unwrap(),
+            Some(b"v".to_vec())
+        );
     }
 
     #[test]
@@ -402,10 +402,106 @@ mod tests {
         let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
         // Force the bogus hash into a commit's manifest list. create_commit
         // validates existence (it exists), so this is accepted.
-        db.create_commit_at_head("main", "agent", "m", vec![bogus]).unwrap();
+        db.create_commit_at_head("main", "agent", "m", vec![bogus])
+            .unwrap();
 
         let err = gc(&db, true, NO_GRACE).unwrap_err();
         assert!(err.to_string().contains("fail-closed"), "got: {err}");
+    }
+
+    #[test]
+    fn nested_chunk_manifest_in_retrieved_chunks_survives_prune() {
+        // A RunManifest may carry a ChunkManifest *object* hash in
+        // retrieved_chunks. GC must walk that nested object so its own
+        // chunk_text/embedding blobs are not pruned out from under it.
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+
+        let chunk_text = db.blob_store.put(b"retrieved-chunk-text-payload").unwrap();
+        let chunk_manifest = db
+            .manifest_store
+            .put_manifest(&ChunkManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                chunk_text,
+                start: 0,
+                end: 10,
+                embedding: None,
+            })
+            .unwrap();
+
+        let prompt = db.blob_store.put(b"the-prompt").unwrap();
+        let run = db
+            .manifest_store
+            .put_manifest(&RunManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                model: "m".into(),
+                prompt,
+                tool_calls: vec![],
+                inputs: vec![],
+                outputs: vec![],
+                started_at: 1,
+                ended_at: 2,
+                provider: None,
+                system_prompt: None,
+                model_parameters: None,
+                // The object hash, not a raw blob.
+                retrieved_chunks: vec![chunk_manifest],
+                sdk_version: None,
+                agent_id: None,
+            })
+            .unwrap();
+
+        let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
+        db.create_commit_at_head("main", "agent", "m", vec![run]).unwrap();
+
+        gc(&db, true, NO_GRACE).unwrap();
+
+        assert!(
+            db.object_store.exists(chunk_manifest),
+            "nested ChunkManifest object must survive"
+        );
+        // The discriminating assertion: fails unless GC walks the nested object.
+        assert!(
+            db.blob_store.exists(chunk_text),
+            "nested ChunkManifest's chunk_text blob must survive prune"
+        );
+    }
+
+    #[test]
+    fn blob_reachable_only_through_ancestor_commit_survives_prune() {
+        // Exercises parent traversal: a blob reachable only via an ancestor
+        // commit (not the tip) must survive prune.
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+
+        let doc = db
+            .manifest_store
+            .put_doc_manifest_from_bytes(
+                &db.blob_store,
+                "src".into(),
+                b"ancestor-only-document-body",
+                ChunkingSpec { method: "fixed".into(), chunk_size: 8, overlap: 0 },
+                Some(0),
+            )
+            .unwrap();
+        let b1 = db.manifest_store.get_doc_manifest(doc).unwrap().chunks[0];
+        let _ = db.state_set_at_head("main", b"k", b"v1").unwrap();
+        let c1 = db.create_commit_at_head("main", "agent", "c1", vec![doc]).unwrap();
+
+        // C2 on top of C1, carrying no manifests. B1 is reachable ONLY via C1.
+        let _ = db.state_set_at_head("main", b"k", b"v2").unwrap();
+        let c2 = db.create_commit_at_head("main", "agent", "c2", vec![]).unwrap();
+        assert_ne!(c1, c2);
+        assert_eq!(db.refs.head_get("main").unwrap(), Some(c2));
+
+        gc(&db, true, NO_GRACE).unwrap();
+
+        assert!(
+            db.blob_store.exists(b1),
+            "blob reachable only through an ancestor commit must survive prune"
+        );
+        assert!(db.object_store.exists(c1), "ancestor commit retained");
+        assert!(db.object_store.exists(doc), "ancestor commit's manifest retained");
     }
 
     #[test]
