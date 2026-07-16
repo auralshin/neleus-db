@@ -1,5 +1,5 @@
 # Rust
-/target/
+target/
 Cargo.lock
 **/*.rs.bk
 *.pdb
@@ -35,6 +35,9 @@ Cargo.lock
 ehthumbs.db
 Thumbs.db
 
+# Python
+__pycache__/
+
 # Environment
 .env
 .env.local
@@ -45,6 +48,8 @@ Thumbs.db
 *.db
 *.sqlite
 *.log
+*.nelaudit
+*.proof
 
 # Build outputs
 dist/
@@ -55,3 +60,4 @@ node_modules/
 
 
 .claude
+.gstack/

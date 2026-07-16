@@ -1,0 +1,24 @@
+[package]
+name = "neleus-client"
+version = "0.1.0"
+edition = "2024"
+description = "Rust HTTP client for neleus-db: verifiable agent memory, retrieval, proofs, and compliance."
+license = "LicenseRef-Neleus-Commercial"
+publish = false
+repository = "https://github.com/auralshin/neleus-db"
+
+# Standalone client: talks to `neleus-db serve` over HTTP. For the embedded,
+# in-process engine, depend on the `neleus-db` crate directly instead.
+#
+# Hand-rolled std-only HTTP (no tokio, no reqwest), consistent with the
+# server's "no in-process TLS" stance: speak http:// to a TLS-terminating
+# proxy or an SSH tunnel for untrusted networks.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Integration tests spin up an in-process `neleus-db serve` and drive the
+# client against it. Only pulled in for `cargo test`.
+[dev-dependencies]
+neleus-db = { path = "../.." }
+tempfile = "3"

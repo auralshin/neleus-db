@@ -9,10 +9,11 @@ use crate::merkle::{
 };
 use crate::object_store::ObjectStore;
 
-const MANIFEST_TAG: &[u8] = b"manifest:";
+pub const MANIFEST_TAG: &[u8] = b"manifest:";
 const MANIFEST_REF_LEAF_TAG: &[u8] = b"manifest_leaf:";
-// v2 adds provider-metadata and RAG audit fields to RunManifest.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
+// All schema bumps are additive: older records decode with field defaults and
+// their hashes are unchanged.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkingSpec {
@@ -28,6 +29,39 @@ pub struct ToolCallRef {
     pub output: Option<Hash>,
 }
 
+/// Filterable chunk metadata. All fields optional + skip-if-empty so
+/// metadata-less manifests stay minimal and hash-stable. Empty `acl` =
+/// public; non-empty requires an overlapping caller tag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Unix seconds; chunk is retrievable when `valid_from <= t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<u64>,
+    /// Unix seconds; chunk is retrievable when `t < valid_to`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<u64>,
+    /// Unix seconds; chunk is dropped from retrieval when `t >= expires_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acl: Vec<String>,
+    /// Data-subject (end-user) id for per-user retention and erasure scoping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+impl ChunkMetadata {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkManifest {
     pub schema_version: u32,
@@ -35,6 +69,8 @@ pub struct ChunkManifest {
     pub start: usize,
     pub end: usize,
     pub embedding: Option<Hash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ChunkMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,12 +81,62 @@ pub struct DocManifest {
     pub chunking: ChunkingSpec,
     pub chunks: Vec<Hash>,
     pub original: Hash,
+    /// Applies to every chunk of this document (v3+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ChunkMetadata>,
 }
 
-/// A single AI model invocation: all inputs, outputs, retrieved context, and provider metadata.
-///
-/// Fields added in schema v2 use `skip_serializing_if` so v1 on-disk records are unaffected.
-/// A v1 record decoded into this struct will have all new fields set to their defaults.
+/// Summary over chunks or child summaries (hierarchical retrieval).
+/// Indexed like a chunk; `children` links down to the evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryManifest {
+    pub schema_version: u32,
+    /// Content-addressed blob of the summary text.
+    pub summary_text: Hash,
+    pub embedding: Option<Hash>,
+    /// Chunk-text or child-summary-text blob hashes this summary covers.
+    pub children: Vec<Hash>,
+    /// 1 = summary of chunks, 2 = summary of summaries, ...
+    pub level: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<ChunkMetadata>,
+}
+
+/// Scored hit in a [`QueryManifest`]; score in micro-units keeps Eq + hash
+/// stability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryHit {
+    pub chunk: Hash,
+    pub score_micro: i64,
+}
+
+/// Retrieval audit record: principal, query, commit, returned chunks.
+/// Content-addressed, so the audit log is itself tamper-evident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryManifest {
+    pub schema_version: u32,
+    /// Commit root the query executed against.
+    pub commit: Hash,
+    /// `"semantic"`, `"vector"`, or `"hybrid"`.
+    pub mode: String,
+    /// Content-addressed blob of the query text, when textual.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_text: Option<Hash>,
+    /// Content-addressed blob of the query embedding, when vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_embedding: Option<Hash>,
+    pub top_k: u32,
+    /// Canonical JSON of the filter applied, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<String>,
+    /// Authenticated principal (API key id, agent id) that ran the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    pub executed_at: u64,
+    pub hits: Vec<QueryHit>,
+}
+
+/// A single AI model invocation: inputs, outputs, retrieved context, provider metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub schema_version: u32,
@@ -84,6 +170,24 @@ pub struct RunManifest {
     /// Logical agent name or version, e.g. `"policy-reviewer-v1"` (v2+).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// Trace id grouping every run/span of one logical task across agent
+    /// handoffs and model switches (v4+). Opaque, caller-supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Manifest hash of the parent run in the trace — a cryptographic span edge,
+    /// so the causal chain across handoffs and model switches is itself
+    /// verifiable (v4+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span: Option<Hash>,
+    /// `agent_id` that handed off to this run's agent — the explicit delegation
+    /// edge for an agent switch (v4+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_from: Option<String>,
+    /// Data-subject (end-user) id this run's content belongs to, for per-user
+    /// retention and erasure scoping (v4+). Opaque; the immutable linkage key
+    /// that survives content erasure, so it must not itself be PII.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +231,16 @@ impl ManifestStore {
         self.get_manifest(hash)
     }
 
+    /// Typed retrieval for [`SummaryManifest`].
+    pub fn get_summary_manifest(&self, hash: Hash) -> Result<SummaryManifest> {
+        self.get_manifest(hash)
+    }
+
+    /// Typed retrieval for [`QueryManifest`].
+    pub fn get_query_manifest(&self, hash: Hash) -> Result<QueryManifest> {
+        self.get_manifest(hash)
+    }
+
     /// Canonical manifest bytes (decrypted/decompressed, not yet deserialized).
     /// GC uses these to identify a manifest's exact type by round-trip.
     pub fn raw_manifest_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
@@ -154,13 +268,32 @@ impl ManifestStore {
         chunking: ChunkingSpec,
         created_at: Option<u64>,
     ) -> Result<Hash> {
+        self.put_doc_manifest_from_bytes_with_metadata(
+            blob_store,
+            source,
+            input_bytes,
+            chunking,
+            created_at,
+            None,
+        )
+    }
+
+    /// [`Self::put_doc_manifest_from_bytes`] with filterable [`ChunkMetadata`]
+    /// applied to every chunk of the document.
+    pub fn put_doc_manifest_from_bytes_with_metadata(
+        &self,
+        blob_store: &BlobStore,
+        source: String,
+        input_bytes: &[u8],
+        chunking: ChunkingSpec,
+        created_at: Option<u64>,
+        metadata: Option<ChunkMetadata>,
+    ) -> Result<Hash> {
         let original = blob_store.put(input_bytes)?;
         let chunks = chunk_fixed(input_bytes, chunking.chunk_size, chunking.overlap)?;
 
-        let mut chunk_hashes = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
-            chunk_hashes.push(blob_store.put(&chunk)?);
-        }
+        // Bulk path: parallel hash/encrypt, pack-first write.
+        let chunk_hashes = blob_store.put_many(chunks)?;
 
         let created_at = match created_at {
             Some(t) => t,
@@ -173,6 +306,7 @@ impl ManifestStore {
             chunking,
             chunks: chunk_hashes,
             original,
+            metadata: metadata.filter(|m| !m.is_empty()),
         };
         self.put_manifest(&doc)
     }
@@ -228,6 +362,31 @@ impl ManifestReferences for ChunkManifest {
         if let Some(h) = self.embedding {
             out.push(h);
         }
+        out
+    }
+}
+
+impl ManifestReferences for SummaryManifest {
+    fn referenced_blobs(&self) -> Vec<Hash> {
+        let mut out = vec![self.summary_text];
+        if let Some(h) = self.embedding {
+            out.push(h);
+        }
+        out.extend(self.children.iter().copied());
+        out
+    }
+}
+
+impl ManifestReferences for QueryManifest {
+    fn referenced_blobs(&self) -> Vec<Hash> {
+        let mut out = Vec::new();
+        if let Some(h) = self.query_text {
+            out.push(h);
+        }
+        if let Some(h) = self.query_embedding {
+            out.push(h);
+        }
+        out.extend(self.hits.iter().map(|h| h.chunk));
         out
     }
 }
@@ -356,6 +515,7 @@ mod tests {
             },
             chunks: vec![bs.put(b"chunk").unwrap()],
             original: bs.put(b"orig").unwrap(),
+            metadata: None,
         };
 
         let h = ms.put_manifest(&doc).unwrap();
@@ -379,6 +539,7 @@ mod tests {
             },
             chunks: vec![bs.put(b"chunk").unwrap()],
             original: bs.put(b"orig").unwrap(),
+            metadata: None,
         };
 
         let a = ms.put_manifest(&doc).unwrap();
@@ -410,6 +571,10 @@ mod tests {
             retrieved_chunks: vec![],
             sdk_version: Some("anthropic-python/0.40.0".into()),
             agent_id: Some("test-agent-v1".into()),
+            trace_id: Some("trace-abc".into()),
+            parent_span: None,
+            delegated_from: Some("planner-v1".into()),
+            subject: Some("user-42".into()),
         };
 
         let h = ms.put_manifest(&run).unwrap();
@@ -458,6 +623,7 @@ mod tests {
             },
             chunks: vec![c1, c2],
             original,
+            metadata: None,
         };
         let _h = ms.put_manifest(&doc).unwrap();
 
@@ -489,6 +655,10 @@ mod tests {
             retrieved_chunks: vec![],
             sdk_version: None,
             agent_id: None,
+            trace_id: None,
+            parent_span: None,
+            delegated_from: None,
+            subject: None,
         };
         let _h = ms.put_manifest(&run).unwrap();
 
@@ -516,6 +686,10 @@ mod tests {
             retrieved_chunks: vec![],
             sdk_version: None,
             agent_id: None,
+            trace_id: None,
+            parent_span: None,
+            delegated_from: None,
+            subject: None,
         };
         let missing = bs.put(b"missing").unwrap();
         assert!(prove_blob_inclusion(&run, missing).is_none());
@@ -545,6 +719,10 @@ mod tests {
             retrieved_chunks: vec![chunk],
             sdk_version: None,
             agent_id: None,
+            trace_id: None,
+            parent_span: None,
+            delegated_from: None,
+            subject: None,
         };
         let _h = ms.put_manifest(&run).unwrap();
 

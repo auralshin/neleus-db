@@ -1,0 +1,8 @@
+# PyO3 extension modules resolve CPython symbols at load time, so the cdylib
+# must allow undefined symbols at link time. maturin sets this automatically;
+# this makes a plain `cargo build` work too.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

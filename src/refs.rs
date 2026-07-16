@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow};
 
 use crate::atomic::write_atomic;
 use crate::hash::Hash;
-use crate::lock::acquire_lock;
+use crate::lock::flock_exclusive;
 use crate::wal::{Wal, WalOp};
 
 #[derive(Clone, Debug)]
@@ -26,6 +26,7 @@ impl RefsStore {
     pub fn ensure_dirs(&self) -> Result<()> {
         fs::create_dir_all(self.heads_dir())?;
         fs::create_dir_all(self.states_dir())?;
+        fs::create_dir_all(self.checkpoints_dir())?;
         Ok(())
     }
 
@@ -38,7 +39,7 @@ impl RefsStore {
         validate_ref_name(name)?;
         self.ensure_dirs()?;
 
-        let _lock = acquire_lock(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
         let entry = Wal::make_ref_entry(WalOp::RefHeadSet, name, hash);
         let wal_path = self.wal.begin_entry(&entry)?;
 
@@ -71,12 +72,11 @@ impl RefsStore {
         validate_ref_name(name)?;
         self.ensure_dirs()?;
 
-        let _lock = acquire_lock(self.root.join(".refs.lock"), Duration::from_secs(10))?;
-        let entry = Wal::make_ref_entry(WalOp::RefStateSet, name, hash);
-        let wal_path = self.wal.begin_entry(&entry)?;
-
+        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        // No WAL for staging refs: the write below is rename-atomic, and an
+        // interrupted UNacknowledged staging update is simply retried. Head
+        // and checkpoint refs keep WAL intent-replay (head_set).
         write_atomic(&self.state_path(name), format!("{hash}\n").as_bytes())?;
-        self.wal.end(&wal_path)?;
         Ok(())
     }
 
@@ -95,6 +95,35 @@ impl RefsStore {
         )
     }
 
+    /// Latest checkpoint object hash for a head (transparency-log spine).
+    pub fn checkpoint_get(&self, name: &str) -> Result<Option<Hash>> {
+        validate_ref_name(name)?;
+        read_hash(self.checkpoint_path(name))
+    }
+
+    pub fn checkpoint_set(&self, name: &str, hash: Hash) -> Result<()> {
+        validate_ref_name(name)?;
+        self.ensure_dirs()?;
+
+        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        let entry = Wal::make_ref_entry(WalOp::RefCheckpointSet, name, hash);
+        let wal_path = self.wal.begin_entry(&entry)?;
+
+        write_atomic(&self.checkpoint_path(name), format!("{hash}\n").as_bytes())?;
+        self.wal.end(&wal_path)?;
+        Ok(())
+    }
+
+    /// Every `(name, hash)` under `refs/heads/`, sorted by name.
+    pub fn list_heads(&self) -> Result<Vec<(String, Hash)>> {
+        list_refs(&self.heads_dir())
+    }
+
+    /// Every `(name, hash)` under `refs/checkpoints/`, sorted by name.
+    pub fn list_checkpoints(&self) -> Result<Vec<(String, Hash)>> {
+        list_refs(&self.checkpoints_dir())
+    }
+
     pub fn root(&self) -> &PathBuf {
         &self.root
     }
@@ -105,6 +134,14 @@ impl RefsStore {
 
     fn states_dir(&self) -> PathBuf {
         self.root.join("states")
+    }
+
+    fn checkpoints_dir(&self) -> PathBuf {
+        self.root.join("checkpoints")
+    }
+
+    fn checkpoint_path(&self, name: &str) -> PathBuf {
+        self.checkpoints_dir().join(name)
     }
 
     fn head_path(&self, name: &str) -> PathBuf {
@@ -126,16 +163,24 @@ impl RefsStore {
         validate_ref_name(name)?;
         self.ensure_dirs()?;
 
-        let _lock = acquire_lock(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
         let current = read_hash(path.clone())?;
         if current != expected {
             return Ok(false);
         }
 
-        let entry = Wal::make_ref_entry(wal_op, name, new_hash);
-        let wal_path = self.wal.begin_entry(&entry)?;
-        write_atomic(&path, format!("{new_hash}\n").as_bytes())?;
-        self.wal.end(&wal_path)?;
+        // WAL intent-replay only for refs whose loss would orphan an
+        // acknowledged commit. Staging refs (RefStateSet) are rename-atomic
+        // and retryable; skipping their WAL removes 3 metadata ops from the
+        // per-write hot path.
+        if matches!(wal_op, WalOp::RefHeadSet | WalOp::RefCheckpointSet) {
+            let entry = Wal::make_ref_entry(wal_op, name, new_hash);
+            let wal_path = self.wal.begin_entry(&entry)?;
+            write_atomic(&path, format!("{new_hash}\n").as_bytes())?;
+            self.wal.end(&wal_path)?;
+        } else {
+            write_atomic(&path, format!("{new_hash}\n").as_bytes())?;
+        }
         Ok(true)
     }
 }
@@ -148,6 +193,42 @@ pub fn head_set(store: &RefsStore, name: &str, hash: Hash) -> Result<()> {
     store.head_set(name, hash)
 }
 
+/// Recursively enumerate ref files under `dir` as `(name, hash)` pairs.
+/// Nested namespaces (`feature/foo`) come back with their full name.
+fn list_refs(dir: &PathBuf) -> Result<Vec<(String, Hash)>> {
+    fn walk(base: &PathBuf, dir: &PathBuf, out: &mut Vec<(String, Hash)>) -> Result<()> {
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out)?;
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(base) else {
+                continue;
+            };
+            let name = rel.to_string_lossy().to_string();
+            // Skip temp files and anything that fails validation.
+            if validate_ref_name(&name).is_err() {
+                continue;
+            }
+            if let Some(h) = read_hash(path.clone())? {
+                out.push((name, h));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
 fn read_hash(path: PathBuf) -> Result<Option<Hash>> {
     if !path.exists() {
         return Ok(None);
@@ -156,6 +237,15 @@ fn read_hash(path: PathBuf) -> Result<Option<Hash>> {
         .with_context(|| format!("failed reading ref file {}", path.display()))?;
     let h = raw.trim().parse::<Hash>()?;
     Ok(Some(h))
+}
+
+/// A tenant name is one ref path component: it prefixes head names as
+/// `<tenant>/<head>`, so it must be a valid single-segment ref name.
+pub fn validate_tenant(name: &str) -> Result<()> {
+    if name.contains('/') {
+        return Err(anyhow!("tenant name cannot contain '/': {name}"));
+    }
+    validate_ref_name(name)
 }
 
 /// Maximum number of `/`-separated components in a ref name. Caps directory
@@ -173,11 +263,6 @@ const MAX_REF_DEPTH: usize = 5;
 /// - at most `MAX_REF_DEPTH` `/`-separated components
 /// - no `..` substring (path traversal)
 /// - no trailing `.` and no `.lock` suffix (mirrors git)
-///
-/// Tightening from previous (laxer) behavior: names like `feature/foo`
-/// still pass, while names like `name//other`, `~weird`, or arbitrarily
-/// nested `a/b/c/d/e/f/g` are now rejected. Untrusted ref names cannot
-/// produce surprising directory hierarchies under `refs/`.
 pub(crate) fn validate_ref_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(anyhow!("reference name cannot be empty"));
@@ -187,6 +272,13 @@ pub(crate) fn validate_ref_name(name: &str) -> Result<()> {
     }
     if name.starts_with('-') {
         return Err(anyhow!("reference name cannot start with '-': {name}"));
+    }
+    // No component may begin with '.' (git convention) — also filters
+    // atomic-write temp files (`.{stem}.tmp-…`) from ref listings.
+    if name.split('/').any(|c| c.starts_with('.')) {
+        return Err(anyhow!(
+            "reference name component cannot start with '.': {name}"
+        ));
     }
     if name.contains("..") || name.contains("//") || name.contains('\0') {
         return Err(anyhow!("unsafe reference name: {name}"));
@@ -235,6 +327,23 @@ mod tests {
     }
 
     #[test]
+    fn list_heads_skips_atomic_temp_orphans() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let h = hash_blob(b"x");
+        s.head_set("main", h).unwrap();
+        // A crashed writer's orphan temp (partial bytes) sits next to the ref;
+        // listing must skip it, not choke parsing it as a hash.
+        let orphan = tmp
+            .path()
+            .join("refs")
+            .join("heads")
+            .join(".main.tmp-1-2-0");
+        std::fs::write(&orphan, b"deadbeef-partial").unwrap();
+        assert_eq!(s.list_heads().unwrap(), vec![("main".to_string(), h)]);
+    }
+
+    #[test]
     fn head_get_missing_returns_none() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
@@ -276,7 +385,10 @@ mod tests {
             "weird~char",
             "weird?char",
             "weird*char",
-            "a/b/c/d/e/f", // depth 6 > MAX_REF_DEPTH
+            "a/b/c/d/e/f",           // depth 6 > MAX_REF_DEPTH
+            ".main.tmp-1234-5678-0", // atomic-write temp at the root
+            "feature/.x.tmp-9-9-0",  // atomic-write temp in a namespace
+            ".hidden",               // leading-dot component
         ] {
             assert!(
                 super::validate_ref_name(bad).is_err(),

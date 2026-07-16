@@ -13,7 +13,6 @@ use crate::clock::now_unix;
 use crate::commit::CommitStore;
 use crate::encryption::{EncryptionConfig, EncryptionRuntime};
 use crate::hash::Hash;
-use crate::index::SearchIndexStore;
 use crate::lock::acquire_lock;
 use crate::manifest::ManifestStore;
 use crate::object_store::ObjectStore;
@@ -32,7 +31,6 @@ pub struct Database {
     pub manifest_store: ManifestStore,
     pub state_store: StateStore,
     pub commit_store: CommitStore,
-    pub index_store: SearchIndexStore,
     pub refs: RefsStore,
     pub wal: Wal,
     pub config: Config,
@@ -69,6 +67,16 @@ pub struct Config {
     pub compression: Option<String>,
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
+    /// "os" (default: crash-safe, fast) or "full" (fsync per write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<String>,
+    /// Minimum record age in seconds before session GC may remove it, even
+    /// when expired. Set to the audit retention window of your framework
+    /// (HIPAA: 6y, SEC 17a-4: 6y, EU AI Act high-risk: lifetime + 10y).
+    /// Canonical history (commits, manifests, audit records) is never
+    /// touched by session GC regardless of this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_min_secs: Option<u64>,
 }
 
 impl Database {
@@ -92,6 +100,8 @@ impl Database {
                 verify_on_read: false,
                 compression: None,
                 encryption: None,
+                durability: None,
+                retention_min_secs: None,
             };
             let bytes = serde_json::to_vec_pretty(&cfg)?;
             write_atomic(&cfg_path, &bytes)?;
@@ -133,6 +143,16 @@ impl Database {
             write_atomic(&cfg_path, &bytes)?;
         }
 
+        match config.durability.as_deref() {
+            None | Some("os") => crate::atomic::set_full_durability(false),
+            Some("full") => crate::atomic::set_full_durability(true),
+            Some(other) => {
+                return Err(anyhow::anyhow!(
+                    "unknown durability '{other}' (expected \"os\" or \"full\")"
+                ));
+            }
+        }
+
         let encryption = build_encryption_runtime(&config)?;
         let compress = config.compression.as_deref() == Some("zstd");
         let blob_store = BlobStore::with_runtime_options(
@@ -149,16 +169,14 @@ impl Database {
         );
         let wal = Wal::new(root.join("wal"));
         let refs = RefsStore::new(root.join("refs"), wal.clone());
-        let state_store = StateStore::new(object_store.clone(), blob_store.clone(), wal.clone());
+        let state_store = StateStore::new(object_store.clone(), blob_store.clone());
         let manifest_store = ManifestStore::new(object_store.clone());
         let commit_store = CommitStore::new(object_store.clone());
-        let index_store = SearchIndexStore::with_encryption(root.join("index"), encryption.clone());
 
         blob_store.ensure_dir()?;
         object_store.ensure_dir()?;
         wal.ensure_dir()?;
         refs.ensure_dirs()?;
-        index_store.ensure_dir()?;
 
         let _report: WalRecoveryReport = wal.recover_refs(refs.root())?;
 
@@ -170,6 +188,7 @@ impl Database {
         let _ = cleanup_orphan_temps(&root.join("objects"), true)?;
         let _ = cleanup_orphan_temps(&root.join("refs").join("heads"), true)?;
         let _ = cleanup_orphan_temps(&root.join("refs").join("states"), true)?;
+        let _ = cleanup_orphan_temps(&root.join("refs").join("checkpoints"), true)?;
         let _ = cleanup_orphan_temps(&root.join("meta"), false)?;
 
         Ok(Self {
@@ -179,7 +198,6 @@ impl Database {
             manifest_store,
             state_store,
             commit_store,
-            index_store,
             refs,
             wal,
             config,
@@ -216,6 +234,17 @@ impl Database {
     pub fn state_set_many_at_head(&self, head: &str, pairs: &[(&[u8], &[u8])]) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.set_many(base_root, pairs)
+        })
+    }
+
+    /// Mixed sets/deletes in one new state version (see [`StateStore::write_many`]).
+    pub fn state_write_many_at_head(
+        &self,
+        head: &str,
+        ops: &[(&[u8], Option<&[u8]>)],
+    ) -> Result<Hash> {
+        self.apply_state_update_with_cas(head, |base_root| {
+            self.state_store.write_many(base_root, ops)
         })
     }
 
@@ -290,20 +319,6 @@ impl Database {
             "concurrent update contention while creating commit for '{}'",
             head
         ))
-    }
-
-    pub fn ensure_index_ready(&self, commit: Hash) -> Result<()> {
-        if self.index_store.read_index(commit).is_ok() {
-            return Ok(());
-        }
-
-        let _ = self.index_store.build_for_head(
-            commit,
-            &self.commit_store,
-            &self.manifest_store,
-            &self.blob_store,
-        )?;
-        Ok(())
     }
 
     fn resolve_base_root_for_state_update(
@@ -427,7 +442,7 @@ impl Database {
         Ok(RepackSummary { blobs, objects })
     }
 
-    fn encryption_runtime(&self) -> Option<Arc<EncryptionRuntime>> {
+    pub fn encryption_runtime(&self) -> Option<Arc<EncryptionRuntime>> {
         // Re-derive from stored config + env var (same as Database::open).
         let enc = self.config.encryption.as_ref().filter(|e| e.enabled)?;
         let password = std::env::var("NELEUS_DB_ENCRYPTION_PASSWORD").ok()?;
@@ -836,6 +851,8 @@ mod tests {
                 algorithm: "aes-256-gcm".into(),
                 ..EncryptionConfig::default()
             }),
+            durability: None,
+            retention_min_secs: None,
         };
         write_atomic(
             &path.join("meta").join("config.json"),
@@ -849,6 +866,105 @@ mod tests {
         // Materialize the empty state root under encryption.
         let _ = db.state_store.empty_root().unwrap();
         db
+    }
+
+    /// GDPR crypto-shred path: with encryption on, erasing a subject deletes
+    /// the per-blob envelope (unrecoverable, no key) and purges the index. This
+    /// is the robust erasure guarantee documented on `BlobStore::shred`.
+    #[test]
+    fn encrypted_erasure_crypto_shreds_and_purges_index() {
+        use crate::engine::{Engine, SearchFilter};
+        use crate::erasure::{EraseOptions, covers, erase_subject};
+        use crate::manifest::{ChunkMetadata, ChunkingSpec};
+
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let engine = Engine::new(init_encrypted_db(&db_root, "erase-test-password"));
+
+        let spec = || ChunkingSpec {
+            method: "fixed".into(),
+            chunk_size: 64,
+            overlap: 0,
+        };
+        let meta = |s: &str| {
+            Some(ChunkMetadata {
+                subject: Some(s.into()),
+                ..Default::default()
+            })
+        };
+        let (adoc, _) = engine
+            .put_document(
+                "main",
+                "kb",
+                b"alice has a rare diabetes diagnosis",
+                spec(),
+                meta("alice"),
+                "agent",
+            )
+            .unwrap();
+        let (_, commit) = engine
+            .put_document(
+                "main",
+                "kb",
+                b"bob enjoys mountain hiking trips",
+                spec(),
+                meta("bob"),
+                "agent",
+            )
+            .unwrap();
+        let alice_chunk = engine
+            .db()
+            .manifest_store
+            .get_doc_manifest(adoc)
+            .unwrap()
+            .chunks[0];
+
+        // Indexed + retrievable before erasure.
+        assert!(
+            engine
+                .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+                .unwrap()
+                .iter()
+                .any(|h| h.chunk_hash == alice_chunk),
+            "alice indexed pre-erasure"
+        );
+
+        let rec = erase_subject(
+            &engine,
+            "alice",
+            EraseOptions {
+                reason: "request",
+                requested_by: None,
+                signer: None,
+            },
+        )
+        .unwrap();
+
+        // Crypto-shred, not physical overwrite, because encryption is on.
+        assert_eq!(rec.method, "crypto-shred");
+        assert!(rec.blobs.contains(&alice_chunk));
+        assert!(
+            !engine.db().blob_store.exists(alice_chunk),
+            "envelope deleted"
+        );
+        assert!(covers(&engine.db().root, alice_chunk).unwrap());
+
+        // Index purged for alice; bob still served.
+        let after = engine
+            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .unwrap();
+        assert!(
+            after.iter().all(|h| h.chunk_hash != alice_chunk),
+            "alice purged"
+        );
+        assert!(
+            !engine
+                .search_hybrid(commit, Some("hiking"), None, 5, &SearchFilter::default())
+                .unwrap()
+                .is_empty(),
+            "bob survives erasure"
+        );
     }
 
     /// Issue #3: search index file must not contain plaintext chunk text
@@ -878,6 +994,7 @@ mod tests {
             },
             chunks: vec![chunk_hash],
             original: original_hash,
+            metadata: None,
         };
         let manifest_hash = db.manifest_store.put_manifest(&doc).unwrap();
 
@@ -885,21 +1002,32 @@ mod tests {
         let commit = db
             .create_commit_at_head("main", "agent", "m", vec![manifest_hash])
             .unwrap();
-        db.ensure_index_ready(commit).unwrap();
+        let engine = crate::engine::Engine::new(db);
+        engine.ensure_indexed(commit).unwrap();
 
-        let path = db_root
-            .join("index")
-            .join(commit.to_string())
-            .join("search_index.cbor");
-        let raw = fs::read(&path).unwrap();
-        assert!(
-            !raw.windows(needle.len()).any(|w| w == needle),
-            "plaintext chunk text leaked into on-disk search index"
-        );
+        // Every on-disk index artifact (segments + head manifests) must be
+        // ciphertext: scan them all for the plaintext needle.
+        for dir in ["segments", "heads"] {
+            let dir_path = db_root.join("index").join(dir);
+            for entry in fs::read_dir(&dir_path).unwrap() {
+                let raw = fs::read(entry.unwrap().path()).unwrap();
+                assert!(
+                    !raw.windows(needle.len()).any(|w| w == needle),
+                    "plaintext chunk text leaked into index/{dir}"
+                );
+            }
+        }
 
-        // Reads through the store still succeed.
-        let parsed = db.index_store.read_index(commit).unwrap();
-        assert!(parsed.chunks.iter().any(|c| c.chunk_hash == chunk_hash));
+        // Reads through the engine still succeed.
+        let hits = engine
+            .search_semantic(
+                commit,
+                "SECRET NEEDLE",
+                5,
+                &crate::engine::SearchFilter::default(),
+            )
+            .unwrap();
+        assert!(hits.iter().any(|h| h.chunk_hash == chunk_hash));
     }
 
     /// Issue #3: rotation must read what it wrote — pre-rotation blobs are

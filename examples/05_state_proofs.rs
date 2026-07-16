@@ -19,10 +19,14 @@ fn main() -> Result<()> {
     println!("Membership proof verified: {}", verified);
     match proof.outcome {
         StateOutcome::Found(value_hash) => {
-            let value = db.blob_store.get(value_hash)?;
-            println!("Found value for key_b: {}", String::from_utf8_lossy(&value));
+            // `value_hash` is the proof's content commitment; fetch the bytes via
+            // the state store (values <512B live inline, not in BlobStore).
+            let value = db.state_store.get(r3, b"key_b")?.expect("key_b present");
+            println!(
+                "Found value for key_b ({value_hash}): {}",
+                String::from_utf8_lossy(&value)
+            );
         }
-        StateOutcome::Deleted => println!("key_b was deleted"),
         StateOutcome::Missing => println!("key_b is missing"),
     }
 
@@ -37,8 +41,8 @@ fn main() -> Result<()> {
     let deleted_verified = db.state_store.verify_proof(r4, b"key_b", &deleted_proof);
     println!("Deletion proof verified: {}", deleted_verified);
     match deleted_proof.outcome {
-        StateOutcome::Deleted => println!("Deletion correctly proven"),
-        _ => println!("Unexpected deletion proof outcome"),
+        StateOutcome::Missing => println!("Deletion correctly proven (key now absent)"),
+        StateOutcome::Found(_) => println!("Unexpected: key_b still present"),
     }
 
     Ok(())

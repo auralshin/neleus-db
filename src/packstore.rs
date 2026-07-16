@@ -406,7 +406,7 @@ pub fn list_packs(cas_root: &Path) -> Result<Vec<PackInfo>> {
 
 /// Write `count` hash-sorted objects into a new pack + index. Each source is a
 /// thunk, so only one object is held in memory at a time.
-fn write_pack<I, F>(pack_dir: &Path, count: usize, sources: I) -> Result<PackInfo>
+pub(crate) fn write_pack<I, F>(pack_dir: &Path, count: usize, sources: I) -> Result<PackInfo>
 where
     I: IntoIterator<Item = (Hash, F)>,
     F: FnOnce() -> Result<Vec<u8>>,

@@ -7,7 +7,7 @@ use crate::hash::{Hash, hash_typed};
 use crate::object_store::ObjectStore;
 use crate::state::StateRoot;
 
-const COMMIT_TAG: &[u8] = b"commit:";
+pub const COMMIT_TAG: &[u8] = b"commit:";
 const COMMIT_PAYLOAD_TAG: &[u8] = b"commit_payload:";
 const COMMIT_SCHEMA_VERSION: u32 = 1;
 
@@ -138,6 +138,13 @@ impl CommitStore {
         Ok(commit)
     }
 
+    /// Canonical commit bytes (decrypted/decompressed, not yet deserialized).
+    /// Proof bundles carry these so verifiers can re-derive the commit hash
+    /// offline.
+    pub fn raw_commit_bytes(&self, hash: CommitHash) -> Result<Vec<u8>> {
+        self.objects.get_typed_bytes(COMMIT_TAG, hash)
+    }
+
     pub fn verify_commit_with<V: CommitVerifier>(
         &self,
         hash: CommitHash,
@@ -193,7 +200,6 @@ mod tests {
     use crate::blob_store::BlobStore;
     use crate::object_store::ObjectStore;
     use crate::state::StateStore;
-    use crate::wal::Wal;
 
     fn stores(tmp: &TempDir) -> (CommitStore, StateStore, BlobStore) {
         let objects = ObjectStore::new(tmp.path().join("objects"));
@@ -203,7 +209,7 @@ mod tests {
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
 
-        let state = StateStore::new(objects, blobs.clone(), Wal::new(tmp.path().join("wal")));
+        let state = StateStore::new(objects, blobs.clone());
         (commit_store, state, blobs)
     }
 
@@ -456,7 +462,7 @@ mod tests {
         let state_objects = ObjectStore::new(tmp.path().join("objects"));
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        let state = StateStore::new(state_objects, blobs, Wal::new(tmp.path().join("wal")));
+        let state = StateStore::new(state_objects, blobs);
         let root = state.empty_root().unwrap();
 
         // Hand-craft a forged commit: body says "real" but payload_hash

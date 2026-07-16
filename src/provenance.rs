@@ -9,7 +9,6 @@ use crate::manifest::ManifestStore;
 
 const PROVENANCE_SCHEMA_VERSION: u32 = 1;
 
-/// The origin kind for a single piece of evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
@@ -22,8 +21,6 @@ pub enum SourceType {
     Custom(String),
 }
 
-/// A single piece of evidence supporting a claim: which blob it came from,
-/// its position in that blob, and any caller-supplied metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
     /// Content-addressed hash of the source blob (chunk, document, tool output, …).
@@ -38,7 +35,6 @@ pub struct Evidence {
     pub metadata: BTreeMap<String, String>,
 }
 
-/// An agent's assertion, backed by one or more pieces of evidence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceRecord {
     pub schema_version: u32,
@@ -60,14 +56,7 @@ pub struct ProvenanceRecord {
 }
 
 impl ProvenanceRecord {
-    /// Create a new record. Evidence must be added before the record is valid for storage.
-    ///
-    /// # Arguments
-    /// - `claim_id`: stable caller-chosen identifier
-    /// - `claim_text`: human-readable assertion
-    /// - `run_manifest`: hash of the `RunManifest` that produced this claim
-    /// - `agent_id`: logical agent name or version
-    /// - `confidence`: value in \[0.0, 1.0\]
+    /// Evidence must be added before the record validates for storage.
     pub fn new(
         claim_id: String,
         claim_text: String,
@@ -92,29 +81,23 @@ impl ProvenanceRecord {
         }
     }
 
-    /// Append a piece of evidence to this record.
     pub fn add_evidence(&mut self, evidence: Evidence) -> &mut Self {
         self.evidence.push(evidence);
         self
     }
 
-    /// Set the free-text reasoning explaining how the evidence supports the claim.
     pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
         self.reasoning = Some(reasoning.into());
         self
     }
 
-    /// Replace the tag list.
     pub fn with_tags(mut self, tags: Vec<String>) -> Self {
         self.tags = tags;
         self
     }
 
-    /// Check that the record is ready for storage.
-    ///
     /// # Errors
-    /// Returns an error if `claim_id` is empty, `confidence` is outside \[0.0, 1.0\],
-    /// or `evidence` is empty.
+    /// Empty `claim_id`, `confidence` outside \[0.0, 1.0\], or empty `evidence`.
     pub fn validate(&self) -> Result<()> {
         if self.claim_id.is_empty() {
             return Err(anyhow::anyhow!("claim_id cannot be empty"));
@@ -134,9 +117,6 @@ impl ProvenanceRecord {
     }
 }
 
-/// A batch of [`ProvenanceRecord`]s produced by one agent, stored as a manifest.
-///
-/// Store via [`ProvenanceStore::put`] and retrieve by the returned hash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProvenanceManifest {
     pub schema_version: u32,
@@ -146,7 +126,6 @@ pub struct ProvenanceManifest {
 }
 
 impl ProvenanceManifest {
-    /// Create an empty manifest for `agent_id`.
     pub fn new(agent_id: impl Into<String>) -> Self {
         let created_at = now_unix().unwrap_or(0);
         Self {
@@ -157,22 +136,18 @@ impl ProvenanceManifest {
         }
     }
 
-    /// Validate and append a record.
-    ///
     /// # Errors
-    /// Returns an error if `record.validate()` fails.
+    /// `record.validate()` failed.
     pub fn add_record(&mut self, record: ProvenanceRecord) -> Result<&mut Self> {
         record.validate()?;
         self.records.push(record);
         Ok(self)
     }
 
-    /// Look up the first record with the given `claim_id`.
     pub fn find_by_claim_id(&self, claim_id: &str) -> Option<&ProvenanceRecord> {
         self.records.iter().find(|r| r.claim_id == claim_id)
     }
 
-    /// Return all records carrying `tag`.
     pub fn find_by_tag(&self, tag: &str) -> Vec<&ProvenanceRecord> {
         self.records
             .iter()
@@ -180,14 +155,11 @@ impl ProvenanceManifest {
             .collect()
     }
 
-    /// Return the confidence of a claim, or `None` if not found.
     pub fn claim_confidence(&self, claim_id: &str) -> Option<f32> {
         self.find_by_claim_id(claim_id).map(|r| r.confidence)
     }
 }
 
-/// Thin wrapper that stores and retrieves [`ProvenanceManifest`]s via the shared
-/// [`ManifestStore`].
 #[derive(Clone, Debug)]
 pub struct ProvenanceStore {
     manifests: ManifestStore,
@@ -198,10 +170,8 @@ impl ProvenanceStore {
         Self { manifests }
     }
 
-    /// Validate and store a [`ProvenanceManifest`].
-    ///
     /// # Errors
-    /// Returns an error if any record fails validation or the object store write fails.
+    /// A record fails validation, or the object-store write fails.
     pub fn put(&self, manifest: &ProvenanceManifest) -> Result<Hash> {
         for record in &manifest.records {
             record.validate()?;
@@ -209,10 +179,6 @@ impl ProvenanceStore {
         self.manifests.put_manifest(manifest)
     }
 
-    /// Retrieve a [`ProvenanceManifest`] by hash.
-    ///
-    /// # Errors
-    /// Returns an error if the hash is not found or the bytes cannot be deserialized.
     pub fn get(&self, hash: Hash) -> Result<ProvenanceManifest> {
         self.manifests.get_manifest(hash)
     }
@@ -257,13 +223,8 @@ mod tests {
 
     #[test]
     fn record_rejects_empty_claim_id() {
-        let mut r = ProvenanceRecord::new(
-            "".into(),
-            "claim".into(),
-            Hash::zero(),
-            "agent".into(),
-            0.5,
-        );
+        let mut r =
+            ProvenanceRecord::new("".into(), "claim".into(), Hash::zero(), "agent".into(), 0.5);
         r.add_evidence(evidence(Hash::zero()));
         assert!(r.validate().is_err());
     }
@@ -319,13 +280,8 @@ mod tests {
     #[test]
     fn find_by_tag_works() {
         let mut manifest = ProvenanceManifest::new("a");
-        let mut r = ProvenanceRecord::new(
-            "c1".into(),
-            "claim".into(),
-            Hash::zero(),
-            "a".into(),
-            0.7,
-        );
+        let mut r =
+            ProvenanceRecord::new("c1".into(), "claim".into(), Hash::zero(), "a".into(), 0.7);
         r.add_evidence(evidence(Hash::zero()));
         r = r.with_tags(vec!["security".into(), "pii".into()]);
         manifest.add_record(r).unwrap();

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! commit ── parents ──▶ commit
-//!   ├─ state_root ─▶ StateManifest ─▶ StateSegment ─▶ value blob
+//!   ├─ state_root ─▶ StateManifest ─▶ StateNode tree ─▶ value blob
 //!   └─ manifests  ─▶ {Doc,Run,Chunk,Provenance}Manifest ─▶ blobs / nested objects
 //! ```
 //!
@@ -426,6 +426,7 @@ mod tests {
                 start: 0,
                 end: 10,
                 embedding: None,
+                metadata: None,
             })
             .unwrap();
 
@@ -448,11 +449,16 @@ mod tests {
                 retrieved_chunks: vec![chunk_manifest],
                 sdk_version: None,
                 agent_id: None,
+                trace_id: None,
+                parent_span: None,
+                delegated_from: None,
+                subject: None,
             })
             .unwrap();
 
         let _ = db.state_set_at_head("main", b"k", b"v").unwrap();
-        db.create_commit_at_head("main", "agent", "m", vec![run]).unwrap();
+        db.create_commit_at_head("main", "agent", "m", vec![run])
+            .unwrap();
 
         gc(&db, true, NO_GRACE).unwrap();
 
@@ -480,17 +486,25 @@ mod tests {
                 &db.blob_store,
                 "src".into(),
                 b"ancestor-only-document-body",
-                ChunkingSpec { method: "fixed".into(), chunk_size: 8, overlap: 0 },
+                ChunkingSpec {
+                    method: "fixed".into(),
+                    chunk_size: 8,
+                    overlap: 0,
+                },
                 Some(0),
             )
             .unwrap();
         let b1 = db.manifest_store.get_doc_manifest(doc).unwrap().chunks[0];
         let _ = db.state_set_at_head("main", b"k", b"v1").unwrap();
-        let c1 = db.create_commit_at_head("main", "agent", "c1", vec![doc]).unwrap();
+        let c1 = db
+            .create_commit_at_head("main", "agent", "c1", vec![doc])
+            .unwrap();
 
         // C2 on top of C1, carrying no manifests. B1 is reachable ONLY via C1.
         let _ = db.state_set_at_head("main", b"k", b"v2").unwrap();
-        let c2 = db.create_commit_at_head("main", "agent", "c2", vec![]).unwrap();
+        let c2 = db
+            .create_commit_at_head("main", "agent", "c2", vec![])
+            .unwrap();
         assert_ne!(c1, c2);
         assert_eq!(db.refs.head_get("main").unwrap(), Some(c2));
 
@@ -501,7 +515,10 @@ mod tests {
             "blob reachable only through an ancestor commit must survive prune"
         );
         assert!(db.object_store.exists(c1), "ancestor commit retained");
-        assert!(db.object_store.exists(doc), "ancestor commit's manifest retained");
+        assert!(
+            db.object_store.exists(doc),
+            "ancestor commit's manifest retained"
+        );
     }
 
     #[test]

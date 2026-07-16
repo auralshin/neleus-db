@@ -1,7 +1,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -9,27 +9,108 @@ use crate::atomic::{build_temp_name, maybe_sync_dir, maybe_sync_file};
 use crate::hash::Hash;
 use crate::packstore::PackSet;
 
+/// Below this many new objects, loose files beat pack overhead.
+const PACK_WRITE_THRESHOLD: usize = 1024;
+
 #[derive(Clone, Debug)]
 pub struct CasStore {
     root: PathBuf,
-    /// Pack index, lazily loaded and shared across clones. A repack is seen only
-    /// by stores built after it (reopen the `Database` to refresh).
-    packs: Arc<OnceLock<PackSet>>,
+    /// Pack index, lazily loaded and shared across clones. Refreshed after
+    /// this handle writes a pack (`put_many`); a repack by ANOTHER process is
+    /// seen only by stores built after it (reopen the `Database`).
+    packs: Arc<RwLock<Option<Arc<PackSet>>>>,
 }
 
 impl CasStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
-            packs: Arc::new(OnceLock::new()),
+            packs: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Pack index for this root, loaded on first use. A corrupt/incomplete pack
     /// degrades to an empty set; affected objects then read as "missing".
-    fn packs(&self) -> &PackSet {
-        self.packs
-            .get_or_init(|| PackSet::load(&self.root).unwrap_or_default())
+    fn packs(&self) -> Arc<PackSet> {
+        if let Some(p) = self.packs.read().expect("pack cache poisoned").as_ref() {
+            return Arc::clone(p);
+        }
+        let loaded = Arc::new(PackSet::load(&self.root).unwrap_or_default());
+        let mut slot = self.packs.write().expect("pack cache poisoned");
+        slot.get_or_insert_with(|| Arc::clone(&loaded));
+        slot.as_ref().map(Arc::clone).unwrap_or(loaded)
+    }
+
+    fn refresh_packs(&self) {
+        let loaded = Arc::new(PackSet::load(&self.root).unwrap_or_default());
+        *self.packs.write().expect("pack cache poisoned") = Some(loaded);
+    }
+
+    /// Remove specific objects for authorized erasure (GDPR). Loose files are
+    /// unlinked; packed objects are dropped by rewriting the packs without them.
+    /// Deliberately deletes *reachable* content — the opposite of GC — so the
+    /// caller must record a signed ErasureRecord.
+    ///
+    /// `physical` zero-overwrites a loose file before unlink, but this is
+    /// best-effort: on copy-on-write filesystems (APFS, Btrfs, ZFS) and on SSDs
+    /// (wear-leveling) the original blocks may persist until the FS/FTL reclaims
+    /// them. The robust guarantee is crypto-shredding — run with encryption on
+    /// so erasure drops the per-blob key, or place the DB on encrypted media.
+    pub fn shred_many(&self, hashes: &[Hash], physical: bool) -> Result<()> {
+        use std::collections::HashSet;
+        let targets: HashSet<Hash> = hashes.iter().copied().collect();
+        if targets.is_empty() {
+            return Ok(());
+        }
+        for h in &targets {
+            let path = self.path_for(*h);
+            if path.exists() {
+                if physical && let Ok(len) = fs::metadata(&path).map(|m| m.len()) {
+                    let _ = fs::write(&path, vec![0u8; len as usize]);
+                }
+                fs::remove_file(&path).with_context(|| format!("shredding loose object {h}"))?;
+            }
+        }
+        let packed: HashSet<Hash> = self.packs().hashes().into_iter().collect();
+        if packed.intersection(&targets).next().is_some() {
+            let live: HashSet<Hash> = packed.difference(&targets).copied().collect();
+            crate::packstore::rewrite_packs_keeping(&self.root, &live)?;
+            self.refresh_packs();
+        }
+        Ok(())
+    }
+
+    /// Bulk write: above [`PACK_WRITE_THRESHOLD`] new objects, append one
+    /// pack + index (two files, sequential IO) instead of one loose file per
+    /// object. The pack is visible to this handle immediately and to other
+    /// handles opened afterwards — the same contract as `db repack`.
+    pub fn put_many(&self, items: Vec<(Hash, Vec<u8>)>) -> Result<()> {
+        let packs = self.packs();
+        let mut fresh: Vec<(Hash, Vec<u8>)> = items
+            .into_iter()
+            .filter(|(h, _)| !packs.contains(*h) && !self.path_for(*h).exists())
+            .collect();
+        fresh.sort_by(|a, b| a.0.cmp(&b.0));
+        fresh.dedup_by(|a, b| a.0 == b.0);
+        if fresh.is_empty() {
+            return Ok(());
+        }
+        if fresh.len() < PACK_WRITE_THRESHOLD {
+            for (hash, bytes) in fresh {
+                self.put_existing_hash(hash, &bytes)?;
+            }
+            return Ok(());
+        }
+        let pack_dir = self.root.join(crate::packstore::PACK_DIR);
+        fs::create_dir_all(&pack_dir)?;
+        let count = fresh.len();
+        crate::packstore::write_pack(
+            &pack_dir,
+            count,
+            fresh.into_iter().map(|(h, bytes)| (h, move || Ok(bytes))),
+        )?;
+        self.refresh_packs();
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
