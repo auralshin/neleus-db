@@ -2,6 +2,7 @@
 // Works in Node 18+ (global fetch) and browsers. No runtime dependencies.
 
 export type SearchMode = "semantic" | "vector" | "hybrid";
+export type ComplianceStatus = "pass" | "warn" | "fail";
 
 export interface Filter {
   tenant?: string;
@@ -21,6 +22,40 @@ export interface SearchResult {
   commit: string;
   hits: Hit[];
   audit_manifest: string | null;
+}
+
+export interface Framework {
+  id: string;
+  name: string;
+  jurisdiction: string;
+  region: string;
+  citation: string;
+}
+
+export interface FrameworkStatus extends Framework {
+  overall: ComplianceStatus;
+  required_fails: number;
+}
+
+export interface CheckResult {
+  id: string;
+  label: string;
+  status: ComplianceStatus;
+  severity: "required" | "recommended";
+  detail: string;
+}
+
+export interface ComplianceReport {
+  framework: string;
+  name: string;
+  jurisdiction: string;
+  region: string;
+  citation: string;
+  head: string;
+  retrievals: number;
+  overall: ComplianceStatus;
+  checks: CheckResult[];
+  mappings: { requirement: string; mechanism: string }[];
 }
 
 export interface AuditRecord {
@@ -242,10 +277,30 @@ export class Client {
     return r.checkpoint;
   }
 
+  // ---- compliance ----
+
+  async frameworks(): Promise<Framework[]> {
+    return (await this.json<{ frameworks: Framework[] }>("GET", "/v1/compliance/frameworks")).frameworks;
+  }
+
+  async complianceStatus(head: string, from?: number, to?: number): Promise<FrameworkStatus[]> {
+    return (
+      await this.json<{ frameworks: FrameworkStatus[] }>("POST", "/v1/compliance/status", { head, ...range(from, to) })
+    ).frameworks;
+  }
+
+  complianceCheck(head: string, framework: string, from?: number, to?: number): Promise<ComplianceReport> {
+    return this.json("POST", "/v1/compliance/check", { head, framework, ...range(from, to) });
+  }
+
   // ---- audit ----
 
   async auditQueries(head: string, from?: number, to?: number): Promise<AuditRecord[]> {
     return (await this.json<{ records: AuditRecord[] }>("POST", "/v1/audit/queries", { head, ...range(from, to) })).records;
+  }
+
+  async auditReport(head: string, framework: string, from?: number, to?: number): Promise<string> {
+    return (await this.json<{ markdown: string }>("POST", "/v1/audit/report", { head, framework, ...range(from, to) })).markdown;
   }
 
   /** Download a self-contained `.nelaudit` bundle (tamper-evident, offline-verifiable). */

@@ -40,10 +40,11 @@ hits = db.search("main", "policy", mode="hybrid", top_k=5)
 proof = db.prove(commit, hits[0]["chunk"])       # bytes (CBOR bundle)
 assert db.verify_proof(proof)["valid"]
 
-# audit, fully in-process
+# audit + compliance, fully in-process
 qm = db.record_query("main", "policy", principal="agent:reviewer")
 db.commit("main", "audited retrieval", manifests=[qm])
 db.checkpoint("main")
+report = db.compliance_check("main", "eu-ai-act")   # { overall, retrievals, checks }
 db.audit_export("main", "q1.nelaudit")              # offline-verifiable bundle
 
 db.session_append("main", "s1", "hello", role="user", ttl_secs=3600)
@@ -55,7 +56,8 @@ argument — pass a commit hash for time-travel retrieval against history.
 ## Methods
 
 `Neleus(path)` then: `put_document`, `search`, `prove`, `verify_proof`,
-`commit`, `record_query`, `checkpoint`, `audit_export`, `session_append`.
+`commit`, `record_query`, `checkpoint`, `compliance_check`, `audit_export`,
+`session_append`.
 
 ## Test
 

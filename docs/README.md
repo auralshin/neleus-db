@@ -8,7 +8,9 @@ Start here, in roughly this order:
 | [concepts.md](concepts.md) | The mental model: content addressing, commits, the two planes, checkpoints, proofs. Read this before the design doc. |
 | [cli.md](cli.md) | Every `neleus-db` command and the `neleus-verify` binary, with flags. |
 | [http-api.md](http-api.md) | `neleus-db serve` endpoint reference: auth, CORS, tenancy, every route. |
+| [compliance.md](compliance.md) | Retrieval audit, signed export + offline verify, the per-jurisdiction law catalog, retention, the dashboard. |
 | [policy.md](policy.md) | Policy-as-code: monitor + enforce rules at write time, the tamper-evident event log, webhook alerting. |
+| [regulatory-mapping.md](regulatory-mapping.md) | Law → mechanism, article by article (EU AI Act, HIPAA, SEC/OCC, NIST AI RMF). |
 | [security.md](security.md) | Threat model and the control for each attacker. |
 
 Deeper references live at the repo root:

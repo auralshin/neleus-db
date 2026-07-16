@@ -23,6 +23,9 @@ const res = await c.search("main", { query: "reset policy", mode: "hybrid", audi
 const proof = await c.prove(res.commit, res.hits[0].chunk);
 const verdict = await c.verify(proof);          // { valid: true, anchor: "doc" }
 
+// per-jurisdiction compliance status
+const status = await c.complianceStatus("main"); // [{ id, name, region, overall }, …]
+
 // offline-verifiable audit bundle
 const bundle = await c.exportBundle("main");     // Uint8Array (.nelaudit)
 ```
@@ -52,7 +55,8 @@ await withRun(c, { provider: "anthropic", model: "claude-sonnet-4-6", agentId: "
 - `search(at, { query?, embedding?, mode?, topK?, filter?, audit? })`
 - `prove(commit, chunk, includeContent?)`, `verify(proofCbor)`
 - `stateGet/stateSet`, `sessionAppend/sessionList`, `checkpoint(head)`
-- `auditQueries`, `exportBundle`
+- `frameworks()`, `complianceStatus(head)`, `complianceCheck(head, framework)`
+- `auditQueries`, `auditReport`, `exportBundle`
 - `run(opts)` / `withRun(client, opts, fn)`
 
 `at` accepts a head name or a 64-hex commit hash (time-travel).

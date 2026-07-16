@@ -8,6 +8,7 @@ pub mod cas;
 pub mod checkpoint;
 pub mod clock;
 pub mod commit;
+pub mod compliance;
 pub mod compression;
 pub mod db;
 pub mod encryption;

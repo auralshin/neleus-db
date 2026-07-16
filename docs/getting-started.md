@@ -26,7 +26,7 @@ ndb db init ./agent_db
 
 This creates the on-disk layout (`blobs/ objects/ refs/ index/ wal/ meta/`)
 and writes `meta/config.json`. Encryption, durability, and retention are
-config knobs — see [security.md](security.md).
+config knobs — see [security.md](security.md) and [compliance.md](compliance.md).
 
 ## 2. Ingest a document
 
@@ -125,15 +125,18 @@ Non-loopback binds need `--allow-remote` and minted keys, with TLS terminated in
 front. See [http-api.md](http-api.md) for every route and
 [policy.md](policy.md) for monitoring and write-time enforcement.
 
-## 8. Audit evidence
+## 8. Compliance evidence
 
 Audit records accumulate as you serve `--audit` queries. Export a period as a
 signed bundle and let an auditor verify it without you:
 
 ```bash
+ndb compliance status --head main           # per-law: satisfied / in-review / gap
 ndb audit export --head main --out q1.nelaudit --sign-key agent.key
 neleus-verify q1.nelaudit --public-key <hex> --require-signature
 ```
+
+Full story in [compliance.md](compliance.md).
 
 ## From Rust
 

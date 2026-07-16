@@ -5,17 +5,19 @@ import { Trident, GitHubIcon } from "./components/icons";
 import { REPO } from "./links";
 import { Overview } from "./components/Overview";
 import { AuditLog } from "./components/AuditLog";
+import { Reports } from "./components/Reports";
 import { Inspector } from "./components/Inspector";
 import { Policies } from "./components/Policies";
 import { Monitor } from "./components/Monitor";
 import { Violations } from "./components/Violations";
 
-type View = "overview" | "audit" | "inspect" | "policies" | "monitor" | "violations";
+type View = "overview" | "audit" | "report" | "inspect" | "policies" | "monitor" | "violations";
 type ConnState = "off" | "on" | "err";
 
 const TABS: { id: View; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "audit", label: "Audit log" },
+  { id: "report", label: "Reports" },
   { id: "inspect", label: "Inspector" },
   { id: "policies", label: "Policies" },
   { id: "monitor", label: "Monitor" },
@@ -136,6 +138,7 @@ export default function App() {
           <div key={`${epoch}-${view}`}>
             {view === "overview" && <Overview conn={conn} onStatus={onStatus} />}
             {view === "audit" && <AuditLog conn={conn} onStatus={onStatus} />}
+            {view === "report" && <Reports conn={conn} onStatus={onStatus} />}
             {view === "inspect" && <Inspector conn={conn} onStatus={onStatus} />}
             {view === "policies" && <Policies conn={conn} onStatus={onStatus} />}
             {view === "monitor" && <Monitor conn={conn} onStatus={onStatus} />}

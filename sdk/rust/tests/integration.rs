@@ -93,7 +93,7 @@ fn health_and_ingest_search_prove_verify() {
 }
 
 #[test]
-fn audit_surfaces() {
+fn compliance_and_audit_surfaces() {
     let f = serve();
     let c = client(&f);
 
@@ -113,6 +113,24 @@ fn audit_surfaces() {
     let qm = res.audit_manifest.unwrap();
     c.commit("main", "audit", &[qm]).unwrap();
     c.checkpoint("main").unwrap();
+
+    // Catalog: 13 frameworks across multiple jurisdictions.
+    let frameworks = c.frameworks().unwrap();
+    assert!(frameworks.len() >= 12);
+    assert!(frameworks.iter().any(|fw| fw.id == "eu-ai-act"));
+
+    // Per-law status: chain intact + a recorded retrieval -> EU AI Act passes.
+    let status = c.compliance_status("main").unwrap();
+    let eu = status.iter().find(|s| s.id == "eu-ai-act").unwrap();
+    assert_eq!(eu.overall, "pass");
+
+    // Single-framework checklist.
+    let report = c.compliance_check("main", "hipaa").unwrap();
+    assert!(!report.checks.is_empty());
+
+    // Markdown report.
+    let md = c.audit_report("main", "eu-ai-act").unwrap();
+    assert!(md.contains("Requirement mapping"));
 
     // Export bundle verifies offline through the engine's verifier.
     let bundle = c.export_bundle("main", None, None).unwrap();

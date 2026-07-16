@@ -38,6 +38,40 @@ export interface ComplianceSummary {
   retention_min_secs: number | null;
 }
 
+export interface Framework {
+  id: string;
+  name: string;
+  jurisdiction: string;
+  region: string;
+  citation: string;
+}
+
+export interface FrameworkStatus extends Framework {
+  overall: Status;
+  required_fails: number;
+}
+
+export interface CheckResult {
+  id: string;
+  label: string;
+  status: Status;
+  severity: "required" | "recommended";
+  detail: string;
+}
+
+export interface ComplianceReport {
+  framework: string;
+  jurisdiction: string;
+  region: string;
+  name: string;
+  citation: string;
+  head: string;
+  retrievals: number;
+  overall: Status;
+  checks: CheckResult[];
+  mappings: { requirement: string; mechanism: string }[];
+}
+
 export interface AuditRecord {
   commit: string;
   manifest: string;
@@ -203,6 +237,29 @@ export class Conn {
   }
   summary() {
     return this.json<ComplianceSummary>("GET", "/v1/compliance/summary");
+  }
+  frameworks() {
+    return this.json<{ frameworks: Framework[] }>("GET", "/v1/compliance/frameworks");
+  }
+  status(head: string, from?: number, to?: number) {
+    return this.json<{ frameworks: FrameworkStatus[] }>("POST", "/v1/compliance/status", {
+      head,
+      ...range(from, to),
+    });
+  }
+  check(head: string, framework: string, from?: number, to?: number) {
+    return this.json<ComplianceReport>("POST", "/v1/compliance/check", {
+      head,
+      framework,
+      ...range(from, to),
+    });
+  }
+  reportMarkdown(head: string, framework: string, from?: number, to?: number) {
+    return this.json<{ markdown: string }>("POST", "/v1/audit/report", {
+      head,
+      framework,
+      ...range(from, to),
+    });
   }
   auditQueries(head: string, from?: number, to?: number) {
     return this.json<{ records: AuditRecord[] }>("POST", "/v1/audit/queries", {

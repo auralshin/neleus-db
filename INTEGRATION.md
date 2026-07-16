@@ -28,7 +28,8 @@ Ingest → Retrieve → Run → Commit → Prove
 | **Prove** | a self-contained proof bundle | the artifact a regulator or auditor receives |
 
 The rest of this guide shows how to execute those steps in each language.
-Read [docs/concepts.md](docs/concepts.md) for the model underneath.
+Read [docs/concepts.md](docs/concepts.md) for the model underneath and
+[docs/compliance.md](docs/compliance.md) for the audit/proof story in depth.
 
 ## Requirements
 
@@ -366,7 +367,7 @@ This maps the hard cases onto primitives you already have:
 - **Context switch** — context is `head@commit`: a run's `retrieved_chunks` and
   the queried commit record exactly what was in scope for that step.
 
-## Audit and proofs
+## Compliance and proofs
 
 This is the differentiator, so it gets its own path. After any committed
 retrieval:
@@ -381,8 +382,17 @@ db.audit_export("main", "2026-q1.nelaudit")          # native binding
 # or:  neleus-db audit export --head main --out 2026-q1.nelaudit --sign-key agent.key
 ```
 
-The bundle is self-contained: the verifier re-derives every claim from the
-carried bytes, independently, with no neleus install.
+What the bundle contains and what the verifier proves — independently, with
+no neleus install — is in [docs/compliance.md](docs/compliance.md). Per-law
+status across 13 jurisdictions:
+
+```python
+report = db.compliance_check("main", "eu-ai-act")    # {overall, retrievals, checks}
+```
+
+```
+neleus-db compliance status --head main      # satisfied / in-review / gap, per law
+```
 
 ## Production and operations
 
@@ -406,8 +416,8 @@ carried bytes, independently, with no neleus install.
   time). Embedded readers run concurrently against immutable snapshots.
 - **Durability:** `os` (default, crash-safe) or `full` (fsync per write) in
   `meta/config.json`. See [docs/security.md](docs/security.md).
-- **Console + policy enforcement:** `serve` ships a console at `/`
-  (audit log, proof inspector, policy views). Declare
+- **Console + policy enforcement:** `serve` ships a compliance console at `/`
+  (live framework status, audit log, proof inspector, policy views). Declare
   write-time policies as code and the server refuses violating writes (HTTP 403,
   `code: policy_violation`); violations append to a tamper-evident log, stream to
   the console, and can fire a webhook. See [docs/policy.md](docs/policy.md).

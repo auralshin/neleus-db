@@ -82,12 +82,19 @@ maybe("ingest, search, prove, verify", async () => {
   assert.equal(verdict.anchor, "doc");
 });
 
-maybe("audit export bundle", async () => {
+maybe("compliance status and export bundle", async () => {
   const c = new Client(url, { token });
   await c.putDocument("comp", "kb", "auditable corpus");
   const res = await c.search("comp", { query: "auditable", mode: "semantic", audit: true });
   await c.commit("comp", "audit", [res.audit_manifest!]);
   await c.checkpoint("comp");
+
+  const frameworks = await c.frameworks();
+  assert.ok(frameworks.length >= 12);
+
+  const status = await c.complianceStatus("comp");
+  const eu = status.find((s) => s.id === "eu-ai-act")!;
+  assert.equal(eu.overall, "pass");
 
   const bundle = await c.exportBundle("comp");
   assert.ok(bundle.byteLength > 0);

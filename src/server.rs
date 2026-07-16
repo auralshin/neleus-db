@@ -1260,6 +1260,65 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             ))
         }
 
+        ("GET", "/v1/compliance/frameworks") => {
+            require(req, Role::Reader)?;
+            let fws: Vec<Value> = crate::compliance::frameworks()
+                .into_iter()
+                .map(|f| {
+                    json!({
+                        "id": f.id,
+                        "jurisdiction": f.jurisdiction,
+                        "region": f.region,
+                        "name": f.name,
+                        "citation": f.citation,
+                    })
+                })
+                .collect();
+            Ok(Response::Json(200, json!({"frameworks": fws})))
+        }
+
+        // Per-framework status across the whole catalog: powers the
+        // "Regulatory framework status" panel (per-country / per-law checks).
+        ("POST", "/v1/compliance/status") => {
+            require(req, Role::Reader)?;
+            let v = parse_json(&req.body)?;
+            let head = scope_head(req, str_field(&v, "head")?)?;
+            let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
+            let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
+            let mut out = Vec::new();
+            for fw in crate::compliance::frameworks() {
+                let r = crate::compliance::check(db, head, fw.id, from, to)?;
+                out.push(json!({
+                    "id": fw.id,
+                    "name": fw.name,
+                    "jurisdiction": fw.jurisdiction,
+                    "region": fw.region,
+                    "citation": fw.citation,
+                    "overall": r.overall,
+                    "required_fails": r.checks.iter()
+                        .filter(|c| matches!(c.severity, crate::compliance::Severity::Required)
+                            && matches!(c.status, crate::compliance::Status::Fail))
+                        .count(),
+                }));
+            }
+            Ok(Response::Json(
+                200,
+                json!({"head": head, "frameworks": out}),
+            ))
+        }
+
+        // Full check list for one framework: powers the report view checklist.
+        ("POST", "/v1/compliance/check") => {
+            require(req, Role::Reader)?;
+            let v = parse_json(&req.body)?;
+            let head = scope_head(req, str_field(&v, "head")?)?;
+            let framework = str_field(&v, "framework")?;
+            let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
+            let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
+            let report = crate::compliance::check(db, head, framework, from, to)?;
+            Ok(Response::Json(200, serde_json::to_value(report)?))
+        }
+
         ("POST", "/v1/audit/queries") => {
             require(req, Role::Reader)?;
             let v = parse_json(&req.body)?;
@@ -1283,6 +1342,20 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // offline-verifiable). Origin signing is a CLI/KMS operation.
             let (bytes, _) = crate::audit::export_bytes(db, head, from, to, None)?;
             Ok(Response::Bytes("application/octet-stream", bytes))
+        }
+
+        ("POST", "/v1/audit/report") => {
+            require(req, Role::Reader)?;
+            let v = parse_json(&req.body)?;
+            let head = scope_head(req, str_field(&v, "head")?)?;
+            let framework = str_field(&v, "framework")?;
+            let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
+            let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
+            let markdown = crate::audit::report(db, head, framework, from, to)?;
+            Ok(Response::Json(
+                200,
+                json!({"framework": framework, "markdown": markdown}),
+            ))
         }
 
         // ---- policy-as-code ----
@@ -1626,6 +1699,20 @@ mod tests {
             serde_json::json!({"head": "main"}),
         );
         assert!(!queries["records"].as_array().unwrap().is_empty());
+
+        // Report renders for a framework.
+        let report = post_json(
+            &url,
+            "/v1/audit/report",
+            token,
+            serde_json::json!({"head": "main", "framework": "hipaa"}),
+        );
+        assert!(
+            report["markdown"]
+                .as_str()
+                .unwrap()
+                .contains("Requirement mapping")
+        );
 
         // Export returns a bundle that the offline verifier accepts.
         let bundle = http_request(

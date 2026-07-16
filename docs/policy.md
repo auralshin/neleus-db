@@ -1,9 +1,9 @@
 # Policy enforcement
 
-The audit log tells you whether the data *was* handled correctly. Policy turns
-that from an observation into a control: declarative rules that **monitor**
-live state and **enforce** them at write time — neleus refuses the write that
-would create a violation.
+Compliance reports (see [compliance.md](compliance.md)) tell you whether the
+data *was* handled correctly. Policy turns that from an observation into a
+control: declarative rules that **monitor** live state and **enforce** them at
+write time — neleus refuses the write that would create a violation.
 
 Policies live in `meta/policy.json` and are edited as code (CLI `policy set`,
 HTTP `POST /v1/policy`, or the **Policies** view in the console). Violations are

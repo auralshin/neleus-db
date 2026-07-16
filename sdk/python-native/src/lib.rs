@@ -222,6 +222,33 @@ impl Neleus {
         Ok(h.to_string())
     }
 
+    /// Run a framework's compliance checks. Returns `{overall, retrievals, checks}`.
+    fn compliance_check<'py>(
+        &self,
+        py: Python<'py>,
+        head: &str,
+        framework: &str,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let engine = self.engine.lock().map_err(err)?;
+        let r = neleus_db::compliance::check(engine.db(), head, framework, 0, u64::MAX).map_err(err)?;
+        let d = PyDict::new_bound(py);
+        d.set_item("framework", r.framework)?;
+        d.set_item("name", r.name)?;
+        d.set_item("overall", format!("{:?}", r.overall).to_lowercase())?;
+        d.set_item("retrievals", r.retrievals)?;
+        let checks = PyList::empty_bound(py);
+        for c in &r.checks {
+            let cd = PyDict::new_bound(py);
+            cd.set_item("id", c.id)?;
+            cd.set_item("label", c.label)?;
+            cd.set_item("status", format!("{:?}", c.status).to_lowercase())?;
+            cd.set_item("detail", c.detail.clone())?;
+            checks.append(cd)?;
+        }
+        d.set_item("checks", checks)?;
+        Ok(d)
+    }
+
     /// Export a self-contained, offline-verifiable audit bundle to `out`.
     fn audit_export(&self, head: &str, out: &str) -> PyResult<usize> {
         let engine = self.engine.lock().map_err(err)?;

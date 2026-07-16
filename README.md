@@ -6,11 +6,11 @@
 
 Fast hybrid retrieval, git-like versioned state, and session memory — where
 every answer carries a cryptographic receipt. Sub-millisecond warm queries;
-any hit upgrades to an offline-verifiable Merkle proof. Ships with an audit
-surface: signed audit export and a standalone verifier (`neleus-verify`) an
-auditor runs without Neleus.
+any hit upgrades to an offline-verifiable Merkle proof. Ships with a
+compliance surface: per-jurisdiction AI-law checks, signed audit export, and
+a standalone verifier (`neleus-verify`) an auditor runs without Neleus.
 
-[Get started](docs/getting-started.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [Benchmarks](BENCHMARKS.md) · [Design](DESIGN.md) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug)
+[Get started](docs/getting-started.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [Compliance](docs/compliance.md) · [Benchmarks](BENCHMARKS.md) · [Design](DESIGN.md) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug)
 
 </div>
 
@@ -132,8 +132,8 @@ ndb serve --open                                 # boots engine + console at htt
 ```
 
 On loopback it mints a one-time bootstrap admin token so localhost just works.
-The console is the policy surface: the audit log, proof inspector, and the
-**policy** views.
+The console is the compliance/policy surface: live framework status, the audit
+log, proof inspector, and the **policy** views.
 
 Neleus is a policy *enforcer*, not just a store of compliance reports. Declare
 rules as code and the server refuses the write that would violate them:
@@ -170,7 +170,7 @@ remote.
 
 The Rust crate itself (`neleus_db::Engine`) is the embedded path for Rust.
 Every SDK covers the same surface — ingest, hybrid search, proofs, sessions,
-audit export, and run-capture:
+compliance, audit export, and run-capture:
 
 ```python
 # native, in-process
@@ -234,14 +234,25 @@ cargo bench --bench scale         # 100k chunks, 1536d vectors, coalesced writes
 
 See [BENCHMARKS.md](BENCHMARKS.md) for measured results and market context.
 
-## Audit
+## Compliance
 
-Every audited retrieval becomes a signed, offline-verifiable record:
+Per-jurisdiction AI/data law checks run against live audit data — 13
+frameworks across 10 jurisdictions (EU AI Act, GDPR, HIPAA, SEC/OCC, Colorado
+AI Act, CCPA, UK DPA, Canada AIDA, China GenAI, Singapore MGF, Brazil LGPD,
+ISO 42001, NIST AI RMF):
 
 ```bash
+ndb compliance frameworks                          # the catalog, by jurisdiction
+ndb compliance status --head main                  # per-law: satisfied / in-review / gap
+ndb compliance check --head main --framework eu-ai-act
 ndb audit export --head main --out q1.nelaudit --sign-key agent.key
 neleus-verify q1.nelaudit --public-key <hex>       # offline, no Neleus needed
 ```
+
+The web console (bundled into `serve`, source in [console/](console)) is the
+compliance-officer surface. See
+[docs/regulatory-mapping.md](docs/regulatory-mapping.md) for the
+article-by-article mechanism mapping.
 
 ## Docs
 
@@ -250,6 +261,8 @@ neleus-verify q1.nelaudit --public-key <hex>       # offline, no Neleus needed
 - [docs/concepts.md](docs/concepts.md) — content addressing, commits, checkpoints, proofs, the two planes
 - [docs/cli.md](docs/cli.md) — every command, with flags
 - [docs/http-api.md](docs/http-api.md) — server endpoint reference, auth, CORS, tenancy
+- [docs/compliance.md](docs/compliance.md) — audit records, signed export, the law catalog, the dashboard
+- [docs/regulatory-mapping.md](docs/regulatory-mapping.md) — law → mechanism, article by article
 - [docs/security.md](docs/security.md) — threat model and controls
 - [DESIGN.md](DESIGN.md) — Merkle model, storage planes, recovery
 - [BENCHMARKS.md](BENCHMARKS.md) — measured numbers and the verifiability gap

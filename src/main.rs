@@ -131,10 +131,42 @@ enum Commands {
         #[command(subcommand)]
         command: SessionCommands,
     },
-    /// Retrieval audit: list, export, and verify.
+    /// Retrieval audit: list, export, verify, and report.
     Audit {
         #[command(subcommand)]
         command: AuditCommands,
+    },
+    /// Per-jurisdiction AI/data law checks against live audit data.
+    Compliance {
+        #[command(subcommand)]
+        command: ComplianceCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ComplianceCommands {
+    /// List the framework catalog, grouped by jurisdiction.
+    Frameworks,
+    /// Per-law overall status (satisfied / in review / gap) for a head.
+    Status {
+        #[arg(long)]
+        head: String,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = u64::MAX)]
+        to: u64,
+    },
+    /// Full check list for one framework against a head.
+    Check {
+        #[arg(long)]
+        head: String,
+        /// Framework id (see `compliance frameworks`).
+        #[arg(long)]
+        framework: String,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = u64::MAX)]
+        to: u64,
     },
 }
 
@@ -172,6 +204,21 @@ enum AuditCommands {
         public_key: Option<String>,
         #[arg(long)]
         require_signature: bool,
+    },
+    /// Generate a markdown compliance report from live audit data.
+    Report {
+        #[arg(long)]
+        head: String,
+        /// eu-ai-act | hipaa | sec-occ
+        #[arg(long)]
+        framework: String,
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        #[arg(long, default_value_t = u64::MAX)]
+        to: u64,
+        /// Write to a file instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
     },
 }
 
@@ -1849,6 +1896,118 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                AuditCommands::Report {
+                    head,
+                    framework,
+                    from,
+                    to,
+                    out,
+                } => {
+                    let md = neleus_db::audit::report(&db, &head, &framework, from, to)?;
+                    match out {
+                        Some(path) => {
+                            fs::write(&path, &md)?;
+                            emit(
+                                json_output,
+                                serde_json::json!({"report": path, "framework": framework}),
+                                &format!("wrote {}", path.display()),
+                            )?;
+                        }
+                        None => println!("{md}"),
+                    }
+                }
+            }
+        }
+        Commands::Compliance { command } => {
+            let db = Database::open(&db_path)?;
+            match command {
+                ComplianceCommands::Frameworks => {
+                    let fws = neleus_db::compliance::frameworks();
+                    if json_output {
+                        let rows: Vec<_> = fws
+                            .iter()
+                            .map(|f| {
+                                serde_json::json!({
+                                    "id": f.id,
+                                    "jurisdiction": f.jurisdiction,
+                                    "region": f.region,
+                                    "name": f.name,
+                                    "citation": f.citation,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&rows)?);
+                    } else {
+                        let mut jurisdiction = "";
+                        for f in &fws {
+                            if f.jurisdiction != jurisdiction {
+                                jurisdiction = f.jurisdiction;
+                                println!("\n{jurisdiction}");
+                            }
+                            println!("  {:<14} {}  ({})", f.id, f.name, f.citation);
+                        }
+                    }
+                }
+                ComplianceCommands::Status { head, from, to } => {
+                    let mut rows = Vec::new();
+                    for f in neleus_db::compliance::frameworks() {
+                        let r = neleus_db::compliance::check(&db, &head, f.id, from, to)?;
+                        rows.push((f, r.overall));
+                    }
+                    if json_output {
+                        let json: Vec<_> = rows
+                            .iter()
+                            .map(|(f, status)| {
+                                serde_json::json!({
+                                    "id": f.id,
+                                    "name": f.name,
+                                    "jurisdiction": f.jurisdiction,
+                                    "region": f.region,
+                                    "overall": status,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&json)?);
+                    } else {
+                        for (f, status) in &rows {
+                            println!(
+                                "{:<8} {:<10} {}",
+                                compliance_word(*status),
+                                f.region,
+                                f.name
+                            );
+                        }
+                    }
+                }
+                ComplianceCommands::Check {
+                    head,
+                    framework,
+                    from,
+                    to,
+                } => {
+                    let r = neleus_db::compliance::check(&db, &head, &framework, from, to)?;
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&r)?);
+                    } else {
+                        println!(
+                            "{} — {} ({})\noverall: {}   retrievals: {}\n",
+                            r.name,
+                            r.jurisdiction,
+                            r.citation,
+                            compliance_word(r.overall),
+                            r.retrievals
+                        );
+                        for c in &r.checks {
+                            println!(
+                                "  [{}] {:<11} {}\n        {}",
+                                compliance_word(c.status),
+                                format!("{:?}", c.severity).to_lowercase(),
+                                c.label,
+                                c.detail
+                            );
+                        }
+                    }
+                }
             }
         }
         Commands::Session { command } => {
@@ -2042,6 +2201,17 @@ fn decode_key(key: &str, enc: &KeyEncoding) -> Result<Vec<u8>> {
         KeyEncoding::Utf8 => Ok(key.as_bytes().to_vec()),
         KeyEncoding::Hex => Ok(hex::decode(key)?),
         KeyEncoding::Base64 => Ok(BASE64.decode(key.as_bytes())?),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Compliance vocabulary as a CCO reads it, not the engine's pass/warn/fail.
+fn compliance_word(s: neleus_db::compliance::Status) -> &'static str {
+    use neleus_db::compliance::Status;
+    match s {
+        Status::Pass => "satisfied",
+        Status::Warn => "in-review",
+        Status::Fail => "gap",
     }
 }
 

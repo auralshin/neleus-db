@@ -288,7 +288,7 @@ Reads filter expired records when a `now` instant is supplied. `session gc`
 tombstones expired records and compacts state, but honors
 `retention_min_secs`; canonical committed history is not automatically removed.
 
-## 11. Audit
+## 11. Audit and Compliance
 
 Every audited retrieval is a `QueryManifest` committed into canonical history.
 
@@ -302,6 +302,19 @@ Every audited retrieval is a `QueryManifest` committed into canonical history.
 Bundle entries include metadata, a summary, retrieval JSONL, canonical commit
 and manifest bytes, and checkpoint bytes. Verification re-derives claims from
 the carried bytes by hash equations.
+
+`compliance` maps implemented mechanisms to framework checks. It evaluates
+live audit data for checks such as:
+
+- audit logging present
+- tamper-evident checkpoint chain
+- signed checkpoints
+- encryption at rest
+- principal recorded
+- retention configured
+- data-version linkage
+
+Compliance reports are mechanism checks, not legal certification.
 
 ## 12. Checkpoints
 

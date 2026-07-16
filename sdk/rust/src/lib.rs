@@ -83,6 +83,43 @@ pub struct Verdict {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Framework {
+    pub id: String,
+    pub name: String,
+    pub jurisdiction: String,
+    pub region: String,
+    pub citation: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FrameworkStatus {
+    pub id: String,
+    pub name: String,
+    pub jurisdiction: String,
+    pub region: String,
+    pub overall: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckResult {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub severity: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceReport {
+    pub framework: String,
+    pub name: String,
+    pub jurisdiction: String,
+    pub overall: String,
+    pub retrievals: usize,
+    pub checks: Vec<CheckResult>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DocOpts {
     pub chunk_size: Option<usize>,
@@ -253,7 +290,28 @@ impl Client {
         Ok(v["checkpoint"].as_str().unwrap_or_default().to_string())
     }
 
+    // ---- compliance ----
+
+    pub fn frameworks(&self) -> Result<Vec<Framework>, Error> {
+        let v: serde_json::Value = self.get("/v1/compliance/frameworks")?;
+        Ok(serde_json::from_value(v["frameworks"].clone())?)
+    }
+
+    pub fn compliance_status(&self, head: &str) -> Result<Vec<FrameworkStatus>, Error> {
+        let v: serde_json::Value = self.post("/v1/compliance/status", &json!({"head": head}))?;
+        Ok(serde_json::from_value(v["frameworks"].clone())?)
+    }
+
+    pub fn compliance_check(&self, head: &str, framework: &str) -> Result<ComplianceReport, Error> {
+        self.post("/v1/compliance/check", &json!({"head": head, "framework": framework}))
+    }
+
     // ---- audit ----
+
+    pub fn audit_report(&self, head: &str, framework: &str) -> Result<String, Error> {
+        let v: serde_json::Value = self.post("/v1/audit/report", &json!({"head": head, "framework": framework}))?;
+        Ok(v["markdown"].as_str().unwrap_or_default().to_string())
+    }
 
     /// Download a self-contained, offline-verifiable `.nelaudit` bundle.
     pub fn export_bundle(&self, head: &str, from: Option<u64>, to: Option<u64>) -> Result<Vec<u8>, Error> {

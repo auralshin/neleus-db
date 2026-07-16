@@ -54,11 +54,15 @@ class NativeBinding(unittest.TestCase):
         verdict = self.db.verify_proof(bytes(proof))
         self.assertFalse(verdict["valid"])
 
-    def test_audit_export(self):
+    def test_audit_and_compliance(self):
         self._seed()
         qm = self.db.record_query("main", "verifiable audit", principal="agent:py")
         self.db.commit("main", "audit", manifests=[qm])
         self.db.checkpoint("main")
+
+        chk = self.db.compliance_check("main", "eu-ai-act")
+        self.assertEqual(chk["overall"], "pass")  # chain intact + a recorded retrieval
+        self.assertTrue(any(c["id"] == "audit-logging" for c in chk["checks"]))
 
         bundle = os.path.join(self.tmp, "q.nelaudit")
         self.assertEqual(self.db.audit_export("main", bundle), 1)

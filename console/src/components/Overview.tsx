@@ -1,12 +1,13 @@
 import { useEffect, useState } from "react";
-import type { Conn, ComplianceSummary } from "../lib/api";
+import type { Conn, ComplianceSummary, FrameworkStatus } from "../lib/api";
 import { fmtTime } from "../lib/api";
-import { Card, Panel, Pill } from "./ui";
+import { Card, Panel, Pill, statusWord } from "./ui";
 
 // Surface 1 — the CCO's morning view. One load-bearing signal (chain intact),
-// then agent activity and retention.
+// then per-jurisdiction regulatory status, agent activity, and retention.
 export function Overview({ conn, onStatus }: { conn: Conn; onStatus: (m: string, err?: boolean) => void }) {
   const [summary, setSummary] = useState<ComplianceSummary | null>(null);
+  const [statuses, setStatuses] = useState<FrameworkStatus[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -16,6 +17,11 @@ export function Overview({ conn, onStatus }: { conn: Conn; onStatus: (m: string,
         const s = await conn.summary();
         if (cancelled) return;
         setSummary(s);
+        const head = s.heads[0]?.name;
+        if (head) {
+          const st = await conn.status(head);
+          if (!cancelled) setStatuses(st.frameworks);
+        }
         onStatus(`Loaded ${s.heads.length} head(s).`);
       } catch (e) {
         if (!cancelled) {
@@ -70,6 +76,14 @@ export function Overview({ conn, onStatus }: { conn: Conn; onStatus: (m: string,
         ? "Run `checkpoint new --sign-key` to anchor history."
         : `${anchored.length} head${anchored.length > 1 ? "s" : ""} anchored and verified.`;
 
+  // group regulatory status by jurisdiction
+  const byRegion = new Map<string, FrameworkStatus[]>();
+  (statuses ?? []).forEach((f) => {
+    const list = byRegion.get(f.jurisdiction) ?? [];
+    list.push(f);
+    byRegion.set(f.jurisdiction, list);
+  });
+
   return (
     <>
       <div className={`banner ${bannerState} glass`}>
@@ -92,34 +106,54 @@ export function Overview({ conn, onStatus }: { conn: Conn; onStatus: (m: string,
         />
       </div>
 
-      <Panel title="Heads">
-        <div className="table-scroll">
-          <table className="grid">
-            <thead>
-              <tr><th>Head</th><th>Chain</th><th>Checkpoints</th><th>Retrievals 30d</th><th>Last</th></tr>
-            </thead>
-            <tbody>
-              {heads.length === 0 ? (
-                <tr><td colSpan={5} className="empty">No heads yet.</td></tr>
-              ) : (
-                heads.map((h) => (
-                  <tr key={h.name}>
-                    <td><code className="mono">{h.name}</code></td>
-                    <td>
-                      {h.chain.intact === true ? <Pill status="pass">intact</Pill>
-                        : h.chain.intact === false ? <Pill status="fail">broken</Pill>
-                          : <Pill status="none">none</Pill>}
-                    </td>
-                    <td>{h.chain.length ? `${h.chain.length} (${h.chain.signed} signed)` : "—"}</td>
-                    <td>{h.retrievals_30d.toLocaleString()}</td>
-                    <td>{fmtTime(h.last_retrieval_at)}</td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-      </Panel>
+      <div className="two-col">
+        <Panel title="Regulatory framework status">
+          {statuses === null ? (
+            <p className="hint">No head to evaluate.</p>
+          ) : (
+            [...byRegion.entries()].map(([region, fws]) => (
+              <div className="reg-group" key={region}>
+                <div className="reg-region">{region}</div>
+                {fws.map((f) => (
+                  <div className="reg-row" key={f.id}>
+                    <span>{f.name}</span>
+                    <Pill status={f.overall}>{statusWord(f.overall)}</Pill>
+                  </div>
+                ))}
+              </div>
+            ))
+          )}
+        </Panel>
+
+        <Panel title="Heads">
+          <div className="table-scroll">
+            <table className="grid">
+              <thead>
+                <tr><th>Head</th><th>Chain</th><th>Checkpoints</th><th>Retrievals 30d</th><th>Last</th></tr>
+              </thead>
+              <tbody>
+                {heads.length === 0 ? (
+                  <tr><td colSpan={5} className="empty">No heads yet.</td></tr>
+                ) : (
+                  heads.map((h) => (
+                    <tr key={h.name}>
+                      <td><code className="mono">{h.name}</code></td>
+                      <td>
+                        {h.chain.intact === true ? <Pill status="pass">intact</Pill>
+                          : h.chain.intact === false ? <Pill status="fail">broken</Pill>
+                            : <Pill status="none">none</Pill>}
+                      </td>
+                      <td>{h.chain.length ? `${h.chain.length} (${h.chain.signed} signed)` : "—"}</td>
+                      <td>{h.retrievals_30d.toLocaleString()}</td>
+                      <td>{fmtTime(h.last_retrieval_at)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      </div>
     </>
   );
 }

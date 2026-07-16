@@ -108,12 +108,16 @@ the remote model.
 | POST | `/v1/sessions/list` | reader | `{ head, session_id, at? }` → `{ turns[] }` |
 | POST | `/v1/checkpoints` | writer | `{ head }` → `{ checkpoint }` |
 
-### Audit
+### Compliance and audit
 
 | Method | Path | Role | Body / notes |
 |---|---|---|---|
 | GET | `/v1/compliance/summary` | reader, untenanted | per-head chain status, retrievals, encryption, retention |
+| GET | `/v1/compliance/frameworks` | reader | the law catalog |
+| POST | `/v1/compliance/status` | reader | `{ head, from?, to? }` → per-law overall status |
+| POST | `/v1/compliance/check` | reader | `{ head, framework, from?, to? }` → full check list |
 | POST | `/v1/audit/queries` | reader | `{ head, from?, to? }` → `{ records[] }` |
+| POST | `/v1/audit/report` | reader | `{ head, framework, from?, to? }` → `{ markdown }` |
 | POST | `/v1/audit/export` | reader | `{ head, from?, to? }` → bundle bytes (octet-stream) |
 
 Server-side export carries the integrity footer (tamper-evident,

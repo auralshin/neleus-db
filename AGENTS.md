@@ -11,9 +11,9 @@ bundles a web console into the binary.
 Key modules: `src/engine/` (BM25 + vector retrieval), `src/state.rs` (state +
 proofs), `src/commit.rs` / `src/manifest.rs` (commits, manifests),
 `src/server.rs` (HTTP + embedded console), `src/policy.rs` (policy-as-code +
-enforcement), `src/events.rs` (tamper-evident event log), `src/audit.rs`
-(audit bundles). UI source in `console/`, SDKs in
-`sdk/{python,typescript,rust,python-native}`.
+enforcement), `src/events.rs` (tamper-evident event log), `src/compliance.rs`
+(framework checks), `src/audit.rs` (audit bundles). UI source in `console/`,
+SDKs in `sdk/{python,typescript,rust,python-native}`.
 
 ## Commands
 

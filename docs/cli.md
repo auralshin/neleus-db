@@ -93,13 +93,17 @@ durable.
 | `session list --head <h> --session-id <id> [--include-expired]` | List turns (oldest first). |
 | `session gc --head <h>` | Remove expired records (honors the retention floor). |
 
-## audit — the audit surface
+## audit / compliance — the compliance surface
 
 | Command | What it does |
 |---|---|
 | `audit log --head <h> [--from <unix>] [--to <unix>]` | List retrieval audit records. |
 | `audit export --head <h> [--from] [--to] --out <file> [--sign-key <key>]` | Write a self-contained, optionally signed bundle. |
 | `audit verify <input> [--public-key <hex>] [--require-signature]` | Verify a bundle offline (same as `neleus-verify`). |
+| `audit report --head <h> --framework <id> [--from] [--to] [--out <file>]` | Markdown compliance report with live checks. |
+| `compliance frameworks` | The law catalog, grouped by jurisdiction. |
+| `compliance status --head <h> [--from] [--to]` | Per-law overall status: satisfied / in-review / gap. |
+| `compliance check --head <h> --framework <id> [--from] [--to]` | Full check list for one framework. |
 
 ## policy / events — monitor and enforce
 

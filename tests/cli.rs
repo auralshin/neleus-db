@@ -26,6 +26,7 @@ fn cli_command_dispatch_end_to_end() {
     let dbs = db.to_str().unwrap();
 
     ok(&["db", "init", dbs]);
+    ok(&["--db", dbs, "compliance", "frameworks"]);
 
     // ed25519 key; capture its public key from the JSON output (std string parse).
     let keyf = tmp.path().join("k.key");
@@ -181,7 +182,18 @@ fn cli_pipeline_ingest_search_prove_audit() {
     ]);
     ok(&["--db", dbs, "state", "get", "main", "userkey"]);
 
-    // audit surface.
+    // compliance + audit surfaces.
+    ok(&["--db", dbs, "compliance", "status", "--head", "main"]);
+    ok(&[
+        "--db",
+        dbs,
+        "compliance",
+        "check",
+        "--head",
+        "main",
+        "--framework",
+        "gdpr",
+    ]);
     ok(&["--db", dbs, "audit", "log", "--head", "main"]);
 }
 

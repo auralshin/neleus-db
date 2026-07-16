@@ -25,6 +25,11 @@ let res = c.search("main", SearchOpts {
 let proof = c.prove(&res.commit, &res.hits[0].chunk, true)?;
 assert!(c.verify(&proof)?.valid);
 
+// per-jurisdiction compliance status
+for s in c.compliance_status("main")? {
+    println!("{:8} {:6} {}", s.overall, s.region, s.name);
+}
+
 // offline-verifiable audit bundle
 let bundle = c.export_bundle("main", None, None)?;
 std::fs::write("q1.nelaudit", bundle)?;

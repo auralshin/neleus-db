@@ -17,6 +17,11 @@ export function EnforcedBadge({ enforced }: { enforced: boolean }) {
   );
 }
 
+// Compliance vocabulary the way a CCO reads it, not the engine's pass/warn/fail.
+export function statusWord(s: Status): string {
+  return s === "pass" ? "satisfied" : s === "warn" ? "in review" : "gap";
+}
+
 export function Card({ num, label, note, tone }: { num: ReactNode; label: string; note?: string; tone?: "warn" }) {
   return (
     <div className="metric glass">

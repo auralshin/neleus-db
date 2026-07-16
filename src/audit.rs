@@ -554,6 +554,13 @@ pub fn verify_bundle(
     })
 }
 
+/// Markdown compliance report for a framework over a period. Delegates to
+/// the jurisdiction catalog in [`crate::compliance`], which runs live checks
+/// and renders the requirement mapping.
+pub fn report(db: &Database, head: &str, framework: &str, from: u64, to: u64) -> Result<String> {
+    crate::compliance::render_report(db, head, framework, from, to)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -665,5 +672,17 @@ mod tests {
         export(&db, &head, 0, u64::MAX, &out, None).unwrap();
         assert!(verify_bundle(&out, None, true).is_err());
         verify_bundle(&out, None, false).unwrap();
+    }
+
+    #[test]
+    fn report_renders_for_each_framework() {
+        let (_tmp, db, head) = db_with_audited_queries();
+        for fw in ["eu-ai-act", "hipaa", "sec-occ"] {
+            let md = report(&db, &head, fw, 0, u64::MAX).unwrap();
+            assert!(md.contains("retrievals recorded: **3**"), "{fw}");
+            assert!(md.contains("Requirement mapping"), "{fw}");
+            assert!(md.contains("## Checks"), "{fw}");
+        }
+        assert!(report(&db, &head, "soc2", 0, u64::MAX).is_err());
     }
 }
