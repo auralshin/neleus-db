@@ -5,10 +5,10 @@ a round trip.
 
 ## License of contributions
 
-neleus-db is proprietary, commercial software (see [LICENSE](LICENSE)). By
-submitting a contribution you assign all right, title, and interest in it to the
-Licensor, who may license it under any terms. Don't submit code you can't assign
-this way.
+neleus-db is source-available under [PolyForm Noncommercial 1.0.0](LICENSE).
+By submitting a contribution you license it under the project license and grant
+the maintainer the right to offer it under other terms (e.g. commercial
+licenses). Don't submit code you can't license this way.
 
 ## The one rule that matters: don't break the byte format
 

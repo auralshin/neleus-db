@@ -3,7 +3,7 @@ name = "neleus-client"
 version = "0.1.0"
 edition = "2024"
 description = "Rust HTTP client for neleus-db: verifiable agent memory, retrieval, proofs, and compliance."
-license = "LicenseRef-Neleus-Commercial"
+license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 repository = "https://github.com/auralshin/neleus-db"
 

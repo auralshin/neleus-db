@@ -257,6 +257,7 @@ neleus-verify q1.nelaudit --public-key <hex>       # offline, no Neleus needed
 
 ## License
 
-neleus-db is proprietary, commercial software, licensed not sold. Use requires a
-commercial license or a 30-day evaluation; see [LICENSE](LICENSE). The source is
-not published. For commercial licensing, contact the maintainer.
+neleus-db is source-available under [PolyForm Noncommercial 1.0.0](LICENSE):
+use it, modify it, and redistribute it freely for any noncommercial purpose.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commercial
+use requires a separate license from the maintainer; open an issue to ask.

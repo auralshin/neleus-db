@@ -14,7 +14,7 @@
     "test": "npm run build && node --test test/client.test.ts",
     "prepublishOnly": "npm run build"
   },
-  "license": "UNLICENSED",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "devDependencies": {
     "typescript": "^5.6.3"
   }

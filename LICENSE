@@ -1,124 +1,133 @@
-neleus-db Software License Agreement
+# PolyForm Noncommercial License 1.0.0
 
-Copyright (c) 2026 Anshul (auralshin). All rights reserved.
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
 
-This Software License Agreement ("Agreement") is a legal agreement between you,
-either an individual or a single entity ("Licensee" or "you"), and Anshul
-(auralshin) ("Licensor"), for the neleus-db software, including its binaries,
-libraries, embedded web console, SDKs, documentation, and any updates or
-supplements (collectively, the "Software").
+Required Notice: Copyright (c) 2026 Anshul (auralshin) — https://github.com/auralshin/neleus-db
 
-By installing, copying, accessing, or otherwise using the Software, you agree to
-be bound by this Agreement. If you do not agree, do not install or use the
-Software.
+## Acceptance
 
-The Software is proprietary and confidential. It is licensed, not sold. Licensor
-reserves all rights not expressly granted in this Agreement.
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
 
-1. License Grant
+## Copyright License
 
-   1.1 Commercial use. Subject to your payment of the applicable fees and the
-       terms of an order, subscription, or written agreement with Licensor (an
-       "Order"), Licensor grants you a non-exclusive, non-transferable,
-       non-sublicensable, revocable license to install and use the Software in
-       object-code (binary) form, for your internal business purposes, limited
-       to the scope (such as seats, instances, environments, or term) stated in
-       your Order.
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright
+in it for any permitted purpose.  However, you may
+only distribute the software according to [Distribution
+License](#distribution-license) and make changes or new works
+based on the software according to [Changes and New Works
+License](#changes-and-new-works-license).
 
-   1.2 Evaluation. Absent an Order, Licensor grants you a limited,
-       non-exclusive, non-production license to install and use the Software
-       solely to evaluate it for up to thirty (30) days. Evaluation use is
-       provided "AS IS" and may be revoked at any time. Any production use
-       requires an Order.
+## Distribution License
 
-2. Restrictions
+The licensor grants you an additional copyright license
+to distribute copies of the software.  Your license
+to distribute covers distributing the software with
+changes and new works permitted by [Changes and New Works
+License](#changes-and-new-works-license).
 
-   You shall not, and shall not permit any third party to:
+## Notices
 
-   (a) copy the Software, except for a reasonable number of backup copies;
-   (b) modify, adapt, translate, or create derivative works of the Software;
-   (c) reverse engineer, decompile, disassemble, or otherwise attempt to derive
-       the source code, underlying ideas, or algorithms of the Software, except
-       to the extent this restriction is prohibited by applicable law;
-   (d) rent, lease, lend, sell, sublicense, distribute, or otherwise transfer
-       the Software or make it available to any third party;
-   (e) host, operate, or offer the Software, in whole or in part, as a service,
-       including any managed, hosted, SaaS, or time-sharing offering, to any
-       third party;
-   (f) remove, alter, or obscure any proprietary notices, labels, or license
-       keys in or on the Software;
-   (g) circumvent or disable any license-key, activation, metering, or other
-       technical-protection mechanism in the Software;
-   (h) use the Software to develop or assist in developing a competing product,
-       or publish benchmarks or comparisons of the Software without Licensor's
-       prior written consent.
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms or the
+URL for them above, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided
+with the software.  For example:
 
-3. Ownership
+> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
 
-   The Software is licensed, not sold. Licensor and its licensors retain all
-   right, title, and interest in and to the Software, including all
-   intellectual-property rights. No rights are granted except as expressly set
-   out in this Agreement. "neleus-db" and associated names and logos are
-   trademarks of Licensor; this Agreement grants no right to use them.
+## Changes and New Works License
 
-4. License Keys
+The licensor grants you an additional copyright license to
+make changes and new works based on the software for any
+permitted purpose.
 
-   The Software may require a license key or activation to operate. You may use
-   license keys only as authorized by your Order, and shall not share, publish,
-   or circumvent them.
+## Patent License
 
-5. Confidentiality
+The licensor grants you a patent license for the software that
+covers patent claims the licensor can license, or becomes able
+to license, that you would infringe by using the software.
 
-   The Software, its object code, and any non-public information disclosed by
-   Licensor are the confidential information of Licensor. You shall protect them
-   with at least reasonable care and shall not disclose them except as expressly
-   permitted by this Agreement.
+## Noncommercial Purposes
 
-6. Third-Party Components
+Any noncommercial purpose is a permitted purpose.
 
-   The Software includes third-party components licensed under their own terms.
-   A list of those components and their notices is provided with the Software or
-   on request. Those components remain governed by their respective licenses;
-   nothing in this Agreement limits your rights, or adds obligations, under
-   those licenses with respect to those components.
+## Personal Uses
 
-7. Term and Termination
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for a permitted purpose.
 
-   This Agreement is effective until terminated. It terminates automatically if
-   you breach any of its terms, or at the end of the applicable Order term. On
-   termination, you shall cease all use of the Software and destroy all copies
-   in your possession or control. Sections 2 through 11 survive termination.
+## Noncommercial Organizations
 
-8. Warranty Disclaimer
+Use by any charitable organization, educational institution,
+public research organization, public safety or health
+organization, environmental protection organization,
+or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting
+from the funding.
 
-   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITHOUT WARRANTY OF ANY
-   KIND. TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR DISCLAIMS ALL
-   WARRANTIES AND CONDITIONS, EXPRESS OR IMPLIED, INCLUDING WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND ANY
-   WARRANTY ARISING FROM COURSE OF DEALING OR USAGE OF TRADE. The Software is not
-   designed or intended for use in hazardous or fail-safe-critical environments.
+## Fair Use
 
-9. Limitation of Liability
+You may have "fair use" rights for the software under the
+law. These terms do not limit them.
 
-   TO THE MAXIMUM EXTENT PERMITTED BY LAW, LICENSOR SHALL NOT BE LIABLE FOR ANY
-   INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR EXEMPLARY DAMAGES, OR FOR ANY
-   LOST PROFITS, REVENUE, OR DATA, ARISING OUT OF OR RELATED TO THIS AGREEMENT,
-   EVEN IF ADVISED OF THE POSSIBILITY. LICENSOR'S TOTAL CUMULATIVE LIABILITY
-   SHALL NOT EXCEED THE GREATER OF THE FEES YOU PAID FOR THE SOFTWARE IN THE
-   TWELVE (12) MONTHS PRECEDING THE CLAIM, OR ONE HUNDRED U.S. DOLLARS (USD 100).
+## No Other Rights
 
-10. Compliance and Export
+These terms do not allow you to sublicense or transfer any of
+your licenses to anyone else, or prevent the licensor from
+granting licenses to anyone else.  These terms do not imply
+any other licenses.
 
-    You shall comply with all applicable laws in your use of the Software,
-    including export-control and economic-sanctions laws.
+## Patent Defense
 
-11. General
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license
+for the software granted under these terms ends immediately. If
+your company makes such a claim, your patent license ends
+immediately for work on behalf of your company.
 
-    This Agreement is governed by the laws of [JURISDICTION], without regard to
-    its conflict-of-laws rules. This Agreement is the entire agreement between
-    the parties on its subject matter and supersedes all prior or contemporaneous
-    understandings. If any provision is held unenforceable, the remaining
-    provisions remain in full effect. You may not assign this Agreement without
-    Licensor's prior written consent.
+## Violations
 
-For commercial licensing, contact: [contact email].
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the software
+not covered by your licenses, your licenses can nonetheless
+continue if you come into full compliance with these terms,
+and take practical steps to correct past violations, within
+32 days of receiving notice.  Otherwise, all your licenses
+end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use
+or nature of the software, under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these
+terms, and the **software** is the software the licensor makes
+available under these terms.
+
+**You** refers to the individual or entity agreeing to these
+terms.
+
+**Your company** is any legal entity, sole proprietorship,
+or other kind of organization that you work for, plus all
+organizations that have control over, are under the control of,
+or are under common control with that organization.  **Control**
+means ownership of substantially all the assets of an entity,
+or the power to direct its management and policies by vote,
+contract, or otherwise.  Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the
+software under these terms.
+
+**Use** means anything you do with the software requiring one
+of your licenses.

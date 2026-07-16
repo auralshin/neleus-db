@@ -3,7 +3,7 @@ name = "neleus-native"
 version = "0.1.0"
 edition = "2021"
 description = "Native (PyO3) Python binding embedding the neleus-db engine in-process."
-license = "LicenseRef-Neleus-Commercial"
+license = "PolyForm-Noncommercial-1.0.0"
 publish = false
 
 [lib]
