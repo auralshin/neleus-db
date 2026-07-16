@@ -14,40 +14,37 @@ use crate::lock::process_is_alive;
 /// nanosecond.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Test-only fsync override. In test builds fsync is skipped by default —
-/// tests don't simulate crashes, so durability is moot and the savings on
-/// macOS APFS / Linux ext4 are large (each fsync is several ms). Production
-/// builds get an `#[inline(always)] true` branch the optimizer will erase.
+/// Process-wide durability policy (config `durability`):
+/// - os (default): no fsync. Renames stay crash-of-process atomic; power
+///   loss can drop recent writes but never corrupts (objects verifiable,
+///   refs WAL-recovered).
+/// - full: fsync file + dir per atomic write; power-loss durable.
 ///
-/// If you ever add a test that genuinely needs durability semantics (e.g. a
-/// crash-replay test that powers down between writes), call
-/// `enable_fsync_for_tests()` in its setup before any I/O.
-#[cfg(test)]
-static TEST_FSYNC_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Global because `write_atomic` has no config context; set at open.
+static FSYNC_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Force fsync back on for the lifetime of the current test process. Use it
-/// in the rare test that asserts durability semantics; the global default in
-/// test builds is "fsync off".
+/// Switch the process-wide durability policy (true = fsync everything).
+pub fn set_full_durability(enabled: bool) {
+    FSYNC_FULL.store(enabled, Ordering::Relaxed);
+}
+
+/// Test override for durability-sensitive tests.
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn enable_fsync_for_tests() {
-    TEST_FSYNC_ENABLED.store(true, Ordering::Relaxed);
+    set_full_durability(true);
 }
 
-#[cfg(test)]
 fn fsync_enabled() -> bool {
-    TEST_FSYNC_ENABLED.load(Ordering::Relaxed)
-}
-
-#[cfg(not(test))]
-#[inline(always)]
-fn fsync_enabled() -> bool {
-    true
+    FSYNC_FULL.load(Ordering::Relaxed)
 }
 
 pub(crate) fn maybe_sync_file(f: &File) -> std::io::Result<()> {
-    if fsync_enabled() { f.sync_all() } else { Ok(()) }
+    if fsync_enabled() {
+        f.sync_all()
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn maybe_sync_dir(path: &Path) -> std::io::Result<()> {
@@ -136,8 +133,8 @@ pub fn cleanup_orphan_temps(root: &Path, recursive: bool) -> Result<usize> {
     }
 
     let mut removed = 0usize;
-    let entries = fs::read_dir(root)
-        .with_context(|| format!("failed reading dir {}", root.display()))?;
+    let entries =
+        fs::read_dir(root).with_context(|| format!("failed reading dir {}", root.display()))?;
 
     for entry in entries {
         let entry = entry?;

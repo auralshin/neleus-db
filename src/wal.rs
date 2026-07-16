@@ -34,6 +34,7 @@ pub struct Wal {
 pub enum WalOp {
     RefHeadSet,
     RefStateSet,
+    RefCheckpointSet,
     StateSet,
     StateDel,
     StateCompact,
@@ -172,6 +173,21 @@ impl Wal {
                             &refs_root.join("states").join(name),
                             format!("{hash}\n").as_bytes(),
                         )?;
+                        report.replayed += 1;
+                    } else {
+                        report.rolled_back += 1;
+                    }
+                }
+                WalOp::RefCheckpointSet => {
+                    if let WalPayload::RefUpdate { name, hash } = entry.payload {
+                        if validate_ref_name(&name).is_err() {
+                            self.end(&path)?;
+                            report.rolled_back += 1;
+                            continue;
+                        }
+                        let dir = refs_root.join("checkpoints");
+                        fs::create_dir_all(&dir)?;
+                        write_atomic(&dir.join(name), format!("{hash}\n").as_bytes())?;
                         report.replayed += 1;
                     } else {
                         report.rolled_back += 1;

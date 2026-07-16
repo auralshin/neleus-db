@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "neleus-native"
+version = "0.1.0"
+description = "Native (PyO3) Python binding embedding the neleus-db engine in-process."
+requires-python = ">=3.8"
+license = { text = "PolyForm-Noncommercial-1.0.0" }
+
+[tool.maturin]
+# abi3 wheel: one build runs on any CPython >= 3.8.
+features = ["pyo3/extension-module"]

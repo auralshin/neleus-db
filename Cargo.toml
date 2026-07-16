@@ -3,26 +3,36 @@ name = "neleus-db"
 version = "0.2.0"
 edition = "2024"
 description = "Local-first Merkle-DAG database for AI agents with cryptographic proofs and immutable versioning"
-license = "MIT"
+license-file = "LICENSE"
+publish = false
 repository = "https://github.com/auralshin/neleus-db"
 homepage = "https://github.com/auralshin/neleus-db"
 documentation = "https://docs.rs/neleus-db"
 readme = "README.md"
 keywords = ["database", "merkle", "ai-agents", "content-addressed", "versioning"]
 categories = ["database-implementations", "cryptography", "data-structures"]
+build = "build.rs"
+
+[features]
+# Embed the prebuilt web console (console/dist) into the binary and serve it
+# from `serve`. On by default for the shipped binary; turn off for lib-only or
+# Node-less builds with `--no-default-features`.
+default = ["console"]
+console = []
 
 [dependencies]
 aes-gcm = "0.10"
 anyhow = "1.0"
+argon2 = "0.5.3"
 base64 = "0.22"
 blake3 = "1.5"
 chacha20poly1305 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = "2.2.0"
 getrandom = "0.2"
 hex = "0.4"
 hkdf = "0.12"
 libc = "0.2"
-pbkdf2 = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_ipld_dagcbor = "0.6"
 serde_json = "1.0"
@@ -31,10 +41,16 @@ thiserror = "2.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zstd = "0.13"
 
+[build-dependencies]
+# Compress the embedded console assets at build time (served Content-Encoding:
+# zstd). Same crate as the runtime dep — no new dependency.
+zstd = "0.13"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.5"
 rand = "0.8"
+rusqlite = "0.37"
 tempfile = "3.16"
 
 [[bin]]
@@ -49,6 +65,17 @@ harness = false
 name = "state"
 harness = false
 
+# Release size/perf tuning. strip removes ~0.7M of symbols; LTO + a single
+# codegen unit let the linker drop dead cross-crate code. opt-level stays at the
+# default 3 — this is a throughput-sensitive DB, so we trade build time, not
+# runtime speed. panic stays `unwind` on purpose: the server is
+# thread-per-connection, and `abort` would let one panicking request kill the
+# whole daemon.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
 # Crypto/hash/compression deps dominate test and bench runtime. Compiling them
 # at opt-level=3 while leaving this crate at opt-level=0 keeps incremental
 # builds fast and shrinks the test suite wall time dramatically — measured ~6×
@@ -58,3 +85,15 @@ opt-level = 3
 
 [profile.test.package."*"]
 opt-level = 3
+
+[[bench]]
+name = "compare_sql"
+harness = false
+
+[[bench]]
+name = "scale"
+harness = false
+
+[[bin]]
+name = "neleus-verify"
+path = "src/bin/neleus-verify.rs"

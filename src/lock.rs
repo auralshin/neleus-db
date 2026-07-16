@@ -42,7 +42,11 @@ pub fn acquire_lock(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLoc
                 let pid = std::process::id();
                 writeln!(file, "pid={pid}")?;
                 writeln!(file, "created_at={now}")?;
-                file.sync_all()?;
+                // No fsync: the lock is ephemeral advisory state. Concurrent
+                // acquirers are excluded by O_EXCL create (a metadata op the
+                // filesystem orders without fsync), and crash recovery is
+                // PID-liveness based, not content based. An fsync here costs
+                // ~5-10ms per acquisition on macOS (F_FULLFSYNC) for nothing.
                 return Ok(FileLockGuard { path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -65,6 +69,62 @@ pub fn acquire_lock(path: impl AsRef<Path>, timeout: Duration) -> Result<FileLoc
                     .with_context(|| format!("failed to acquire lock {}", path.display()));
             }
         }
+    }
+}
+
+/// Exclusive advisory lock via flock(2): ~3 cheap syscalls per acquisition
+/// (open, flock, close-on-drop) vs ~6 expensive metadata ops for the
+/// marker-file scheme, and the kernel releases it on process death — no
+/// stale-lock heuristics. Used on hot paths (ref mutation); the marker-file
+/// `acquire_lock` stays for rare maintenance locks where a human-readable
+/// owner PID is worth the cost.
+#[cfg(unix)]
+pub struct FlockGuard {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: fd is valid for the lifetime of `file`.
+        unsafe {
+            libc::flock(
+                std::os::unix::io::AsRawFd::as_raw_fd(&self.file),
+                libc::LOCK_UN,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+pub fn flock_exclusive(path: impl AsRef<Path>, timeout: Duration) -> Result<FlockGuard> {
+    use std::os::unix::io::AsRawFd;
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening lock file {}", path.display()))?;
+
+    let deadline = SystemTime::now() + timeout;
+    loop {
+        // SAFETY: fd is valid; LOCK_NB makes this non-blocking.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(FlockGuard { file });
+        }
+        if SystemTime::now() >= deadline {
+            return Err(anyhow!(
+                "timed out acquiring lock {} after {:?}",
+                path.display(),
+                timeout
+            ));
+        }
+        thread::sleep(Duration::from_micros(200));
     }
 }
 

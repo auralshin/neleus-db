@@ -1,0 +1,21 @@
+{
+  "name": "@neleus/client",
+  "version": "0.1.0",
+  "description": "TypeScript client for neleus-db: verifiable agent memory, retrieval, proofs, and compliance.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+  },
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test test/client.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

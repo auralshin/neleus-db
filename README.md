@@ -1,326 +1,263 @@
 <div align="center">
-  <p align="center">
-    <a href="#contributors"><img src="https://img.shields.io/badge/contributors-1-brightgreen?style=flat-square" alt="Contributors"></a>
-    <a href="https://github.com/auralshin/neleus-db/network/members"><img src="https://img.shields.io/github/forks/auralshin/neleus-db?style=flat-square" alt="Forks"></a>
-    <a href="https://github.com/auralshin/neleus-db/stargazers"><img src="https://img.shields.io/github/stars/auralshin/neleus-db?style=flat-square" alt="Stars"></a>
-    <a href="https://github.com/auralshin/neleus-db/issues"><img src="https://img.shields.io/github/issues/auralshin/neleus-db?style=flat-square" alt="Issues"></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
-  </p>
-  
+
 # 🔱 Neleus DB
 
-## Verifiable memory and audit trails for AI agents
+## The verifiable context engine for AI agents
 
-  A high-performance, content-addressed database designed for AI agent workflows with cryptographic proofs and immutable versioning.
+Fast hybrid retrieval, git-like versioned state, and session memory — where
+every answer carries a cryptographic receipt. Sub-millisecond warm queries;
+any hit upgrades to an offline-verifiable Merkle proof. Ships with an audit
+surface: signed audit export and a standalone verifier (`neleus-verify`) an
+auditor runs without Neleus.
 
-  [Examples](examples/) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug) · [Request Feature](https://github.com/auralshin/neleus-db/issues/new?labels=feature)
+[Get started](docs/getting-started.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [Benchmarks](BENCHMARKS.md) · [Design](DESIGN.md) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug)
+
 </div>
 
 ---
 
-## Contents
+## Why
 
-- [Why neleus-db](#why-neleus-db)
-- [Who should use this](#who-should-use-this)
-- [Features](#features)
-- [Architecture at a glance](#architecture-at-a-glance)
-- [Installation](#installation)
-- [Examples](#examples)
-- [Quick start](#quick-start)
-- [CLI](#cli)
-- [Public Rust API](#public-rust-api)
-- [Data layout](#data-layout)
-- [Integrity and determinism](#integrity-and-determinism)
-- [Reliability and security](#reliability-and-security)
-- [Testing](#testing)
-- [Python SDK](#python-sdk)
-- [Integration guide](#integration-guide)
-- [Design document](#design-document)
-- [Contributing](#contributing)
-- [License](#license)
+Vector databases and agent-memory products are fast but trust-free: nothing
+stops history from being rewritten, and nothing proves what an agent actually
+retrieved. Audit logs are "trust me" artifacts. neleus-db makes the storage
+layer itself the proof:
 
-## Why neleus-db
+- **Content-addressed everything** — blobs, manifests, commits, state are
+  BLAKE3-addressed immutable objects. Tampering changes hashes; hashes are
+  the identities.
+- **Proof-carrying retrieval** — any search hit `(commit, chunk)` becomes a
+  self-contained bundle verifiable offline with nothing but BLAKE3 and a
+  CBOR decoder. `proof chunk` / `proof verify-chunk`.
+- **Fast by architecture** — a resident engine serves BM25 + HNSW + metadata
+  filters from in-memory caches over immutable segments. Warm point reads
+  and BM25 search beat SQLite on the same machine ([numbers](BENCHMARKS.md)).
+- **One engine, local or hosted** — embed the crate like SQLite, or run
+  `neleus-db serve` for an authenticated multi-tenant HTTP API. Same code
+  path either way.
 
-AI agent systems need more than a key-value store:
+No shipping agent-memory product (Mem0, Zep, Supermemory, Letta, Cognee)
+offers cryptographic tamper-evidence as of mid-2026 — see
+[BENCHMARKS.md](BENCHMARKS.md#3-the-verifiability-gap).
 
-- auditable, state-replayable runs from immutable content-addressed inputs
-- versioned state snapshots with commit history
-- integrity proofs for every claim and retrieved chunk
-- local operation without network dependencies
+## Capabilities
 
-`neleus-db` is built around those guarantees.
+**Retrieval**
+- Hybrid search: BM25 + HNSW vectors fused with reciprocal rank fusion
+- Metadata filters: tenant, doc type, language, ACL tags, validity windows
+- Time-travel: query any historical commit (`search --head <commit-hash>`)
+- TTL + temporal validity (`valid_from`/`valid_to`/`expires_at`) as engine
+  primitives
+- Hierarchical retrieval via `SummaryManifest` (summaries indexed beside
+  chunks, linked to their evidence)
 
-> **On reproducibility:** neleus-db captures all inputs, retrieved context, and provider
-> metadata needed for replay. Because hosted LLMs are non-deterministic and may change
-> over time, runs are *auditable and state-replayable* rather than bit-for-bit reproducible.
-> Equivalent outputs require equivalent model, parameters, and runtime conditions.
+**State & memory**
+- Versioned KV with O(log n) Merkle membership/non-membership proofs
+- Content-addressed prolly tree (Merkle B+-tree): canonical roots, ordered
+  prefix scans, inline small values / blob-backed large values — warm gets
+  well under SQLite point-read latency
+- Episodic session memory with TTL (`session append/list/gc`)
 
-## Who should use this
+**Verifiability**
+- ed25519-signed commits (`key generate`, `commit new --sign-key`)
+- Checkpoint chains: an append-only transparency log over each head
+  (`checkpoint new/verify`); publish the latest hash anywhere to externally
+  anchor the whole history
+- Content-addressed query audit records (`search --audit`)
+- Offline chunk proofs spanning commit ancestry
 
-- teams building agent runtimes or orchestrators
-- local/private RAG systems that need provenance
-- products requiring tamper-evident run history
-- developers who want Git-like history for agent state
-
-## Features
-
-- Content-addressed blob and object storage (`blake3`)
-- Strict canonical object encoding (DAG-CBOR) with golden-byte tests
-- Versioned segmented state store with Merkle commitments
-- Membership and non-membership state proofs
-- Git-like commit graph (`parents`, `author`, `message`, `state_root`, `manifests`)
-- **`RunManifest`** — captures provider, model, parameters, system prompt, inputs, outputs, and retrieved RAG chunks in one signed, Merkle-linked record
-- **`ProvenanceRecord`** — agent claims with evidence, confidence scores, and `RunManifest` back-links
-- WAL + atomic file writes + automatic WAL recovery on open
-- Lock-file protection for multi-process mutable operations
-- Optional verify-on-read integrity checks
-- Encryption at rest for blobs and objects (AES-256-GCM / ChaCha20-Poly1305 + PBKDF2-HMAC-SHA256)
-- Native semantic and vector search as rebuildable derived indexes
-- **Python SDK** — `with neleus.run(...) as run:` context manager for zero-friction agent auditing
-
-## Architecture at a glance
-
-```text
-Immutable canonical layer:
-  blobs/   -> raw bytes
-  objects/ -> canonical manifests, state objects, commits
-
-Mutable pointers:
-  refs/heads/*  -> commit hashes
-  refs/states/* -> staged state roots
-
-Derived/rebuildable layer:
-  index/<commit_hash>/search_index.json
-
-Reliability:
-  wal/*.wal
-  meta/config.json
-```
-
-## Installation
-
-```bash
-git clone https://github.com/auralshin/neleus-db
-cd neleus-db
-cargo build --release
-```
-
-## Examples
-
-See the [examples/](examples/) directory for practical code demonstrating common patterns:
-
-- **[01_basic_blob_storage.rs](examples/01_basic_blob_storage.rs)** - Content-addressed storage and deduplication
-- **[02_state_and_commits.rs](examples/02_state_and_commits.rs)** - Versioned state with Git-like history
-- **[03_document_chunking.rs](examples/03_document_chunking.rs)** - Deterministic document chunking and manifests
-- **[05_state_proofs.rs](examples/05_state_proofs.rs)** - Cryptographic proof generation and verification
-
-Run any example:
-
-```bash
-cargo run --example 01_basic_blob_storage
-```
+**Operations**
+- `neleus-db serve`: std-only HTTP server, API keys (BLAKE3-hashed,
+  constant-time), role ladder reader/writer/admin, hard tenant partitioning
+- Replication: `db push` / `db pull` — fast-forward-only, content-addressed
+  sync (no force-push, divergence reported not overwritten)
+- Encryption at rest: AES-256-GCM or ChaCha20-Poly1305, Argon2id master key
+- Durability ladder: `os` (default, SQLite-WAL-class) or `full` (fsync per
+  write)
+- Backup (`db pack/unpack`), GC, repack; everything in `index/` is derived
+  and rebuildable
 
 ## Quick start
 
 ```bash
-# 1) initialize DB
-cargo run -- db init /tmp/neleus_db
+cargo build --release
+alias ndb='./target/release/neleus-db --db ./agent_db'
 
-# 2) add a blob
-cargo run -- --db /tmp/neleus_db blob put /path/to/file.txt
+ndb db init ./agent_db
 
-# 3) create a document manifest + deterministic chunks
-cargo run -- --db /tmp/neleus_db manifest put-doc \
-  --source local_file \
-  --file /path/to/file.txt \
-  --chunk-size 512 \
-  --overlap 64
+# ingest with metadata; commits auto-index
+ndb manifest put-doc --source policy.md --file policy.md \
+    --chunk-size 512 --overlap 64 --doc-type policy --acl group:hr
+ndb commit new --head main --author ingest --message "policy v1" --manifest <hash>
 
-# 4) update versioned state
-cargo run -- --db /tmp/neleus_db state set main 6b6579 /path/to/value.bin --key-encoding hex
+# hybrid search with filters + audit record
+ndb search hybrid --head main --query "password reset policy" \
+    --acl group:hr --audit
 
-# 5) commit snapshot
-cargo run -- --db /tmp/neleus_db commit new \
-  --head main \
-  --author agent1 \
-  --message "initial snapshot" \
-  --manifest <manifest_hash>
+# prove a hit, verify offline
+ndb proof chunk --head main --chunk <chunk-hash> --include-content --out hit.proof
+ndb proof verify-chunk hit.proof
 
-# 6) build and query derived search indexes
-cargo run -- --db /tmp/neleus_db index build --head main
-cargo run -- --db /tmp/neleus_db search semantic --head main --query "systems programming" --top-k 5
-cargo run -- --db /tmp/neleus_db search vector --head main --embedding-file /path/to/query_embedding.json --top-k 5
+# signed commits + transparency log
+ndb key generate --out agent.key
+ndb commit new --head main --author agent --message "..." --sign-key agent.key
+ndb checkpoint new --head main --sign-key agent.key
+ndb checkpoint verify --head main --public-key <hex> --require-signatures
 
-# 7) generate and verify state proof
-cargo run -- --db /tmp/neleus_db proof state main 6b6579 --key-encoding hex
+# session memory with TTL
+ndb session append --head main --session-id s1 --role user --content "hi" --ttl-secs 3600
+ndb session list --head main --session-id s1
 ```
 
-## CLI
-
-- `db init <path>`
-- `blob put <file>`
-- `blob get <hash> <out_file>`
-- `manifest put-doc --source ... --file ... --chunk-size ... [--overlap ...]`
-- `manifest put-run --model ... --prompt-file ... --io-hashes in:<hash> --io-hashes out:<hash>`
-- `state set <head> <key> <value-file> [--key-encoding utf8|hex|base64]`
-- `state get <head> <key> [--key-encoding utf8|hex|base64] [--out-file <path>]`
-- `state del <head> <key> [--key-encoding utf8|hex|base64]`
-- `state compact <head>`
-- `commit new --head <name> --author <id> --message <text> [--manifest <hash> ...]`
-- `index build --head <name>`
-- `search semantic --head <name> (--query <text> | --query-file <path>) [--top-k <n>]`
-- `search vector --head <name> --embedding-file <path> [--top-k <n>]`
-- `log <head>`
-- `proof state <head> <key> [--key-encoding utf8|hex|base64]`
-
-Storage maintenance:
-
-- `db repack` — consolidate loose blobs/objects into pack files (reclaims per-file disk/inode overhead; crash-safe)
-- `db packs` — list the pack files under `blobs/` and `objects/`
-- `db gc [--prune] [--grace-secs <n>]` — reclaim objects unreachable from any ref; **dry-run by default**, `--prune` deletes. `--grace-secs` (default `3600`) protects objects modified that recently, so in-flight writes aren't swept.
-
-Backup and transport (single self-contained file):
-
-- `db pack <out> [--compress]` — export the whole DB to one file; `--compress` zstd-frames the stream
-- `db unpack <input> [--force] [--verify-only]` — restore a DB from a pack; `--verify-only` checks integrity/structure without writing
-- `db reencrypt [--new-password-env <VAR>]` — rotate the encryption key
-
-Global flags:
-
-- `--db <path>` (default: `./neleus_db`)
-- `--json` machine-readable output
-
-## Public Rust API
-
-- `hash` - `Hash`, domain-separated hashing helpers
-- `blob_store` - immutable content-addressed blobs
-- `manifest` - typed manifests + deterministic chunking
-- `state` - segmented persistent KV + proofs + compaction
-- `commit` - commit objects + signing/verifier hooks
-- `refs` - atomic refs and staged roots
-- `db` - open/init, schema migration, WAL recovery orchestration, `repack`
-- `index` - derived semantic/vector index build and query
-- `packstore` - loose-object consolidation into pack files + pack-aware reads
-- `gc` - reachability mark-and-sweep (fail-closed) over commits, state, and manifests
-- `pack` - single-file whole-DB backup/restore with integrity footer
-
-## Data layout
-
-```text
-<db_root>/
-  blobs/aa/bb/<fullhash>          # loose objects (sharded by hash prefix)
-  blobs/pack/pack-<id>.{pack,idx} # consolidated objects after `db repack`
-  objects/cc/dd/<fullhash>
-  objects/pack/pack-<id>.{pack,idx}
-  refs/heads/<name>
-  refs/states/<name>
-  index/<commit_hash>/search_index.json
-  wal/*.wal
-  meta/config.json
-```
-
-Reads check the loose path first, then fall back to packs. `db repack` moves
-loose objects into a pack and removes the loose copies; `db gc --prune` drops
-objects unreachable from any ref (sweeping loose files and rewriting packs).
-Both store the verbatim on-disk bytes, so packing/GC need no encryption password.
-
-## Integrity and determinism
-
-Hash domains:
-
-- `H_blob = blake3("blob:" || bytes)`
-- `H_manifest = blake3("manifest:" || dag_cbor_bytes)`
-- `H_state_node = blake3("state_node:" || dag_cbor_bytes)`
-- `H_commit = blake3("commit:" || dag_cbor_bytes)`
-- `H_state_leaf = blake3("state_leaf:" || leaf_encoding)`
-- `H_merkle_node = blake3("merkle_node:" || left || right)`
-
-Canonical encoding:
-
-- DAG-CBOR via `serde_ipld_dagcbor`
-- deterministic bytes locked with golden tests in `src/canonical.rs`
-
-## Reliability and security
-
-- atomic temp-write + rename for persistent files
-- structured WAL with replay/rollback during `Database::open`
-- lock files for ref/state mutation safety across processes
-- optional verify-on-read mode for blobs and typed objects
-- authenticated encryption support for persisted payloads
-
-When encryption is enabled, **blobs and objects** are encrypted at rest with the configured
-algorithm (AES-256-GCM or ChaCha20-Poly1305). WAL files, search indexes, metadata, and key
-paths have separate leakage considerations — review the security notes before using this with
-sensitive data in regulated environments.
-
-To enable encryption, set `meta/config.json` with an enabled encryption block and provide
-`NELEUS_DB_ENCRYPTION_PASSWORD` when running the CLI.
-
-Example config snippet:
-
-```json
-{
-  "schema_version": 3,
-  "hashing": "blake3",
-  "verify_on_read": true,
-  "encryption": {
-    "enabled": true,
-    "algorithm": "aes-256-gcm",
-    "kdf_iterations": 600000
-  }
-}
-```
-
-`master_salt` is generated automatically on the first open of an encryption-enabled database and added to `config.json`. Do not edit or rotate it manually — every existing ciphertext on disk depends on it. Rotate the *password* via `Database::rotate_encryption_key` instead. The AEAD parameters (key size, nonce size, per-blob salt size) are not user-configurable; they are fixed by the algorithm choice.
-
-## Testing
+### Server mode
 
 ```bash
-cargo test
+ndb auth add-key --id ci --role admin            # token printed once
+ndb serve --addr 127.0.0.1:7117                  # loopback; TLS-terminate in front for remote
+curl -H "Authorization: Bearer nlk_..." -d '{"at":"main","query":"reset policy"}' \
+     http://127.0.0.1:7117/v1/search
 ```
 
-The suite covers determinism, state semantics, proof verification/tampering, WAL recovery, integrity checks, compaction behavior, and CLI-facing flows.
+Tenant keys (`auth add-key --tenant acme`) are hard-partitioned: they can
+only touch heads under `acme/`, every search is forced to their tenant
+filter, and raw blob/replication endpoints are unreachable.
 
-## Python SDK
+### Web console + policy enforcement
 
-Copy `sdk/python/neleus.py` alongside your project and add the neleus-db binary to `PATH`:
+`serve` bundles a web console into the binary — like a database that ships its
+own admin UI. One command, no Node, no CORS:
+
+```bash
+ndb serve --open                                 # boots engine + console at http://127.0.0.1:7117/
+```
+
+On loopback it mints a one-time bootstrap admin token so localhost just works.
+The console is the policy surface: the audit log, proof inspector, and the
+**policy** views.
+
+Neleus is a policy *enforcer*, not just a store of compliance reports. Declare
+rules as code and the server refuses the write that would violate them:
+
+```bash
+ndb policy set policy.json    # e.g. require-encryption-at-rest / retention-floor / require-principal (enforce)
+ndb policy eval               # score every rule against live state
+ndb events list               # tamper-evident, hash-chained violation log
+```
+
+Violations append to a hash-chained event log, stream to the console's live
+Monitor, and can fire a webhook. See [docs/policy.md](docs/policy.md).
+
+### Replication
+
+```bash
+NELEUS_DB_TOKEN=nlk_... ndb db pull --remote http://primary:7117
+NELEUS_DB_TOKEN=nlk_... ndb db push --remote http://replica:7117
+```
+
+Fast-forward only; checkpoint chains merge with the same rule.
+
+## SDKs
+
+Under `sdk/`. Pick by language and by whether the database is in-process or
+remote.
+
+| SDK | Transport | Use when |
+|---|---|---|
+| [`sdk/python-native`](sdk/python-native) | **Embedded** (PyO3) | the database runs *in* your Python process — fastest, no network |
+| [`sdk/python`](sdk/python) | HTTP / CLI | Python talking to a remote `serve` (stdlib-only) |
+| [`sdk/typescript`](sdk/typescript) | HTTP (`fetch`) | Node 18+ or browser clients |
+| [`sdk/rust`](sdk/rust) | HTTP (std-only) | Rust clients of a remote `serve` |
+
+The Rust crate itself (`neleus_db::Engine`) is the embedded path for Rust.
+Every SDK covers the same surface — ingest, hybrid search, proofs, sessions,
+audit export, and run-capture:
 
 ```python
-import neleus
-
-with neleus.run(
-    db="./neleus_db",
-    provider="anthropic",
-    model="claude-sonnet-4-6",
-    agent_id="policy-reviewer-v1",
-    model_parameters={"max_tokens": 1024, "temperature": 0.0},
-) as run:
-    run.system_prompt("You are a policy analyst.")
-    run.prompt(user_question)
-    run.retrieved_chunks(chunk_hashes)   # RAG audit link
-
-    response = anthropic_client.messages.create(...)
-
-    run.output(response.content[0].text)
-# auto-commits here — every input, chunk, and output is content-addressed
+# native, in-process
+import neleus_native as n
+db = n.Neleus("./agent_db")
+_, commit = db.put_document("main", "kb.md", open("kb.md").read())
+hits = db.search("main", "reset policy", mode="hybrid", top_k=5)
+assert db.verify_proof(db.prove(commit, hits[0]["chunk"]))["valid"]
 ```
 
-See [`examples/06_claude_run.py`](examples/06_claude_run.py) for a full working example.
+```ts
+// TypeScript, over HTTP
+import { connect } from "@neleus/client";
+const c = connect("neleus://nlk_...@127.0.0.1:7117");
+const res = await c.search("main", { query: "reset policy", audit: true });
+const proof = await c.prove(res.commit, res.hits[0].chunk);
+console.assert((await c.verify(proof)).valid);
+```
 
-## Integration guide
+Each SDK has its own README and a real test suite (the Rust and TS suites
+spin up a server; the native suite runs in-process).
 
-See `INTEGRATION.md` for Rust embedding patterns and CLI-based integration examples for TypeScript/JavaScript, Go, and Python.
+## Architecture
 
-## Design document
+```text
+canonical (immutable, verifiable)        serving (derived, fast, rebuildable)
+─────────────────────────────────        ────────────────────────────────────
+blobs/    content-addressed bytes        index/segments/  BM25 + HNSW + metadata
+objects/  manifests, state, commits  →   index/heads/     segment set per commit
+refs/     heads, staged state,           in-memory caches: segments, state,
+          checkpoint chains                               blobs (byte-budgeted)
+```
 
-See `DESIGN.md` for details on Merkle model, proof format, and recovery behavior.
+Hash domains: `blob:`, `manifest:`, `state_node:`, `commit:`, `checkpoint:`,
+`state_leaf:`, `merkle_node:`, `commit_payload:`, `checkpoint_payload:` —
+all BLAKE3 over canonical DAG-CBOR. Golden-byte tests lock the encodings.
 
-## Contributing
+The serving plane is never hashed into identity: delete `index/` and lose
+nothing but warm-up time.
 
-1. Open an issue describing the behavior or change.
-2. Add tests with the change.
-3. Keep object encoding/hash behavior backward compatible unless schema migration is included.
+## Security model
+
+| Layer | Mechanism |
+|---|---|
+| At rest | AES-256-GCM / ChaCha20-Poly1305 per object; Argon2id (19 MiB, t=2) master key; per-object HKDF keys; key rotation |
+| In transit | server is loopback-only unless `--allow-remote` + keys; TLS terminates in front (no in-process TLS by design) |
+| AuthN | `nlk_` bearer tokens, BLAKE3-hashed at rest, constant-time compare, instant revocation |
+| AuthZ | reader < writer < admin; tenant keys hard-partitioned structurally |
+| Tamper evidence | content addressing + signed commits + checkpoint chains + offline proofs |
+| Memory hygiene | keys zeroized on drop; 0600 key files; secrets never logged or stored |
+| Durability | `os` (crash-safe, fast) / `full` (power-loss durable) per database |
+
+## Testing & benchmarks
+
+```bash
+cargo test            # 278 tests: determinism, proofs, recovery, tenancy,
+                      # HNSW recall >= 0.90 vs exact oracle, end-to-end HTTP
+cargo bench --bench compare_sql   # vs SQLite on your machine
+cargo bench --bench scale         # 100k chunks, 1536d vectors, coalesced writes
+```
+
+See [BENCHMARKS.md](BENCHMARKS.md) for measured results and market context.
+
+## Audit
+
+Every audited retrieval becomes a signed, offline-verifiable record:
+
+```bash
+ndb audit export --head main --out q1.nelaudit --sign-key agent.key
+neleus-verify q1.nelaudit --public-key <hex>       # offline, no Neleus needed
+```
+
+## Docs
+
+- [INTEGRATION.md](INTEGRATION.md) — wire neleus into an agent: the six-step flow in every language
+- [docs/getting-started.md](docs/getting-started.md) — zero to verifiable memory in one page
+- [docs/concepts.md](docs/concepts.md) — content addressing, commits, checkpoints, proofs, the two planes
+- [docs/cli.md](docs/cli.md) — every command, with flags
+- [docs/http-api.md](docs/http-api.md) — server endpoint reference, auth, CORS, tenancy
+- [docs/security.md](docs/security.md) — threat model and controls
+- [DESIGN.md](DESIGN.md) — Merkle model, storage planes, recovery
+- [BENCHMARKS.md](BENCHMARKS.md) — measured numbers and the verifiability gap
+- [CONTRIBUTING.md](CONTRIBUTING.md) — the byte-format rule and the test bar
 
 ## License
 
-MIT
+neleus-db is source-available under [PolyForm Noncommercial 1.0.0](LICENSE):
+use it, modify it, and redistribute it freely for any noncommercial purpose.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commercial
+use requires a separate license from the maintainer; open an issue to ask.

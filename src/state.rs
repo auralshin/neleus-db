@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
@@ -6,96 +5,77 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::blob_store::BlobStore;
-use crate::canonical::from_cbor;
-use crate::hash::{Hash, hash_typed};
-use crate::merkle::{
-    MerkleLeaf, MerkleProof, prove_inclusion, root as merkle_root, verify_inclusion,
-};
+use crate::canonical::{from_cbor, to_cbor};
+use crate::hash::{Hash, hash_blob, hash_typed};
 use crate::object_store::ObjectStore;
-use crate::wal::{Wal, WalOp};
 
 const STATE_TAG: &[u8] = b"state_node:";
-const STATE_LEAF_TAG: &[u8] = b"state_leaf:";
-const STATE_MANIFEST_LEAF_TAG: &[u8] = b"state_manifest_leaf:";
-const STATE_SCHEMA_VERSION: u32 = 1;
+const LEVEL_TAG: &[u8] = b"state_level:";
+const STATE_SCHEMA_VERSION: u32 = 3;
+
+/// Fanout knob: a key is a boundary at level L iff `key_level(key) > L`, and
+/// `key_level` counts leading zero bits of `hash(key)` in groups of this many
+/// bits. 5 bits ⇒ boundary probability 1/32 per level ⇒ average fanout 32 ⇒
+/// depth ~log32(n) (≈4 for millions of keys). Bigger ⇒ shallower reads, wider
+/// proofs.
+const BITS_PER_LEVEL: u32 = 5;
+
+/// Height cap. The level rule is content-defined, so an adversarial key set
+/// could otherwise inflate height; capping bounds it (and guarantees the
+/// bottom-up build terminates). Far above any non-adversarial tree.
+const MAX_LEVEL: u32 = 16;
 
 pub type StateRoot = Hash;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueRef {
+    /// Blob ref for values above [`INLINE_VALUE_MAX`] (dedup pays for the file).
     Value(Hash),
-    Tombstone,
+    /// Small values stored in the node: no per-value blob file, no blob read.
+    Inline(Vec<u8>),
+}
+
+/// A content-addressed prolly-tree (Merkle Search Tree) node. Leaves hold the
+/// key/value entries; branches route by `last_key` (the largest key in each
+/// child subtree). Children are referenced by content hash, so a node's hash
+/// transitively commits to its whole subtree — the tree is its own Merkle
+/// commitment. Boundaries derive from `key_level`, so the shape is a pure
+/// function of the key set (history independent ⇒ canonical root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeItems {
+    Leaf(Vec<(Vec<u8>, ValueRef)>),
+    Branch(Vec<(Vec<u8>, Hash)>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SegmentEntry {
-    pub key: Vec<u8>,
-    pub value: ValueRef,
+pub struct StateNode {
+    pub level: u32,
+    pub items: NodeItems,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StateSegment {
-    pub schema_version: u32,
-    pub entries: Vec<SegmentEntry>,
-    pub merkle_root: Hash,
-}
-
+/// State version anchor. `root` is the content hash of the trie root node, or
+/// `None` for the empty state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateManifest {
     pub schema_version: u32,
-    pub segments: Vec<Hash>, // newest first
-    pub segments_merkle_root: Hash,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryProof {
-    pub entry: SegmentEntry,
-    pub proof: MerkleProof,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NonInclusionProof {
-    pub insertion_index: usize,
-    pub left: Option<EntryProof>,
-    pub right: Option<EntryProof>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SegmentKeyProof {
-    Inclusion(EntryProof),
-    NonInclusion(NonInclusionProof),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SegmentVerdict {
-    Value(Hash),
-    Tombstone,
-    NotPresent,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SegmentScanProof {
-    pub segment_hash: Hash,
-    pub manifest_proof: MerkleProof,
-    pub segment_merkle_root: Hash,
-    pub segment_leaf_count: usize,
-    pub key_proof: SegmentKeyProof,
-    pub verdict: SegmentVerdict,
+    pub root: Option<Hash>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateOutcome {
     Found(Hash),
-    Deleted,
     Missing,
 }
 
+/// A single root→leaf search path. Each element is the actual node on the
+/// path; its content hash is recomputed and checked against the parent's
+/// routing pointer, anchoring the path to the state root. Length is the tree
+/// height — O(log_B n).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateProof {
     pub manifest_schema_version: u32,
-    pub manifest_segment_count: usize,
-    pub manifest_segments_root: Hash,
-    pub scans: Vec<SegmentScanProof>,
+    pub root: Option<Hash>,
+    pub path: Vec<StateNode>,
     pub outcome: StateOutcome,
 }
 
@@ -103,21 +83,41 @@ pub struct StateProof {
 pub struct StateStore {
     objects: ObjectStore,
     blobs: BlobStore,
-    wal: Wal,
-    /// Cached hash of the empty manifest. Computed and stored on first call;
-    /// subsequent calls return the hash without touching disk. Shared across
-    /// all clones of this `StateStore` so different `Database` views share
-    /// the cache.
     empty_root: Arc<OnceLock<StateRoot>>,
+    node_cache: Arc<std::sync::RwLock<std::collections::HashMap<Hash, Arc<StateNode>>>>,
+    manifest_cache:
+        Arc<std::sync::RwLock<std::collections::HashMap<StateRoot, Arc<StateManifest>>>>,
 }
 
+/// Cache entry cap; overflow clears (perf reset, never a correctness event).
+const STATE_CACHE_CAP: usize = 8192;
+
+/// Values at or below this many bytes are stored inline in the node.
+pub const INLINE_VALUE_MAX: usize = 512;
+
 impl StateStore {
-    pub fn new(objects: ObjectStore, blobs: BlobStore, wal: Wal) -> Self {
+    pub fn new(objects: ObjectStore, blobs: BlobStore) -> Self {
         Self {
             objects,
             blobs,
-            wal,
             empty_root: Arc::new(OnceLock::new()),
+            node_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            manifest_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    fn encode_value(&self, value: &[u8]) -> Result<ValueRef> {
+        if value.len() <= INLINE_VALUE_MAX {
+            Ok(ValueRef::Inline(value.to_vec()))
+        } else {
+            Ok(ValueRef::Value(self.blobs.put(value)?))
+        }
+    }
+
+    fn read_value(&self, value: &ValueRef) -> Result<Vec<u8>> {
+        match value {
+            ValueRef::Value(h) => self.blobs.get(*h),
+            ValueRef::Inline(bytes) => Ok(bytes.clone()),
         }
     }
 
@@ -125,639 +125,643 @@ impl StateStore {
         if let Some(cached) = self.empty_root.get() {
             return Ok(*cached);
         }
-        let empty = new_state_manifest(vec![]);
-        let root = self.store_manifest(&empty)?;
-        // `set` returns Err if another thread won the race; either way the
-        // cached value is now Some, so we just read it back.
+        let root = self.store_manifest(&new_state_manifest(None))?;
         let _ = self.empty_root.set(root);
         Ok(*self.empty_root.get().unwrap_or(&root))
     }
 
     pub fn get(&self, root: StateRoot, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let manifest = self.load_manifest_or_empty(root)?;
-        for segment_hash in &manifest.segments {
-            let segment = self.load_segment(*segment_hash)?;
-            match find_key(&segment.entries, key) {
-                Ok(idx) => match segment.entries[idx].value {
-                    ValueRef::Value(value_hash) => return Ok(Some(self.blobs.get(value_hash)?)),
-                    ValueRef::Tombstone => return Ok(None),
-                },
-                Err(_) => continue,
+        let mut cursor = manifest.root;
+        while let Some(hash) = cursor {
+            let node = self.load_node(hash)?;
+            match &node.items {
+                NodeItems::Leaf(entries) => {
+                    return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                        Ok(i) => Ok(Some(self.read_value(&entries[i].1)?)),
+                        Err(_) => Ok(None),
+                    };
+                }
+                NodeItems::Branch(entries) => {
+                    cursor = Some(entries[route(entries, key)].1);
+                }
             }
         }
         Ok(None)
     }
 
     pub fn set(&self, root: StateRoot, key: &[u8], value: &[u8]) -> Result<StateRoot> {
-        let wal_path =
-            self.wal
-                .begin_entry(&Wal::make_state_entry(WalOp::StateSet, root, key.len()))?;
-
-        let result = (|| {
-            let manifest = self.load_manifest_or_empty(root)?;
-            let value_hash = self.blobs.put(value)?;
-            let segment = StateSegment::from_entries(vec![SegmentEntry {
-                key: key.to_vec(),
-                value: ValueRef::Value(value_hash),
-            }])?;
-            let segment_hash = self.store_segment(&segment)?;
-            let new_manifest =
-                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
-            self.store_manifest(&new_manifest)
-        })();
-
-        if result.is_ok() {
-            self.wal.end(&wal_path)?;
-        }
-        result
+        let manifest = self.load_manifest_or_empty(root)?;
+        let value = self.encode_value(value)?;
+        let new_root = match manifest.root {
+            None => self.build_from_sorted(vec![(key.to_vec(), value)])?,
+            Some(h) => {
+                let level = self.load_node(h)?.level;
+                let entries = self.insert_into(h, key, value)?;
+                Some(self.finish_root(entries, level)?)
+            }
+        };
+        self.store_manifest(&new_state_manifest(new_root))
     }
 
     pub fn del(&self, root: StateRoot, key: &[u8]) -> Result<StateRoot> {
-        let wal_path =
-            self.wal
-                .begin_entry(&Wal::make_state_entry(WalOp::StateDel, root, key.len()))?;
-
-        let result = (|| {
-            let manifest = self.load_manifest_or_empty(root)?;
-            let segment = StateSegment::from_entries(vec![SegmentEntry {
-                key: key.to_vec(),
-                value: ValueRef::Tombstone,
-            }])?;
-            let segment_hash = self.store_segment(&segment)?;
-            let new_manifest =
-                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
-            self.store_manifest(&new_manifest)
-        })();
-
-        if result.is_ok() {
-            self.wal.end(&wal_path)?;
-        }
-        result
+        let manifest = self.load_manifest_or_empty(root)?;
+        let new_root = match manifest.root {
+            None => None,
+            Some(h) => {
+                let level = self.load_node(h)?.level;
+                let entries = self.delete_from(h, key)?;
+                if entries.is_empty() {
+                    None
+                } else {
+                    Some(self.finish_root(entries, level)?)
+                }
+            }
+        };
+        self.store_manifest(&new_state_manifest(new_root))
     }
 
-    /// Set multiple key-value pairs atomically in a single segment.
-    /// Duplicate keys are resolved last-write-wins (stable sort preserves order,
-    /// then dedup keeps the last occurrence so the caller's ordering matters).
+    /// Set multiple key-value pairs in one new state version. Last write wins.
     pub fn set_many(&self, root: StateRoot, pairs: &[(&[u8], &[u8])]) -> Result<StateRoot> {
         if pairs.is_empty() {
             return Ok(root);
         }
-
-        let wal_path =
-            self.wal
-                .begin_entry(&Wal::make_state_entry(WalOp::StateSet, root, pairs.len()))?;
-
-        let result = (|| {
-            let manifest = self.load_manifest_or_empty(root)?;
-
-            // Deduplicate: last occurrence for each key wins.
-            let mut deduped: BTreeMap<Vec<u8>, &[u8]> = BTreeMap::new();
-            for (k, v) in pairs {
-                deduped.insert(k.to_vec(), v);
-            }
-
-            let mut entries = Vec::with_capacity(deduped.len());
-            for (key, value) in deduped {
-                let value_hash = self.blobs.put(value)?;
-                entries.push(SegmentEntry {
-                    key,
-                    value: ValueRef::Value(value_hash),
-                });
-            }
-
-            let segment = StateSegment::from_entries(entries)?;
-            let segment_hash = self.store_segment(&segment)?;
-            let new_manifest =
-                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
-            self.store_manifest(&new_manifest)
-        })();
-
-        if result.is_ok() {
-            self.wal.end(&wal_path)?;
+        let mut deduped: BTreeMap<Vec<u8>, &[u8]> = BTreeMap::new();
+        for (k, v) in pairs {
+            deduped.insert(k.to_vec(), v);
         }
-        result
+        let ops: Vec<(Vec<u8>, Option<&[u8]>)> =
+            deduped.into_iter().map(|(k, v)| (k, Some(v))).collect();
+        self.apply_batch(root, ops)
     }
 
-    /// Delete multiple keys atomically in a single tombstone segment.
+    /// Delete multiple keys in one new state version.
     pub fn del_many(&self, root: StateRoot, keys: &[&[u8]]) -> Result<StateRoot> {
         if keys.is_empty() {
             return Ok(root);
         }
-
-        let wal_path =
-            self.wal
-                .begin_entry(&Wal::make_state_entry(WalOp::StateDel, root, keys.len()))?;
-
-        let result = (|| {
-            let manifest = self.load_manifest_or_empty(root)?;
-
-            // Deduplicate keys via BTreeSet.
-            let mut unique: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
-            for k in keys {
-                unique.insert(k.to_vec());
-            }
-
-            let entries = unique
-                .into_iter()
-                .map(|key| SegmentEntry {
-                    key,
-                    value: ValueRef::Tombstone,
-                })
-                .collect();
-
-            let segment = StateSegment::from_entries(entries)?;
-            let segment_hash = self.store_segment(&segment)?;
-            let new_manifest =
-                new_state_manifest(prepend_segment(segment_hash, &manifest.segments));
-            self.store_manifest(&new_manifest)
-        })();
-
-        if result.is_ok() {
-            self.wal.end(&wal_path)?;
+        let mut deduped: BTreeMap<Vec<u8>, Option<&[u8]>> = BTreeMap::new();
+        for k in keys {
+            deduped.insert(k.to_vec(), None);
         }
-        result
+        self.apply_batch(root, deduped.into_iter().collect())
     }
 
-    pub fn compact(&self, root: StateRoot) -> Result<StateRoot> {
-        let wal_path =
-            self.wal
-                .begin_entry(&Wal::make_state_entry(WalOp::StateCompact, root, 0))?;
+    /// Mixed sets and deletes in one new state version. `None` value = delete.
+    /// Last occurrence per key wins. The coalescer's flush primitive.
+    pub fn write_many(&self, root: StateRoot, ops: &[(&[u8], Option<&[u8]>)]) -> Result<StateRoot> {
+        if ops.is_empty() {
+            return Ok(root);
+        }
+        let mut deduped: BTreeMap<Vec<u8>, Option<&[u8]>> = BTreeMap::new();
+        for (k, v) in ops {
+            deduped.insert(k.to_vec(), *v);
+        }
+        self.apply_batch(root, deduped.into_iter().collect())
+    }
 
-        let result = (|| {
-            let manifest = self.load_manifest_or_empty(root)?;
-            let mut visible: BTreeMap<Vec<u8>, ValueRef> = BTreeMap::new();
-
-            for segment_hash in &manifest.segments {
-                let segment = self.load_segment(*segment_hash)?;
-                for entry in segment.entries {
-                    visible.entry(entry.key).or_insert(entry.value);
+    /// Apply a sorted, deduped batch. An empty base bulk-builds the canonical
+    /// tree in one pass (each node written once); a populated base folds
+    /// incremental inserts/deletes.
+    fn apply_batch(
+        &self,
+        root: StateRoot,
+        ops: Vec<(Vec<u8>, Option<&[u8]>)>,
+    ) -> Result<StateRoot> {
+        let manifest = self.load_manifest_or_empty(root)?;
+        if manifest.root.is_none() {
+            let mut entries = Vec::new();
+            for (key, value) in ops {
+                if let Some(bytes) = value {
+                    entries.push((key, self.encode_value(bytes)?));
                 }
             }
-
-            let merged_entries: Vec<SegmentEntry> = visible
-                .into_iter()
-                .filter_map(|(key, value)| match value {
-                    ValueRef::Value(h) => Some(SegmentEntry {
-                        key,
-                        value: ValueRef::Value(h),
-                    }),
-                    ValueRef::Tombstone => None,
-                })
-                .collect();
-
-            if merged_entries.is_empty() {
-                return self.store_manifest(&new_state_manifest(vec![]));
-            }
-
-            let merged_segment = StateSegment::from_entries(merged_entries)?;
-            let merged_hash = self.store_segment(&merged_segment)?;
-            self.store_manifest(&new_state_manifest(vec![merged_hash]))
-        })();
-
-        if result.is_ok() {
-            self.wal.end(&wal_path)?;
+            let new_root = self.build_from_sorted(entries)?;
+            return self.store_manifest(&new_state_manifest(new_root));
         }
+        let mut cur = manifest.root;
+        for (key, value) in ops {
+            cur = match (cur, value) {
+                (None, Some(bytes)) => {
+                    let v = self.encode_value(bytes)?;
+                    self.build_from_sorted(vec![(key, v)])?
+                }
+                (None, None) => None,
+                (Some(h), Some(bytes)) => {
+                    let v = self.encode_value(bytes)?;
+                    let level = self.load_node(h)?.level;
+                    let entries = self.insert_into(h, &key, v)?;
+                    Some(self.finish_root(entries, level)?)
+                }
+                (Some(h), None) => {
+                    let level = self.load_node(h)?.level;
+                    let entries = self.delete_from(h, &key)?;
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some(self.finish_root(entries, level)?)
+                    }
+                }
+            };
+        }
+        self.store_manifest(&new_state_manifest(cur))
+    }
 
-        result
+    /// The tree is always canonical (shape is a pure function of the key set),
+    /// so compaction is a no-op kept for API/callsite stability.
+    pub fn compact(&self, root: StateRoot) -> Result<StateRoot> {
+        self.load_manifest_or_empty(root)?;
+        Ok(root)
+    }
+
+    /// Visible keys under `prefix` with value commitments, BST-sorted.
+    pub fn scan_prefix(&self, root: StateRoot, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let manifest = self.load_manifest_or_empty(root)?;
+        let mut out = Vec::new();
+        if let Some(h) = manifest.root {
+            let upper = prefix_upper(prefix);
+            self.collect_prefix(h, prefix, upper.as_deref(), None, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    fn collect_prefix(
+        &self,
+        node_hash: Hash,
+        prefix: &[u8],
+        upper: Option<&[u8]>,
+        lower: Option<&[u8]>,
+        out: &mut Vec<(Vec<u8>, Hash)>,
+    ) -> Result<()> {
+        let node = self.load_node(node_hash)?;
+        match &node.items {
+            NodeItems::Leaf(entries) => {
+                for (k, v) in entries {
+                    if k.starts_with(prefix) {
+                        out.push((k.clone(), value_commit(v)));
+                    }
+                }
+            }
+            NodeItems::Branch(entries) => {
+                let mut lo = lower;
+                for (last_key, child) in entries {
+                    // Child covers keys in (lo, last_key]. Descend only if that
+                    // range can intersect [prefix, upper).
+                    let above_start = last_key.as_slice() >= prefix;
+                    let below_end = match (lo, upper) {
+                        (Some(l), Some(u)) => l < u,
+                        _ => true,
+                    };
+                    if above_start && below_end {
+                        self.collect_prefix(*child, prefix, upper, lo, out)?;
+                    }
+                    lo = Some(last_key.as_slice());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn proof(&self, root: StateRoot, key: &[u8]) -> Result<StateProof> {
         let manifest = self.load_manifest_or_empty(root)?;
-        let manifest_leaves = manifest_segment_leaves(&manifest.segments);
-
-        let mut scans = Vec::new();
+        let mut path = Vec::new();
+        let mut cursor = manifest.root;
         let mut outcome = StateOutcome::Missing;
-
-        for (idx, segment_hash) in manifest.segments.iter().enumerate() {
-            let segment = self.load_segment(*segment_hash)?;
-            let manifest_proof = prove_inclusion(&manifest_leaves, idx)
-                .ok_or_else(|| anyhow!("failed to build manifest inclusion proof"))?;
-            let scan = build_segment_scan(*segment_hash, segment, manifest_proof, key)?;
-
-            match scan.verdict {
-                SegmentVerdict::Value(h) => {
-                    scans.push(scan);
-                    outcome = StateOutcome::Found(h);
+        while let Some(hash) = cursor {
+            let node = self.load_node(hash)?;
+            path.push((*node).clone());
+            match &node.items {
+                NodeItems::Leaf(entries) => {
+                    if let Ok(i) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                        outcome = StateOutcome::Found(value_commit(&entries[i].1));
+                    }
                     break;
                 }
-                SegmentVerdict::Tombstone => {
-                    scans.push(scan);
-                    outcome = StateOutcome::Deleted;
-                    break;
+                NodeItems::Branch(entries) => {
+                    cursor = Some(entries[route(entries, key)].1);
                 }
-                SegmentVerdict::NotPresent => scans.push(scan),
             }
         }
-
         Ok(StateProof {
             manifest_schema_version: manifest.schema_version,
-            manifest_segment_count: manifest.segments.len(),
-            manifest_segments_root: manifest.segments_merkle_root,
-            scans,
+            root: manifest.root,
+            path,
             outcome,
         })
     }
 
+    /// Verify a proof against the state `root`, from the root hash alone: each
+    /// path node's content hash is recomputed and checked against its parent's
+    /// routing pointer, and the routing at every branch must match `key`, so
+    /// the path is provably the search path and the prover cannot hide a
+    /// present key or invent an absent one.
     pub fn verify_proof(&self, root: StateRoot, key: &[u8], proof: &StateProof) -> bool {
         let manifest = match self.load_manifest_or_empty(root) {
             Ok(m) => m,
             Err(_) => return false,
         };
-
         if proof.manifest_schema_version != manifest.schema_version {
             return false;
         }
-        if proof.manifest_segment_count != manifest.segments.len() {
+        if proof.root != manifest.root {
             return false;
         }
-        if proof.manifest_segments_root != manifest.segments_merkle_root {
+        if manifest.root.is_none() {
+            return proof.path.is_empty() && proof.outcome == StateOutcome::Missing;
+        }
+        if proof.path.is_empty() {
             return false;
         }
-        if proof.scans.len() > manifest.segments.len() {
+        let hashes: Vec<Hash> = match proof
+            .path
+            .iter()
+            .map(node_hash)
+            .collect::<Result<Vec<Hash>>>()
+        {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if Some(hashes[0]) != manifest.root {
             return false;
         }
 
-        let mut computed_outcome = StateOutcome::Missing;
-        let mut terminal = None;
-
-        for (idx, scan) in proof.scans.iter().enumerate() {
-            if manifest.segments.get(idx).copied() != Some(scan.segment_hash) {
-                return false;
-            }
-
-            if scan.manifest_proof.index != idx {
-                return false;
-            }
-
-            let leaf = manifest_segment_leaf(scan.segment_hash);
-            if !verify_inclusion(manifest.segments_merkle_root, leaf, &scan.manifest_proof) {
-                return false;
-            }
-
-            let segment = match self.load_segment(scan.segment_hash) {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-
-            if segment.merkle_root != scan.segment_merkle_root {
-                return false;
-            }
-            if segment.entries.len() != scan.segment_leaf_count {
-                return false;
-            }
-            if !segment_is_sorted_unique(&segment.entries) {
-                return false;
-            }
-
-            let verdict_terminal = match &scan.key_proof {
-                SegmentKeyProof::Inclusion(ep) => {
-                    if ep.entry.key.as_slice() != key {
+        for i in 0..proof.path.len() {
+            let node = &proof.path[i];
+            let last = i + 1 == proof.path.len();
+            match &node.items {
+                NodeItems::Leaf(entries) => {
+                    if !last || !leaf_sorted_unique(entries) {
                         return false;
                     }
-                    if !verify_entry_proof(&segment, ep) {
+                    return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                        Ok(j) => proof.outcome == StateOutcome::Found(value_commit(&entries[j].1)),
+                        Err(_) => proof.outcome == StateOutcome::Missing,
+                    };
+                }
+                NodeItems::Branch(entries) => {
+                    if last || entries.is_empty() || !branch_sorted_unique(entries) {
                         return false;
                     }
-                    match ep.entry.value {
-                        ValueRef::Value(h) => {
-                            if scan.verdict != SegmentVerdict::Value(h) {
-                                return false;
-                            }
-                            Some(StateOutcome::Found(h))
-                        }
-                        ValueRef::Tombstone => {
-                            if scan.verdict != SegmentVerdict::Tombstone {
-                                return false;
-                            }
-                            Some(StateOutcome::Deleted)
-                        }
-                    }
-                }
-                SegmentKeyProof::NonInclusion(np) => {
-                    if scan.verdict != SegmentVerdict::NotPresent {
+                    if entries[route(entries, key)].1 != hashes[i + 1] {
                         return false;
                     }
-                    if !verify_non_inclusion(&segment, key, np) {
-                        return false;
-                    }
-                    None
-                }
-            };
-
-            if let Some(outcome) = verdict_terminal {
-                terminal = Some(idx);
-                computed_outcome = outcome;
-                break;
-            }
-        }
-
-        match terminal {
-            Some(i) => {
-                if proof.scans.len() != i + 1 {
-                    return false;
                 }
             }
-            None => {
-                if proof.scans.len() != manifest.segments.len() {
-                    return false;
-                }
-                computed_outcome = StateOutcome::Missing;
-            }
         }
-
-        computed_outcome == proof.outcome
+        false
     }
 
-    fn load_manifest_or_empty(&self, root: StateRoot) -> Result<StateManifest> {
-        if self.objects.exists(root) {
-            return self.load_manifest(root);
-        }
-
-        let empty_root = self.empty_root()?;
-        if root == empty_root {
-            return Ok(new_state_manifest(vec![]));
-        }
-
-        Err(anyhow!("state root {} not found", root))
-    }
-
-    fn store_manifest(&self, manifest: &StateManifest) -> Result<StateRoot> {
-        self.objects.put_serialized(STATE_TAG, manifest)
-    }
-
-    fn load_manifest(&self, hash: StateRoot) -> Result<StateManifest> {
-        let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
-        let computed = hash_typed(STATE_TAG, &bytes);
-        if computed != hash {
-            return Err(anyhow!("manifest hash mismatch for {}", hash));
-        }
-        let manifest: StateManifest = from_cbor(&bytes)?;
-        Ok(manifest)
-    }
-
-    fn store_segment(&self, segment: &StateSegment) -> Result<Hash> {
-        self.objects.put_serialized(STATE_TAG, segment)
-    }
-
-    fn load_segment(&self, hash: Hash) -> Result<StateSegment> {
-        let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
-        let computed = hash_typed(STATE_TAG, &bytes);
-        if computed != hash {
-            return Err(anyhow!("segment hash mismatch for {}", hash));
-        }
-        let segment: StateSegment = from_cbor(&bytes)?;
-        Ok(segment)
-    }
-
-    /// Every hash reachable from state `root`: the manifest, its segments, and
-    /// each live entry's value blob. GC asks the state store rather than
-    /// re-deriving the DAG shape.
+    /// Every hash reachable from state `root`: the manifest, its nodes, and
+    /// each entry's value blob. GC asks the state store rather than re-deriving
+    /// the DAG shape.
     pub fn reachable_from(&self, root: StateRoot) -> Result<Vec<Hash>> {
         let manifest = self.load_manifest_or_empty(root)?;
         let mut out = Vec::new();
-        // Unmaterialized empty root has no object on disk.
         if self.objects.exists(root) {
             out.push(root);
         }
-        for seg_hash in &manifest.segments {
-            out.push(*seg_hash);
-            let segment = self.load_segment(*seg_hash)?;
-            for entry in &segment.entries {
-                if let ValueRef::Value(h) = &entry.value {
-                    out.push(*h);
+        let mut stack: Vec<Hash> = manifest.root.into_iter().collect();
+        while let Some(hash) = stack.pop() {
+            out.push(hash);
+            let node = self.load_node(hash)?;
+            match &node.items {
+                NodeItems::Leaf(entries) => {
+                    for (_, v) in entries {
+                        if let ValueRef::Value(h) = v {
+                            out.push(*h);
+                        }
+                    }
+                }
+                NodeItems::Branch(entries) => {
+                    stack.extend(entries.iter().map(|(_, h)| *h));
                 }
             }
         }
         Ok(out)
     }
-}
 
-impl StateSegment {
-    pub fn from_entries(mut entries: Vec<SegmentEntry>) -> Result<Self> {
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
-        if !segment_is_sorted_unique(&entries) {
-            return Err(anyhow!("segment entries must have unique sorted keys"));
+    // ---------- tree construction ----------
+
+    /// Build the canonical tree from sorted-unique leaf entries, bottom-up,
+    /// writing each node once. The boundary rule (`key_level`) is a pure
+    /// function of the key, so this is the unique tree for that key set — the
+    /// oracle every incremental write must match.
+    fn build_from_sorted(&self, entries: Vec<(Vec<u8>, ValueRef)>) -> Result<Option<Hash>> {
+        if entries.is_empty() {
+            return Ok(None);
         }
+        let mut level = 0u32;
+        let mut nodes = self.chunk_leaf(&entries)?;
+        while nodes.len() > 1 {
+            level += 1;
+            nodes = self.chunk_branch(level, &nodes)?;
+        }
+        Ok(Some(nodes[0].1))
+    }
 
-        let leaves: Vec<MerkleLeaf> = entries.iter().map(entry_leaf).collect();
-        let merkle_root = merkle_root(&leaves);
-        Ok(Self {
-            schema_version: STATE_SCHEMA_VERSION,
-            entries,
-            merkle_root,
-        })
+    /// Cut `entries` into leaf nodes after every boundary key (`key_level > 0`),
+    /// store each, and return the parent routing entries `(last_key, hash)`.
+    fn chunk_leaf(&self, entries: &[(Vec<u8>, ValueRef)]) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let mut out = Vec::new();
+        let mut cur: Vec<(Vec<u8>, ValueRef)> = Vec::new();
+        for (k, v) in entries {
+            cur.push((k.clone(), v.clone()));
+            if key_level(k) > 0 {
+                out.push(self.store_leaf(std::mem::take(&mut cur))?);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(self.store_leaf(cur)?);
+        }
+        Ok(out)
+    }
+
+    /// Cut branch routing entries into nodes after every key that is a boundary
+    /// at this level (`key_level > level`).
+    fn chunk_branch(
+        &self,
+        level: u32,
+        entries: &[(Vec<u8>, Hash)],
+    ) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let mut out = Vec::new();
+        let mut cur: Vec<(Vec<u8>, Hash)> = Vec::new();
+        for (k, h) in entries {
+            cur.push((k.clone(), *h));
+            if key_level(k) > level {
+                out.push(self.store_branch(level, std::mem::take(&mut cur))?);
+            }
+        }
+        if !cur.is_empty() {
+            out.push(self.store_branch(level, cur)?);
+        }
+        Ok(out)
+    }
+
+    fn store_leaf(&self, entries: Vec<(Vec<u8>, ValueRef)>) -> Result<(Vec<u8>, Hash)> {
+        let last_key = entries.last().expect("non-empty chunk").0.clone();
+        let hash = self.store_node(&StateNode {
+            level: 0,
+            items: NodeItems::Leaf(entries),
+        })?;
+        Ok((last_key, hash))
+    }
+
+    fn store_branch(&self, level: u32, entries: Vec<(Vec<u8>, Hash)>) -> Result<(Vec<u8>, Hash)> {
+        let last_key = entries.last().expect("non-empty chunk").0.clone();
+        let hash = self.store_node(&StateNode {
+            level,
+            items: NodeItems::Branch(entries),
+        })?;
+        Ok((last_key, hash))
+    }
+
+    /// Build levels up from the replacement entries of the old root, then drop
+    /// a non-canonical single-child branch root (a delete can leave one).
+    fn finish_root(&self, mut entries: Vec<(Vec<u8>, Hash)>, mut level: u32) -> Result<Hash> {
+        while entries.len() > 1 {
+            level += 1;
+            entries = self.chunk_branch(level, &entries)?;
+        }
+        let mut root = entries[0].1;
+        loop {
+            let node = self.load_node(root)?;
+            match &node.items {
+                NodeItems::Branch(es) if es.len() == 1 => root = es[0].1,
+                _ => break,
+            }
+        }
+        Ok(root)
+    }
+
+    /// Insert/replace `(key, value)` in the subtree at `node_hash`, returning
+    /// the replacement routing entries for that subtree (1, or more if a new
+    /// boundary key split it).
+    fn insert_into(
+        &self,
+        node_hash: Hash,
+        key: &[u8],
+        value: ValueRef,
+    ) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let node = self.load_node(node_hash)?;
+        match &node.items {
+            NodeItems::Leaf(entries) => {
+                let mut items = entries.clone();
+                match items.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    Ok(i) => items[i].1 = value,
+                    Err(i) => items.insert(i, (key.to_vec(), value)),
+                }
+                self.chunk_leaf(&items)
+            }
+            NodeItems::Branch(entries) => {
+                let idx = route(entries, key);
+                let new_children = self.insert_into(entries[idx].1, key, value)?;
+                let mut items = entries.clone();
+                items.splice(idx..idx + 1, new_children);
+                self.chunk_branch(node.level, &items)
+            }
+        }
+    }
+
+    /// Remove `key` from the subtree at `node_hash`, returning the replacement
+    /// routing entries (empty if the subtree became empty). Merges fall out of
+    /// re-running the cut rule after the key (and any boundary it was) is gone.
+    fn delete_from(&self, node_hash: Hash, key: &[u8]) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let node = self.load_node(node_hash)?;
+        match &node.items {
+            NodeItems::Leaf(entries) => {
+                let mut items = entries.clone();
+                if let Ok(i) = items.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    items.remove(i);
+                }
+                if items.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.chunk_leaf(&items)
+            }
+            NodeItems::Branch(entries) => {
+                let idx = route(entries, key);
+                let new_children = self.delete_from(entries[idx].1, key)?;
+                let mut items = entries.clone();
+                items.splice(idx..idx + 1, new_children);
+                if items.is_empty() {
+                    return Ok(Vec::new());
+                }
+                self.chunk_branch(node.level, &items)
+            }
+        }
+    }
+
+    // ---------- object IO + caches ----------
+
+    fn load_manifest_or_empty(&self, root: StateRoot) -> Result<Arc<StateManifest>> {
+        if let Some(m) = self
+            .manifest_cache
+            .read()
+            .expect("manifest cache poisoned")
+            .get(&root)
+        {
+            return Ok(Arc::clone(m));
+        }
+        if self.objects.exists(root) {
+            return self.load_manifest(root);
+        }
+        let empty_root = self.empty_root()?;
+        if root == empty_root {
+            return Ok(Arc::new(new_state_manifest(None)));
+        }
+        Err(anyhow!("state root {} not found", root))
+    }
+
+    fn cache_manifest(&self, root: StateRoot, manifest: Arc<StateManifest>) {
+        let mut cache = self
+            .manifest_cache
+            .write()
+            .expect("manifest cache poisoned");
+        if cache.len() >= STATE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(root, manifest);
+    }
+
+    fn cache_node(&self, hash: Hash, node: Arc<StateNode>) {
+        let mut cache = self.node_cache.write().expect("node cache poisoned");
+        if cache.len() >= STATE_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(hash, node);
+    }
+
+    fn store_manifest(&self, manifest: &StateManifest) -> Result<StateRoot> {
+        let root = self.objects.put_serialized(STATE_TAG, manifest)?;
+        self.cache_manifest(root, Arc::new(manifest.clone()));
+        Ok(root)
+    }
+
+    fn load_manifest(&self, hash: StateRoot) -> Result<Arc<StateManifest>> {
+        let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
+        if hash_typed(STATE_TAG, &bytes) != hash {
+            return Err(anyhow!("manifest hash mismatch for {}", hash));
+        }
+        let manifest: Arc<StateManifest> = Arc::new(from_cbor(&bytes)?);
+        self.cache_manifest(hash, Arc::clone(&manifest));
+        Ok(manifest)
+    }
+
+    fn store_node(&self, node: &StateNode) -> Result<Hash> {
+        let hash = self.objects.put_serialized(STATE_TAG, node)?;
+        self.cache_node(hash, Arc::new(node.clone()));
+        Ok(hash)
+    }
+
+    fn load_node(&self, hash: Hash) -> Result<Arc<StateNode>> {
+        if let Some(n) = self
+            .node_cache
+            .read()
+            .expect("node cache poisoned")
+            .get(&hash)
+        {
+            return Ok(Arc::clone(n));
+        }
+        let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
+        if hash_typed(STATE_TAG, &bytes) != hash {
+            return Err(anyhow!("node hash mismatch for {}", hash));
+        }
+        let node: Arc<StateNode> = Arc::new(from_cbor(&bytes)?);
+        self.cache_node(hash, Arc::clone(&node));
+        Ok(node)
     }
 }
 
-fn new_state_manifest(segments: Vec<Hash>) -> StateManifest {
+fn new_state_manifest(root: Option<Hash>) -> StateManifest {
     StateManifest {
         schema_version: STATE_SCHEMA_VERSION,
-        segments_merkle_root: merkle_root(&manifest_segment_leaves(&segments)),
-        segments,
+        root,
     }
 }
 
-#[cfg(test)]
-fn hash_state_object<T: Serialize>(obj: &T) -> Result<Hash> {
-    let bytes = crate::canonical::to_cbor(obj)?;
-    Ok(hash_typed(STATE_TAG, &bytes))
+/// Content hash of a node, recomputed without store access — must match
+/// `ObjectStore::put_serialized(STATE_TAG, node)` so proofs verify offline.
+fn node_hash(node: &StateNode) -> Result<Hash> {
+    Ok(hash_typed(STATE_TAG, &to_cbor(node)?))
 }
 
-fn prepend_segment(newest: Hash, existing: &[Hash]) -> Vec<Hash> {
-    let mut out = Vec::with_capacity(existing.len() + 1);
-    out.push(newest);
-    out.extend_from_slice(existing);
-    out
-}
-
-fn find_key(entries: &[SegmentEntry], key: &[u8]) -> std::result::Result<usize, usize> {
-    entries.binary_search_by(|e| compare_key(e.key.as_slice(), key))
-}
-
-fn compare_key(a: &[u8], b: &[u8]) -> Ordering {
-    a.cmp(b)
-}
-
-fn segment_is_sorted_unique(entries: &[SegmentEntry]) -> bool {
-    entries
-        .windows(2)
-        .all(|w| w[0].key.as_slice() < w[1].key.as_slice())
-}
-
-fn manifest_segment_leaf(segment_hash: Hash) -> MerkleLeaf {
-    MerkleLeaf::new(STATE_MANIFEST_LEAF_TAG, segment_hash.as_bytes())
-}
-
-fn manifest_segment_leaves(segments: &[Hash]) -> Vec<MerkleLeaf> {
-    segments
-        .iter()
-        .copied()
-        .map(manifest_segment_leaf)
-        .collect()
-}
-
-fn entry_leaf(entry: &SegmentEntry) -> MerkleLeaf {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(&(entry.key.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(&entry.key);
-
-    match entry.value {
-        ValueRef::Value(h) => {
-            bytes.push(1);
-            bytes.extend_from_slice(h.as_bytes());
-        }
-        ValueRef::Tombstone => bytes.push(0),
+fn value_commit(value: &ValueRef) -> Hash {
+    match value {
+        ValueRef::Value(h) => *h,
+        ValueRef::Inline(bytes) => hash_blob(bytes),
     }
-
-    MerkleLeaf::new(STATE_LEAF_TAG, &bytes)
 }
 
-fn build_segment_scan(
-    segment_hash: Hash,
-    segment: StateSegment,
-    manifest_proof: MerkleProof,
-    key: &[u8],
-) -> Result<SegmentScanProof> {
-    let leaves: Vec<MerkleLeaf> = segment.entries.iter().map(entry_leaf).collect();
-
-    match find_key(&segment.entries, key) {
-        Ok(index) => {
-            let entry = segment.entries[index].clone();
-            let proof = prove_inclusion(&leaves, index)
-                .ok_or_else(|| anyhow!("failed to build inclusion proof"))?;
-            let verdict = match entry.value {
-                ValueRef::Value(h) => SegmentVerdict::Value(h),
-                ValueRef::Tombstone => SegmentVerdict::Tombstone,
-            };
-            Ok(SegmentScanProof {
-                segment_hash,
-                manifest_proof,
-                segment_merkle_root: segment.merkle_root,
-                segment_leaf_count: segment.entries.len(),
-                key_proof: SegmentKeyProof::Inclusion(EntryProof { entry, proof }),
-                verdict,
-            })
-        }
-        Err(ins) => {
-            let left = if ins > 0 {
-                let idx = ins - 1;
-                Some(EntryProof {
-                    entry: segment.entries[idx].clone(),
-                    proof: prove_inclusion(&leaves, idx)
-                        .ok_or_else(|| anyhow!("failed to build left neighbor proof"))?,
-                })
-            } else {
-                None
-            };
-
-            let right = if ins < segment.entries.len() {
-                Some(EntryProof {
-                    entry: segment.entries[ins].clone(),
-                    proof: prove_inclusion(&leaves, ins)
-                        .ok_or_else(|| anyhow!("failed to build right neighbor proof"))?,
-                })
-            } else {
-                None
-            };
-
-            Ok(SegmentScanProof {
-                segment_hash,
-                manifest_proof,
-                segment_merkle_root: segment.merkle_root,
-                segment_leaf_count: segment.entries.len(),
-                key_proof: SegmentKeyProof::NonInclusion(NonInclusionProof {
-                    insertion_index: ins,
-                    left,
-                    right,
-                }),
-                verdict: SegmentVerdict::NotPresent,
-            })
+/// Boundary level of a key: leading zero bits of `hash(key)` divided by
+/// `BITS_PER_LEVEL`, capped. A key is a boundary at level L iff this is `> L`.
+fn key_level(key: &[u8]) -> u32 {
+    let h = hash_typed(LEVEL_TAG, key);
+    let mut zeros = 0u32;
+    for &b in h.as_bytes() {
+        if b == 0 {
+            zeros += 8;
+        } else {
+            zeros += b.leading_zeros();
+            break;
         }
     }
+    (zeros / BITS_PER_LEVEL).min(MAX_LEVEL)
 }
 
-fn verify_entry_proof(segment: &StateSegment, entry_proof: &EntryProof) -> bool {
-    let idx = entry_proof.proof.index;
-    if segment.entries.get(idx) != Some(&entry_proof.entry) {
-        return false;
-    }
-
-    let leaf = entry_leaf(&entry_proof.entry);
-    verify_inclusion(segment.merkle_root, leaf, &entry_proof.proof)
+/// Route to the child whose subtree covers `key`: the first entry whose
+/// `last_key >= key`, or the last child when `key` exceeds every `last_key`.
+fn route(entries: &[(Vec<u8>, Hash)], key: &[u8]) -> usize {
+    let idx = entries.partition_point(|(lk, _)| lk.as_slice() < key);
+    idx.min(entries.len() - 1)
 }
 
-fn verify_non_inclusion(segment: &StateSegment, key: &[u8], np: &NonInclusionProof) -> bool {
-    let len = segment.entries.len();
-    if np.insertion_index > len {
-        return false;
-    }
+fn leaf_sorted_unique(entries: &[(Vec<u8>, ValueRef)]) -> bool {
+    !entries.is_empty() && entries.windows(2).all(|w| w[0].0 < w[1].0)
+}
 
-    if np.insertion_index < len && segment.entries[np.insertion_index].key.as_slice() == key {
-        return false;
-    }
+fn branch_sorted_unique(entries: &[(Vec<u8>, Hash)]) -> bool {
+    !entries.is_empty() && entries.windows(2).all(|w| w[0].0 < w[1].0)
+}
 
-    match &np.left {
-        Some(left) => {
-            if !verify_entry_proof(segment, left) {
-                return false;
-            }
-            if left.proof.index + 1 != np.insertion_index {
-                return false;
-            }
-            if left.entry.key.as_slice() >= key {
-                return false;
-            }
+/// Smallest key strictly greater than every key starting with `prefix`, or
+/// `None` when `prefix` is empty or all `0xFF` (no upper bound).
+fn prefix_upper(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.last_mut() {
+        if *last < 0xFF {
+            *last += 1;
+            return Some(upper);
         }
-        None => {
-            if np.insertion_index != 0 {
-                return false;
-            }
-        }
+        upper.pop();
     }
-
-    match &np.right {
-        Some(right) => {
-            if !verify_entry_proof(segment, right) {
-                return false;
-            }
-            if right.proof.index != np.insertion_index {
-                return false;
-            }
-            if key >= right.entry.key.as_slice() {
-                return false;
-            }
-        }
-        None => {
-            if np.insertion_index != len {
-                return false;
-            }
-        }
-    }
-
-    if let (Some(left), Some(right)) = (&np.left, &np.right)
-        && left.entry.key.as_slice() >= right.entry.key.as_slice()
-    {
-        return false;
-    }
-
-    true
+    None
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
+    use super::*;
+    use crate::blob_store::BlobStore;
+    use crate::object_store::ObjectStore;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use tempfile::TempDir;
-
-    use super::*;
 
     fn store(tmp: &TempDir) -> StateStore {
         let objects = ObjectStore::new(tmp.path().join("objects"));
         objects.ensure_dir().unwrap();
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        StateStore::new(objects, blobs, Wal::new(tmp.path().join("wal")))
+        StateStore::new(objects, blobs)
+    }
+
+    /// Rebuild the canonical root for `model` directly — the oracle incremental
+    /// writes must match.
+    fn oracle_root(s: &StateStore, model: &BTreeMap<Vec<u8>, Vec<u8>>) -> Option<Hash> {
+        let entries: Vec<(Vec<u8>, ValueRef)> = model
+            .iter()
+            .map(|(k, v)| (k.clone(), s.encode_value(v).unwrap()))
+            .collect();
+        s.build_from_sorted(entries).unwrap()
     }
 
     #[test]
@@ -769,230 +773,120 @@ mod tests {
     }
 
     #[test]
-    fn set_get_single_key() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let root0 = s.empty_root().unwrap();
-        let root1 = s.set(root0, b"k", b"v").unwrap();
-        assert_eq!(s.get(root1, b"k").unwrap(), Some(b"v".to_vec()));
-    }
-
-    #[test]
-    fn overwrite_key_returns_latest_value() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let root0 = s.empty_root().unwrap();
-        let root1 = s.set(root0, b"k", b"v1").unwrap();
-        let root2 = s.set(root1, b"k", b"v2").unwrap();
-        assert_eq!(s.get(root2, b"k").unwrap(), Some(b"v2".to_vec()));
-    }
-
-    #[test]
-    fn old_roots_remain_readable() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let root0 = s.empty_root().unwrap();
-        let root1 = s.set(root0, b"k", b"v1").unwrap();
-        let root2 = s.set(root1, b"k", b"v2").unwrap();
-        assert_eq!(s.get(root1, b"k").unwrap(), Some(b"v1".to_vec()));
-        assert_eq!(s.get(root2, b"k").unwrap(), Some(b"v2".to_vec()));
-    }
-
-    #[test]
-    fn delete_removes_value() {
+    fn set_get_overwrite_delete() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let r2 = s.del(r1, b"k").unwrap();
-        assert_eq!(s.get(r2, b"k").unwrap(), None);
-    }
-
-    #[test]
-    fn delete_missing_key_still_creates_new_root() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.del(r0, b"missing").unwrap();
-        assert_ne!(r0, r1);
-    }
-
-    #[test]
-    fn multiple_keys_independent() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"a", b"1").unwrap();
-        let r2 = s.set(r1, b"b", b"2").unwrap();
-        assert_eq!(s.get(r2, b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(s.get(r2, b"b").unwrap(), Some(b"2".to_vec()));
-    }
-
-    #[test]
-    fn tombstone_wins_over_older_value() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"1").unwrap();
-        let r2 = s.del(r1, b"k").unwrap();
-        let r3 = s.set(r2, b"other", b"x").unwrap();
+        let r1 = s.set(r0, b"k", b"v1").unwrap();
+        assert_eq!(s.get(r1, b"k").unwrap(), Some(b"v1".to_vec()));
+        let r2 = s.set(r1, b"k", b"v2").unwrap();
+        assert_eq!(s.get(r2, b"k").unwrap(), Some(b"v2".to_vec()));
+        // old root still readable
+        assert_eq!(s.get(r1, b"k").unwrap(), Some(b"v1".to_vec()));
+        let r3 = s.del(r2, b"k").unwrap();
         assert_eq!(s.get(r3, b"k").unwrap(), None);
+        // emptied state returns to the canonical empty root
+        assert_eq!(r3, r0);
     }
 
     #[test]
-    fn segment_order_newest_first() {
+    fn large_value_round_trips_via_blob() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"1").unwrap();
-        let r2 = s.set(r1, b"k", b"2").unwrap();
-        let m: StateManifest = s.load_manifest_or_empty(r2).unwrap();
-        assert_eq!(m.segments.len(), 2);
-        let newer: StateSegment = s.load_segment(m.segments[0]).unwrap();
-        assert_eq!(
-            newer.entries[0].value,
-            ValueRef::Value(s.blobs.put(b"2").unwrap())
-        );
+        let big = vec![7u8; INLINE_VALUE_MAX + 100];
+        let r1 = s.set(r0, b"k", &big).unwrap();
+        assert_eq!(s.get(r1, b"k").unwrap(), Some(big));
     }
 
     #[test]
-    fn manifest_merkle_root_matches_segments() {
+    fn many_keys_read_back() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"a", b"1").unwrap();
-        let m = s.load_manifest_or_empty(r1).unwrap();
-        let leaves = m
-            .segments
-            .iter()
-            .copied()
-            .map(super::manifest_segment_leaf)
-            .collect::<Vec<_>>();
-        assert_eq!(m.segments_merkle_root, merkle_root(&leaves));
-    }
-
-    #[test]
-    fn compact_reduces_segments_and_preserves_values() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"a", b"1").unwrap();
-        let r2 = s.set(r1, b"a", b"2").unwrap();
-        let r3 = s.set(r2, b"b", b"3").unwrap();
-        let r4 = s.del(r3, b"b").unwrap();
-        let compacted = s.compact(r4).unwrap();
-
-        let manifest = s.load_manifest_or_empty(compacted).unwrap();
-        assert!(manifest.segments.len() <= 1);
-        assert_eq!(s.get(compacted, b"a").unwrap(), Some(b"2".to_vec()));
-        assert_eq!(s.get(compacted, b"b").unwrap(), None);
-    }
-
-    #[test]
-    fn proof_membership_verifies() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let p = s.proof(r1, b"k").unwrap();
-        assert!(s.verify_proof(r1, b"k", &p));
-        assert!(matches!(p.outcome, StateOutcome::Found(_)));
-    }
-
-    #[test]
-    fn proof_non_membership_verifies() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"a", b"1").unwrap();
-        let p = s.proof(r1, b"z").unwrap();
-        assert!(s.verify_proof(r1, b"z", &p));
-        assert_eq!(p.outcome, StateOutcome::Missing);
-    }
-
-    #[test]
-    fn proof_deleted_verifies() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let r2 = s.del(r1, b"k").unwrap();
-        let p = s.proof(r2, b"k").unwrap();
-        assert!(s.verify_proof(r2, b"k", &p));
-        assert_eq!(p.outcome, StateOutcome::Deleted);
-    }
-
-    #[test]
-    fn proof_wrong_key_fails() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let p = s.proof(r1, b"k").unwrap();
-        assert!(!s.verify_proof(r1, b"x", &p));
-    }
-
-    #[test]
-    fn proof_wrong_root_fails() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let p = s.proof(r1, b"k").unwrap();
-        assert!(!s.verify_proof(r0, b"k", &p));
-    }
-
-    #[test]
-    fn proof_tampered_manifest_proof_fails() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let mut p = s.proof(r1, b"k").unwrap();
-        p.scans[0].manifest_proof.index = 1;
-        assert!(!s.verify_proof(r1, b"k", &p));
-    }
-
-    #[test]
-    fn proof_tampered_entry_fails() {
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
-        let r0 = s.empty_root().unwrap();
-        let r1 = s.set(r0, b"k", b"v").unwrap();
-        let mut p = s.proof(r1, b"k").unwrap();
-        match &mut p.scans[0].key_proof {
-            SegmentKeyProof::Inclusion(ep) => ep.entry.key = b"x".to_vec(),
-            _ => panic!("expected inclusion"),
+        let mut root = s.empty_root().unwrap();
+        for i in 0..2000u32 {
+            root = s.set(root, format!("key_{i:05}").as_bytes(), b"v").unwrap();
         }
-        assert!(!s.verify_proof(r1, b"k", &p));
+        for i in 0..2000u32 {
+            assert_eq!(
+                s.get(root, format!("key_{i:05}").as_bytes()).unwrap(),
+                Some(b"v".to_vec())
+            );
+        }
+        assert_eq!(s.get(root, b"key_99999").unwrap(), None);
     }
 
     #[test]
-    fn set_same_input_same_root() {
+    fn insertion_order_independent_root() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let r0 = s.empty_root().unwrap();
-        let a = s.set(r0, b"k", b"v").unwrap();
-        let b = s.set(r0, b"k", b"v").unwrap();
-        assert_eq!(a, b);
+        let keys: Vec<String> = (0..200).map(|i| format!("k{i:04}")).collect();
+        let forward = {
+            let mut r = r0;
+            for k in &keys {
+                r = s.set(r, k.as_bytes(), b"v").unwrap();
+            }
+            r
+        };
+        let reverse = {
+            let mut r = r0;
+            for k in keys.iter().rev() {
+                r = s.set(r, k.as_bytes(), b"v").unwrap();
+            }
+            r
+        };
+        assert_eq!(forward, reverse);
     }
 
     #[test]
-    fn set_different_value_changes_root() {
+    fn bulk_build_matches_sequential_root() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let r0 = s.empty_root().unwrap();
-        let a = s.set(r0, b"k", b"v1").unwrap();
-        let b = s.set(r0, b"k", b"v2").unwrap();
-        assert_ne!(a, b);
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..500)
+            .map(|i| {
+                (
+                    format!("key_{i:05}").into_bytes(),
+                    format!("v{i}").into_bytes(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&[u8], &[u8])> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+
+        let bulk = s.set_many(r0, &refs).unwrap();
+        let mut seq = r0;
+        for (k, v) in &pairs {
+            seq = s.set(seq, k, v).unwrap();
+        }
+        assert_eq!(bulk, seq, "set_many bulk build diverged from sequential");
     }
 
     #[test]
-    fn load_missing_root_errors() {
+    fn proofs_membership_and_non_membership() {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
-        let missing = Hash::zero();
-        assert!(s.get(missing, b"k").is_err());
+        let mut root = s.empty_root().unwrap();
+        for i in 0..1000u32 {
+            root = s.set(root, format!("key_{i:05}").as_bytes(), b"v").unwrap();
+        }
+        let present = s.proof(root, b"key_00042").unwrap();
+        assert!(matches!(present.outcome, StateOutcome::Found(_)));
+        assert!(s.verify_proof(root, b"key_00042", &present));
+
+        let absent = s.proof(root, b"key_99999").unwrap();
+        assert_eq!(absent.outcome, StateOutcome::Missing);
+        assert!(s.verify_proof(root, b"key_99999", &absent));
+
+        // O(log_B n): a 1000-key tree proves in a handful of nodes, not 1000.
+        assert!(
+            absent.path.len() <= 6,
+            "proof path was {} nodes",
+            absent.path.len()
+        );
     }
 
     #[test]
@@ -1002,42 +896,108 @@ mod tests {
         let r = s.empty_root().unwrap();
         let p = s.proof(r, b"k").unwrap();
         assert_eq!(p.outcome, StateOutcome::Missing);
+        assert!(p.path.is_empty());
         assert!(s.verify_proof(r, b"k", &p));
     }
 
     #[test]
-    fn hash_state_object_is_stable() {
-        let m = new_state_manifest(vec![]);
+    fn scan_prefix_returns_sorted_matches() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut r = s.empty_root().unwrap();
+        for k in [
+            b"p/3".as_slice(),
+            b"p/1",
+            b"q/9",
+            b"p/2",
+            b"a",
+            b"p/10",
+            b"zzz",
+        ] {
+            r = s.set(r, k, b"v").unwrap();
+        }
+        let keys: Vec<Vec<u8>> = s
+            .scan_prefix(r, b"p/")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
         assert_eq!(
-            hash_state_object(&m).unwrap(),
-            hash_state_object(&m).unwrap()
+            keys,
+            vec![
+                b"p/1".to_vec(),
+                b"p/10".to_vec(),
+                b"p/2".to_vec(),
+                b"p/3".to_vec()
+            ]
         );
     }
 
-    /// Regression for issue #5: `empty_root` must memoize so subsequent
-    /// calls don't re-write the empty manifest to disk. Verified by
-    /// deleting the on-disk object after the first call and asserting that
-    /// the second call returns the same hash without re-creating the file.
+    #[test]
+    fn scan_prefix_empty_returns_all_sorted() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut r = s.empty_root().unwrap();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        for i in 0..300u32 {
+            let k = format!("k{i:04}").into_bytes();
+            r = s.set(r, &k, b"v").unwrap();
+            expected.push(k);
+        }
+        expected.sort();
+        let got: Vec<Vec<u8>> = s
+            .scan_prefix(r, b"")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn load_missing_root_errors() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        assert!(s.get(Hash::zero(), b"k").is_err());
+    }
+
     #[test]
     fn empty_root_is_memoized_and_skips_redundant_writes() {
         use crate::cas::CasStore;
-
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let h1 = s.empty_root().unwrap();
-
         let cas_path = CasStore::new(tmp.path().join("objects")).path_for(h1);
-        assert!(
-            cas_path.exists(),
-            "first empty_root call must store the object"
-        );
+        assert!(cas_path.exists());
         std::fs::remove_file(&cas_path).unwrap();
-
         let h2 = s.empty_root().unwrap();
         assert_eq!(h1, h2);
         assert!(
             !cas_path.exists(),
-            "second empty_root call re-stored the object — memoization is bypassed"
+            "empty_root re-stored — memoization bypassed"
+        );
+    }
+
+    /// Golden vector: locks the on-disk node/manifest encoding. A change here
+    /// means the byte format moved — update intentionally, never to make a
+    /// failing test pass.
+    #[test]
+    fn golden_root_hash() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut root = s.empty_root().unwrap();
+        for (k, v) in [
+            (b"alpha".as_slice(), b"1".as_slice()),
+            (b"bravo", b"2"),
+            (b"charlie", b"3"),
+            (b"delta", b"4"),
+        ] {
+            root = s.set(root, k, v).unwrap();
+        }
+        assert_eq!(
+            root.to_string(),
+            "65f3a311333022cb0a16e6dff0902eb31c57cc6a698b2e3ebeae04c6bce6681b",
+            "state root format changed"
         );
     }
 
@@ -1045,31 +1005,32 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let s = store(&tmp);
         let mut rng = StdRng::seed_from_u64(seed);
-
         let mut root = s.empty_root().unwrap();
-        let mut model: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-        let keys: Vec<Vec<u8>> = (0..12).map(|i| format!("k{i}").into_bytes()).collect();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let keys: Vec<Vec<u8>> = (0..40).map(|i| format!("k{i:03}").into_bytes()).collect();
 
-        for _ in 0..200 {
+        for _ in 0..400 {
             let k = keys[rng.gen_range(0..keys.len())].clone();
-            let op = rng.gen_range(0..4);
-            if op < 2 {
-                let val_len = rng.gen_range(1..8);
-                let val: Vec<u8> = (0..val_len).map(|_| rng.gen_range(0u8..=255u8)).collect();
-                root = s.set(root, &k, &val).unwrap();
-                model.insert(k.clone(), Some(val));
-            } else if op == 2 {
-                root = s.del(root, &k).unwrap();
-                model.insert(k.clone(), None);
+            if rng.gen_range(0..3) < 2 {
+                let v = format!("v{}", rng.gen_range(0..1000)).into_bytes();
+                root = s.set(root, &k, &v).unwrap();
+                model.insert(k.clone(), v);
             } else {
-                root = s.compact(root).unwrap();
-                // Compaction does not change logical view.
+                root = s.del(root, &k).unwrap();
+                model.remove(&k);
             }
-
+            // Incremental root must equal the from-scratch canonical build.
+            let manifest_root = s.load_manifest_or_empty(root).unwrap().root;
+            assert_eq!(
+                manifest_root,
+                oracle_root(&s, &model),
+                "incremental diverged from canonical"
+            );
+            // Every probe reads correctly and its proof verifies.
             for probe in &keys {
-                let got = s.get(root, probe).unwrap();
-                let expected = model.get(probe).cloned().flatten();
-                assert_eq!(got, expected);
+                assert_eq!(s.get(root, probe).unwrap(), model.get(probe).cloned());
+                let p = s.proof(root, probe).unwrap();
+                assert!(s.verify_proof(root, probe, &p));
             }
         }
     }
@@ -1082,211 +1043,70 @@ mod tests {
             }
         };
     }
+    prop_test!(property_seed_1, 1);
+    prop_test!(property_seed_2, 2);
+    prop_test!(property_seed_3, 3);
+    prop_test!(property_seed_4, 4);
+    prop_test!(property_seed_5, 5);
 
-    prop_test!(property_random_ops_seed_1, 1);
-    prop_test!(property_random_ops_seed_2, 2);
-    prop_test!(property_random_ops_seed_3, 3);
-    prop_test!(property_random_ops_seed_4, 4);
-    prop_test!(property_random_ops_seed_5, 5);
-    prop_test!(property_random_ops_seed_6, 6);
-    prop_test!(property_random_ops_seed_7, 7);
-    prop_test!(property_random_ops_seed_8, 8);
-    prop_test!(property_random_ops_seed_9, 9);
-    prop_test!(property_random_ops_seed_10, 10);
-
-    mod proptest_suite {
-        use proptest::prelude::*;
-        use tempfile::TempDir;
-
+    /// Forged proofs must be rejected.
+    mod adversarial {
         use super::*;
-
-        fn fresh_store() -> (TempDir, StateStore) {
-            let tmp = TempDir::new().unwrap();
-            let s = store(&tmp);
-            (tmp, s)
-        }
-
-        proptest! {
-            // The 256-case default makes these tests TempDir-heavy and fsync-bound.
-            // 32 cases saturate coverage well before that and keep the suite snappy.
-            #![proptest_config(ProptestConfig::with_cases(32))]
-
-            /// For any sequence of unique keys, set_many must make all of them readable.
-            #[test]
-            fn set_many_all_readable(
-                pairs in proptest::collection::vec(
-                    (proptest::collection::vec(any::<u8>(), 1..16),
-                     proptest::collection::vec(any::<u8>(), 1..32)),
-                    1..20,
-                )
-            ) {
-                // Deduplicate keys so the last one wins (mirrors set_many semantics).
-                use std::collections::BTreeMap;
-                let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-                for (k, v) in &pairs {
-                    map.insert(k.clone(), v.clone());
-                }
-
-                let (_tmp, s) = fresh_store();
-                let root0 = s.empty_root().unwrap();
-                let pairs_ref: Vec<(&[u8], &[u8])> = map
-                    .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                    .collect();
-                let root1 = s.set_many(root0, &pairs_ref).unwrap();
-
-                for (k, expected_v) in &map {
-                    let got = s.get(root1, k.as_slice()).unwrap();
-                    prop_assert_eq!(got.as_deref(), Some(expected_v.as_slice()));
-                }
-            }
-
-            /// del_many must remove exactly the specified keys without touching others.
-            #[test]
-            fn del_many_removes_specified_keys(
-                all_keys in proptest::collection::vec(
-                    proptest::collection::vec(any::<u8>(), 1..12),
-                    2..16,
-                )
-            ) {
-                use std::collections::BTreeSet;
-                // Deduplicate keys.
-                let unique: BTreeSet<Vec<u8>> = all_keys.into_iter().collect();
-                if unique.len() < 2 {
-                    return Ok(());
-                }
-                let keys: Vec<Vec<u8>> = unique.into_iter().collect();
-
-                let (_tmp, s) = fresh_store();
-                let mut root = s.empty_root().unwrap();
-
-                // Set all keys.
-                for k in &keys {
-                    root = s.set(root, k, b"value").unwrap();
-                }
-
-                // Delete the first half.
-                let (to_delete, to_keep) = keys.split_at(keys.len() / 2);
-                let del_refs: Vec<&[u8]> = to_delete.iter().map(|k| k.as_slice()).collect();
-                root = s.del_many(root, &del_refs).unwrap();
-
-                for k in to_delete {
-                    prop_assert_eq!(s.get(root, k).unwrap(), None, "key {:?} should be deleted", k);
-                }
-                for k in to_keep {
-                    let val = s.get(root, k).unwrap();
-                    prop_assert_eq!(
-                        val.as_deref(),
-                        Some(b"value".as_slice()),
-                        "key {:?} should still be present",
-                        k
-                    );
-                }
-            }
-
-            /// Every state proof must self-verify after arbitrary set operations.
-            #[test]
-            fn proofs_always_verify(
-                ops in proptest::collection::vec(
-                    (proptest::collection::vec(b'a'..=b'z', 1..8),
-                     proptest::collection::vec(any::<u8>(), 1..16),
-                     any::<bool>()),
-                    1..15,
-                )
-            ) {
-                let (_tmp, s) = fresh_store();
-                let mut root = s.empty_root().unwrap();
-
-                for (k, v, is_del) in &ops {
-                    if *is_del {
-                        root = s.del(root, k).unwrap();
-                    } else {
-                        root = s.set(root, k, v).unwrap();
-                    }
-                }
-
-                // Probe every key that was ever touched.
-                for (k, _, _) in &ops {
-                    let proof = s.proof(root, k).unwrap();
-                    prop_assert!(
-                        s.verify_proof(root, k, &proof),
-                        "proof failed for key {:?}",
-                        k
-                    );
-                }
-            }
-        }
-    }
-
-    /// Forged proofs must be rejected by `verify_proof`. Each test tampers one
-    /// field at a time on an otherwise-valid proof and asserts rejection — this
-    /// is the soundness side of the existing `proofs_always_verify` property
-    /// (which only checks honest proofs).
-    mod adversarial_proofs {
-        use super::*;
-        use crate::hash::hash_typed;
 
         fn setup() -> (TempDir, StateStore, StateRoot) {
             let tmp = TempDir::new().unwrap();
             let s = store(&tmp);
-            let root = s.empty_root().unwrap();
-            let root = s.set(root, b"a", b"1").unwrap();
-            let root = s.set(root, b"b", b"2").unwrap();
-            let root = s.set(root, b"c", b"3").unwrap();
+            let mut root = s.empty_root().unwrap();
+            for i in 0..500u32 {
+                root = s.set(root, format!("key_{i:05}").as_bytes(), b"v").unwrap();
+            }
             (tmp, s, root)
         }
 
         #[test]
-        fn forged_outcome_value_for_missing_key_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"missing-key").unwrap();
-            assert!(matches!(proof.outcome, StateOutcome::Missing));
-            proof.outcome = StateOutcome::Found(hash_typed(b"blob:", b"fake"));
-            assert!(!s.verify_proof(root, b"missing-key", &proof));
+        fn forged_found_for_absent_key_rejected() {
+            let (_t, s, root) = setup();
+            let mut p = s.proof(root, b"absent").unwrap();
+            assert_eq!(p.outcome, StateOutcome::Missing);
+            p.outcome = StateOutcome::Found(crate::hash::hash_typed(b"blob:", b"fake"));
+            assert!(!s.verify_proof(root, b"absent", &p));
         }
 
         #[test]
-        fn forged_outcome_missing_for_present_key_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"a").unwrap();
-            assert!(matches!(proof.outcome, StateOutcome::Found(_)));
-            proof.outcome = StateOutcome::Missing;
-            assert!(!s.verify_proof(root, b"a", &proof));
+        fn forged_missing_for_present_key_rejected() {
+            let (_t, s, root) = setup();
+            let mut p = s.proof(root, b"key_00100").unwrap();
+            assert!(matches!(p.outcome, StateOutcome::Found(_)));
+            p.outcome = StateOutcome::Missing;
+            assert!(!s.verify_proof(root, b"key_00100", &p));
         }
 
         #[test]
-        fn wrong_manifest_segment_count_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"a").unwrap();
-            proof.manifest_segment_count += 1;
-            assert!(!s.verify_proof(root, b"a", &proof));
+        fn wrong_root_anchor_rejected() {
+            let (_t, s, root) = setup();
+            let mut p = s.proof(root, b"key_00100").unwrap();
+            p.root = Some(crate::hash::hash_typed(b"forged:", b"root"));
+            assert!(!s.verify_proof(root, b"key_00100", &p));
         }
 
         #[test]
-        fn wrong_manifest_segments_root_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"a").unwrap();
-            proof.manifest_segments_root = hash_typed(b"forged:", b"root");
-            assert!(!s.verify_proof(root, b"a", &proof));
+        fn tampered_leaf_rejected() {
+            let (_t, s, root) = setup();
+            let mut p = s.proof(root, b"key_00100").unwrap();
+            if let NodeItems::Leaf(entries) = &mut p.path.last_mut().unwrap().items {
+                entries[0].1 = ValueRef::Inline(b"forged".to_vec());
+            }
+            assert!(!s.verify_proof(root, b"key_00100", &p));
         }
 
         #[test]
-        fn extra_unrelated_scan_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"a").unwrap();
-            // Duplicate the terminal scan to make `scans.len()` inconsistent
-            // with the recorded terminal index.
-            let last = proof.scans.last().cloned().unwrap();
-            proof.scans.push(last);
-            assert!(!s.verify_proof(root, b"a", &proof));
-        }
-
-        #[test]
-        fn schema_version_mismatch_is_rejected() {
-            let (_tmp, s, root) = setup();
-            let mut proof = s.proof(root, b"a").unwrap();
-            proof.manifest_schema_version = proof.manifest_schema_version.wrapping_add(1);
-            assert!(!s.verify_proof(root, b"a", &proof));
+        fn truncated_path_rejected() {
+            let (_t, s, root) = setup();
+            let mut p = s.proof(root, b"key_00100").unwrap();
+            if p.path.len() > 1 {
+                p.path.pop();
+                assert!(!s.verify_proof(root, b"key_00100", &p));
+            }
         }
     }
 }

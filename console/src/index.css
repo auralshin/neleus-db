@@ -1,0 +1,313 @@
+/* ============================================================
+   Neleus DB — foundation: tokens, base, glass system, buttons
+   Flat CSS (no native nesting) for maximum browser support.
+   ============================================================ */
+
+:root {
+  --bg: #0b0809;
+  --bg-raised: #120d0e;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-strong: rgba(255, 255, 255, 0.13);
+
+  --red: #e5484d;
+  --red-bright: #ff6166;
+  --red-deep: #aa2429;
+  --red-dim: rgba(229, 72, 77, 0.12);
+  --red-border: rgba(229, 72, 77, 0.45);
+  --red-glow: rgba(229, 72, 77, 0.28);
+
+  --text: #f4efec;
+  --muted: #b3a8a4;
+  --faint: #7d7370;
+  --good: #4cc38a;
+
+  --glass-bg: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.07),
+    rgba(255, 255, 255, 0.025) 42%,
+    rgba(229, 72, 77, 0.05)
+  );
+  --glass-edge: rgba(255, 255, 255, 0.09);
+  --glass-rim: rgba(255, 255, 255, 0.14);
+
+  --sans:
+    'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+  --serif: 'Instrument Serif', Georgia, 'Times New Roman', serif;
+  --mono:
+    'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  --radius: 18px;
+  --radius-lg: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 104px;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.65;
+  letter-spacing: 0.01em;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow-x: hidden;
+}
+
+/* Ambient red aurora the glass panels blur against — soft, no texture */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  background:
+    radial-gradient(60rem 36rem at 78% -10%, rgba(229, 72, 77, 0.09), transparent 68%),
+    radial-gradient(70rem 46rem at 45% 122%, rgba(170, 36, 41, 0.05), transparent 65%);
+}
+
+::selection {
+  background: rgba(229, 72, 77, 0.4);
+  color: #fff;
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 400;
+  color: var(--text);
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+code {
+  font-family: var(--mono);
+}
+
+button {
+  font-family: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* ---------- layout ---------- */
+
+.container {
+  width: 100%;
+  max-width: 1160px;
+  margin: 0 auto;
+  padding-left: max(24px, env(safe-area-inset-left));
+  padding-right: max(24px, env(safe-area-inset-right));
+}
+
+.section {
+  position: relative;
+  padding: clamp(72px, 10vw, 128px) 0;
+}
+
+.section-line {
+  border-top: 1px solid var(--line);
+}
+
+.section-head {
+  max-width: 720px;
+  margin-bottom: clamp(36px, 5vw, 60px);
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--red);
+  margin-bottom: 20px;
+}
+
+.eyebrow::before {
+  content: '';
+  width: 22px;
+  height: 1px;
+  background: var(--red);
+  opacity: 0.7;
+}
+
+.section h2 {
+  font-family: var(--serif);
+  font-size: clamp(32px, 4.6vw, 50px);
+  line-height: 1.08;
+  letter-spacing: -0.01em;
+}
+
+.section h2 em {
+  font-style: italic;
+  color: var(--red-bright);
+}
+
+.lead {
+  margin-top: 18px;
+  font-size: clamp(16px, 1.9vw, 18px);
+  color: var(--muted);
+  max-width: 640px;
+}
+
+.lead code,
+.fineprint code {
+  font-size: 0.88em;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+/* ---------- liquid glass ---------- */
+
+.glass {
+  position: relative;
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  border: 1px solid var(--glass-edge);
+  border-radius: var(--radius);
+  box-shadow:
+    inset 0 1px 0 var(--glass-rim),
+    inset 0 -1px 0 rgba(255, 255, 255, 0.03),
+    0 24px 60px rgba(0, 0, 0, 0.38);
+}
+
+/* opaque fallback when backdrop-filter is unsupported */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .glass {
+    background: rgba(20, 14, 15, 0.96);
+  }
+}
+
+/* ---------- buttons ---------- */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 13px 24px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    transform 0.25s ease,
+    box-shadow 0.25s ease,
+    background-color 0.25s ease,
+    border-color 0.25s ease;
+}
+
+.btn:active {
+  transform: translateY(1px) scale(0.99);
+}
+
+.btn-primary {
+  color: #fff;
+  background: linear-gradient(180deg, #f0565b, var(--red) 55%, #c93338);
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 10px 30px var(--red-glow);
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.32),
+    0 14px 38px rgba(229, 72, 77, 0.42);
+}
+
+.btn-glass {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+  border-color: var(--line-strong);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+.btn-glass:hover {
+  transform: translateY(-1px);
+  border-color: var(--red-border);
+  background: rgba(229, 72, 77, 0.09);
+}
+
+.btn-sm {
+  padding: 9px 17px;
+  font-size: 13.5px;
+}
+
+/* ---------- scroll reveal ---------- */
+
+.reveal {
+  opacity: 0;
+  transform: translateY(20px);
+  transition:
+    opacity 0.7s cubic-bezier(0.22, 1, 0.36, 1),
+    transform 0.7s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: opacity, transform;
+}
+
+.reveal.in {
+  opacity: 1;
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+  .btn,
+  .btn:hover {
+    transform: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

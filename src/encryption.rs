@@ -1,39 +1,14 @@
-//! Authenticated, at-rest encryption for content-addressed blobs and objects.
+//! Authenticated at-rest encryption for content-addressed blobs and objects.
 //!
-//! Design overview
-//! ---------------
+//! Master key: Argon2id(password, master_salt) derived once at `Database::open`,
+//! so the memory-hard cost is paid once, not per blob. Per operation: a fresh
+//! random `salt`+`nonce`, a per-blob key via HKDF-SHA256(master_key, salt,
+//! info=algorithm) used once with an AEAD then zeroized. The on-disk envelope
+//! (`EncryptedData v3`, canonical DAG-CBOR) carries only salt/nonce/ciphertext —
+//! the KDF config is fixed at the DB level, not per blob.
 //!
-//! 1. A 32-byte **master key** is derived once at `Database::open` from the
-//!    user's password and a long-lived random `master_salt` (persisted in
-//!    `meta/config.json`) via PBKDF2-HMAC-SHA256 at the configured iteration
-//!    count (default 600k, OWASP-2024).
-//!
-//! 2. For each encryption operation we generate a fresh random per-blob
-//!    `salt` and `nonce`, then derive a **per-blob key** via
-//!    HKDF-SHA256(master_key, salt, info=algorithm). The per-blob key is
-//!    used once with an AEAD (AES-256-GCM or ChaCha20-Poly1305) and zeroized
-//!    immediately.
-//!
-//! 3. The on-disk envelope (`EncryptedData v3`) is canonical DAG-CBOR with
-//!    `salt`, `nonce`, and `ciphertext` only — no per-blob KDF parameters,
-//!    since the master KDF config lives at the database level and is fixed
-//!    for a given DB. v3 supersedes the v2 JSON envelope; the encoder/decoder
-//!    runs ~10–15× faster and the bytes are ~40% smaller.
-//!
-//! Why master + HKDF
-//! -----------------
-//!
-//! Earlier versions ran PBKDF2 with 210k iterations *per blob operation*,
-//! which made encryption unusable at any real throughput (~100 ms per read
-//! or write). With master+HKDF, the PBKDF2 cost is paid once at open; each
-//! subsequent operation pays nanosecond-scale HKDF.
-//!
-//! Why zeroize
-//! -----------
-//!
-//! Passwords and derived keys are wrapped in `Zeroizing<...>` so they are
-//! wiped from memory on drop. Decrypted plaintext flows through callers and
-//! escapes our control, so it's not zeroized here — document and move on.
+//! Keys/passwords are `Zeroizing` (wiped on drop); decrypted plaintext escapes
+//! to callers and is deliberately not zeroized here.
 
 use std::sync::Arc;
 
@@ -42,7 +17,6 @@ use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use hkdf::Hkdf;
-use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -50,9 +24,11 @@ use zeroize::Zeroizing;
 /// On-disk envelope format version emitted by current writes.
 const ENVELOPE_VERSION: u32 = 3;
 
-/// PBKDF2 iteration count below which the config is rejected. Matches OWASP
-/// 2024 guidance for PBKDF2-HMAC-SHA256.
-pub const MIN_KDF_ITERATIONS: u32 = 600_000;
+/// Argon2id parameters (OWASP: 19 MiB, t=2, p=1). Fixed by this build, not
+/// user-configurable. Argon2id is memory-hard; PBKDF2-class KDFs are not.
+pub const ARGON2_M_COST_KIB: u32 = 19_456;
+pub const ARGON2_T_COST: u32 = 2;
+pub const ARGON2_P_COST: u32 = 1;
 
 /// AEAD nonce length in bytes (AES-256-GCM and ChaCha20-Poly1305 both use 12).
 const AEAD_NONCE_LEN: usize = 12;
@@ -67,7 +43,6 @@ pub const MASTER_SALT_LEN: usize = 16;
 pub struct EncryptionConfig {
     pub enabled: bool,
     pub algorithm: String,
-    pub kdf_iterations: u32,
     /// Long-lived random salt for master-key derivation. Persisted in
     /// `meta/config.json`. Hex-encoded so the config remains human-readable.
     /// Set on first open of an encryption-enabled database; never rotated.
@@ -82,7 +57,6 @@ impl Default for EncryptionConfig {
         Self {
             enabled: false,
             algorithm: "aes-256-gcm".to_string(),
-            kdf_iterations: MIN_KDF_ITERATIONS,
             master_salt: String::new(),
         }
     }
@@ -123,10 +97,8 @@ impl Algorithm {
     }
 }
 
-/// Runtime encryption handle. Owns the master key and zeroizes it on drop.
-///
-/// Constructed once per `Database::open` via `from_config`. Cheap to clone
-/// (the wrapped state lives behind `Arc`).
+/// Runtime encryption handle. Owns the master key, zeroizes it on drop;
+/// cheap to clone (state behind `Arc`).
 #[derive(Clone)]
 pub struct EncryptionRuntime {
     inner: Arc<RuntimeInner>,
@@ -175,12 +147,18 @@ impl EncryptionRuntime {
         let algorithm = Algorithm::parse(&config.algorithm)?;
 
         let mut master_key = Zeroizing::new(vec![0u8; AEAD_KEY_LEN]);
-        pbkdf2_hmac::<Sha256>(
-            password.as_bytes(),
-            &master_salt,
-            config.kdf_iterations,
-            &mut master_key,
-        );
+        let params = argon2::Params::new(
+            ARGON2_M_COST_KIB,
+            ARGON2_T_COST,
+            ARGON2_P_COST,
+            Some(AEAD_KEY_LEN),
+        )
+        .map_err(|e| anyhow!("invalid argon2 params: {e}"))?;
+        let argon =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        argon
+            .hash_password_into(password.as_bytes(), &master_salt, &mut master_key)
+            .map_err(|e| anyhow!("argon2id key derivation failed: {e}"))?;
 
         Ok(Self {
             inner: Arc::new(RuntimeInner {
@@ -194,13 +172,14 @@ impl EncryptionRuntime {
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let salt = utils::random_bytes(PER_BLOB_SALT_LEN)?;
         let nonce = utils::random_bytes(AEAD_NONCE_LEN)?;
-        let per_blob_key = derive_per_blob_key(
-            &self.inner.master_key,
-            &salt,
-            self.inner.algorithm.name(),
+        let per_blob_key =
+            derive_per_blob_key(&self.inner.master_key, &salt, self.inner.algorithm.name())?;
+        let ciphertext = aead_encrypt(
+            self.inner.algorithm,
+            per_blob_key.as_slice(),
+            &nonce,
+            plaintext,
         )?;
-        let ciphertext =
-            aead_encrypt(self.inner.algorithm, per_blob_key.as_slice(), &nonce, plaintext)?;
 
         let envelope = EncryptedData {
             version: ENVELOPE_VERSION,
@@ -266,12 +245,6 @@ pub fn validate_config(config: &EncryptionConfig) -> Result<()> {
         return Err(anyhow!("encryption is disabled in config"));
     }
     Algorithm::parse(&config.algorithm)?;
-    if config.kdf_iterations < MIN_KDF_ITERATIONS {
-        return Err(anyhow!(
-            "kdf_iterations must be at least {} (OWASP 2024 minimum for PBKDF2-HMAC-SHA256)",
-            MIN_KDF_ITERATIONS
-        ));
-    }
     if config.master_salt.is_empty() {
         return Err(anyhow!(
             "master_salt is missing from config; call ensure_master_salt before runtime construction"
@@ -371,7 +344,6 @@ pub mod utils {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,7 +373,6 @@ mod tests {
         let c = EncryptionConfig::default();
         assert!(!c.enabled);
         assert_eq!(c.algorithm, "aes-256-gcm");
-        assert_eq!(c.kdf_iterations, MIN_KDF_ITERATIONS);
     }
 
     #[test]
@@ -418,11 +389,12 @@ mod tests {
     }
 
     #[test]
-    fn config_below_min_iterations_rejected() {
-        let mut c = enabled_aes_config();
-        c.kdf_iterations = 100_000;
-        let err = validate_config(&c).unwrap_err();
-        assert!(err.to_string().contains("kdf_iterations"));
+    fn argon2id_derivation_is_deterministic_per_salt() {
+        let cfg = enabled_aes_config();
+        let a = EncryptionRuntime::from_config(cfg.clone(), "pw".into()).unwrap();
+        let b = EncryptionRuntime::from_config(cfg, "pw".into()).unwrap();
+        let envelope = a.encrypt(b"argon payload").unwrap();
+        assert_eq!(b.decrypt(&envelope).unwrap(), b"argon payload");
     }
 
     #[test]
@@ -439,8 +411,7 @@ mod tests {
     #[test]
     fn aes_runtime_roundtrip() {
         let runtime =
-            EncryptionRuntime::from_config(enabled_aes_config(), "strong-password".into())
-                .unwrap();
+            EncryptionRuntime::from_config(enabled_aes_config(), "strong-password".into()).unwrap();
         let plaintext = b"runtime payload";
         let envelope = runtime.encrypt(plaintext).unwrap();
         let decrypted = runtime.decrypt(&envelope).unwrap();
@@ -475,8 +446,7 @@ mod tests {
     /// IND-CPA across writes.
     #[test]
     fn same_plaintext_different_ciphertext() {
-        let runtime =
-            EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
+        let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
         let a = runtime.encrypt(b"same").unwrap();
         let b = runtime.encrypt(b"same").unwrap();
         assert_ne!(a, b);
@@ -487,8 +457,7 @@ mod tests {
     /// this loop on a modern laptop.
     #[test]
     fn per_op_cost_is_fast() {
-        let runtime =
-            EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
+        let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
         let start = std::time::Instant::now();
         for i in 0..100 {
             let payload = format!("payload-{i}");
@@ -506,8 +475,7 @@ mod tests {
     fn older_envelope_versions_are_rejected() {
         // A CBOR envelope with an older version field must be refused, even
         // if every other field is well-formed.
-        let runtime =
-            EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
+        let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
         let older = EncryptedData {
             version: ENVELOPE_VERSION - 1,
             algorithm: "aes-256-gcm".into(),
@@ -523,9 +491,9 @@ mod tests {
     #[test]
     fn legacy_json_envelope_is_rejected() {
         // Pre-v3 envelopes were JSON; CBOR decode rejects them as malformed.
-        let json = br#"{"version":2,"algorithm":"aes-256-gcm","salt":"","nonce":"","ciphertext":""}"#;
-        let runtime =
-            EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
+        let json =
+            br#"{"version":2,"algorithm":"aes-256-gcm","salt":"","nonce":"","ciphertext":""}"#;
+        let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
         let err = runtime.decrypt(json).unwrap_err();
         assert!(err.to_string().contains("invalid encryption envelope"));
     }
@@ -534,8 +502,7 @@ mod tests {
     fn algorithm_mismatch_between_runtime_and_envelope_fails() {
         let aes = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
         let envelope = aes.encrypt(b"x").unwrap();
-        let chacha =
-            EncryptionRuntime::from_config(enabled_chacha_config(), "pw".into()).unwrap();
+        let chacha = EncryptionRuntime::from_config(enabled_chacha_config(), "pw".into()).unwrap();
         let err = chacha.decrypt(&envelope).unwrap_err();
         assert!(err.to_string().contains("algorithm mismatch"));
     }

@@ -1,0 +1,19 @@
+[package]
+name = "neleus-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native (PyO3) Python binding embedding the neleus-db engine in-process."
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+
+[lib]
+name = "neleus_native"
+crate-type = ["cdylib", "rlib"]
+
+# In-process binding: no subprocess, no HTTP. The whole engine runs inside the
+# Python process. Build with maturin (`maturin develop`) or
+# `cargo build --release` and rename the artifact to `neleus_native.so`.
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+neleus-db = { path = "../.." }
+anyhow = "1.0"

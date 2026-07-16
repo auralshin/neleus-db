@@ -77,7 +77,11 @@ pub fn prove_inclusion(leaves: &[MerkleLeaf], index: usize) -> Option<MerkleProo
     let mut level: Vec<Hash> = leaves.iter().map(|l| l.0).collect();
 
     while level.len() > 1 {
-        let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+        let sibling_idx = if idx.is_multiple_of(2) {
+            idx + 1
+        } else {
+            idx - 1
+        };
         let sibling = if sibling_idx < level.len() {
             level[sibling_idx]
         } else {
