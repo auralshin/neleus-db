@@ -17,7 +17,7 @@ The canonical plane is a trust anchor. These are hashed into object
 identities, so a change to how they serialize silently invalidates every
 existing database and every proof:
 
-- `src/canonical.rs` — DAG-CBOR encoding, golden-byte tests
+- `src/canonical.rs`: DAG-CBOR encoding, golden-byte tests
 - hash domains applied through `src/hash.rs` (`blob:`, `manifest:`,
   `manifest_leaf:`, `state_node:`, `state_level:`, `commit:`,
   `commit_payload:`, `checkpoint:`, `checkpoint_payload:`, `checkpoint_leaf:`,
@@ -26,13 +26,13 @@ existing database and every proof:
   types, `Checkpoint`, and the encryption envelope
 
 If you change any of these, you are changing the format. That needs a schema
-version bump and an explicit decision — open an issue first. The golden
+version bump and an explicit decision, so open an issue first. The golden
 tests in `canonical.rs` exist to fail loudly when this happens by accident;
 do not "fix" them by updating the expected bytes without understanding why.
 
 This project has no deployed users yet, so we **replace** old formats rather
-than carry migration shims (e.g. PBKDF2 → Argon2id was a straight swap, not a
-compat path). Greenfield until stated otherwise — don't add backward-compat
+than carry migration shims (e.g. PBKDF2 to Argon2id was a straight swap, not a
+compat path). Greenfield until stated otherwise: don't add backward-compat
 layers.
 
 The serving plane (`src/engine/`, `src/index`-derived data) is the opposite:
@@ -42,13 +42,13 @@ free to change. Optimize it freely; just keep recall pinned (see below).
 ## Before you open a PR
 
 ```bash
-cargo test            # all of it must pass — no exceptions
+cargo test            # all of it must pass, no exceptions
 cargo clippy          # zero warnings; CI treats them as errors
 cargo fmt
 ```
 
 For changes to the retrieval engine, the recall oracle tests
-(`engine::vector`, `engine::segment`) must still hold — HNSW recall@10 ≥ 0.90
+(`engine::vector`, `engine::segment`) must still hold: HNSW recall@10 ≥ 0.90
 against the exact brute-force oracle, on both the f32 and SQ8 paths. If you
 touch indexing, run the benchmarks and note any regression:
 
@@ -64,7 +64,7 @@ cargo bench --bench scale
   the code says.
 - Errors use `anyhow` with `with_context`; surface the path/hash that failed.
 - No new heavy dependencies in the canonical plane. The serving plane and
-  server can take well-justified deps, but the bar is high — most of this
+  server can take well-justified deps, but the bar is high: most of this
   (HNSW, the HTTP server, the HTTP client) is hand-rolled on purpose.
 - Crypto is the exception: never hand-roll it. Use the RustCrypto / dalek
   crates already in the tree.
@@ -74,7 +74,7 @@ cargo bench --bench scale
 Anything touching encryption, signing, auth, the WAL, or the proof/verify
 paths gets extra scrutiny. Call it out in the PR description, explain the
 threat model you're addressing, and add a test that fails without your fix.
-If you find a vulnerability, please don't open a public issue — email the
+If you find a vulnerability, please don't open a public issue; email the
 maintainer first.
 
 ## Tests are part of the change
@@ -85,4 +85,4 @@ reproduces the bug first. "It works on my machine" is not a test.
 ## Scope
 
 Keep PRs focused. One concern per PR. If you notice unrelated dead code or a
-nearby cleanup, mention it — don't fold it in.
+nearby cleanup, mention it; don't fold it in.
