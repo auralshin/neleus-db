@@ -20,8 +20,8 @@ existing database and every proof:
 - `src/canonical.rs` — DAG-CBOR encoding, golden-byte tests
 - hash domains applied through `src/hash.rs` (`blob:`, `manifest:`,
   `manifest_leaf:`, `state_node:`, `state_level:`, `commit:`,
-  `commit_payload:`, `checkpoint:`, `checkpoint_payload:`, `merkle_node:`,
-  `index_segment:`)
+  `commit_payload:`, `checkpoint:`, `checkpoint_payload:`, `checkpoint_leaf:`,
+  `merkle_node:`, `merkle_root:`, `index_segment:`)
 - on-disk shapes of `Commit`, `StateNode`/`StateManifest`, the manifest
   types, `Checkpoint`, and the encryption envelope
 

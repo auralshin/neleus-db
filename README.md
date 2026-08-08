@@ -2,15 +2,15 @@
 
 # 🔱 Neleus DB
 
-## Tamper-evident state for AI agents — prove what your agent knew when it decided
+## Prove what your AI agent knew when it decided
 
 neleus-db is a tamper-evident, content-addressed Merkle-DAG database for AI
-agent memory, written in Rust. Fast hybrid retrieval (BM25 + vectors),
-git-like immutable versioning, and session memory — where every answer
-carries a cryptographic receipt. Sub-millisecond warm queries; any hit
-upgrades to an offline-verifiable Merkle proof. Ships with an audit surface:
-signed audit export and a standalone verifier (`neleus-verify`) an auditor
-runs without Neleus.
+agent memory, written in Rust. It does fast hybrid retrieval (BM25 + vectors),
+git-like immutable versioning, and session memory, and every answer carries a
+cryptographic receipt. Warm queries run in well under a millisecond, and any
+hit upgrades to an offline-verifiable Merkle proof. It ships with an audit
+surface too: signed audit export and a standalone verifier (`neleus-verify`)
+that an auditor can run without Neleus.
 
 [Get started](docs/getting-started.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [Benchmarks](BENCHMARKS.md) · [Design](DESIGN.md) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug)
 
@@ -215,8 +215,9 @@ refs/     heads, staged state,           in-memory caches: segments, state,
 
 Hash domains: `blob:`, `manifest:`, `manifest_leaf:`, `state_node:`,
 `state_level:`, `commit:`, `commit_payload:`, `checkpoint:`,
-`checkpoint_payload:`, `merkle_node:`, `index_segment:` — all BLAKE3 over
-canonical DAG-CBOR. Golden-byte tests lock the encodings.
+`checkpoint_payload:`, `checkpoint_leaf:`, `merkle_node:`, `merkle_root:`,
+`index_segment:` — all BLAKE3 over canonical DAG-CBOR. Golden-byte tests lock
+the encodings.
 
 The serving plane is never hashed into identity: delete `index/` and lose
 nothing but warm-up time.

@@ -546,7 +546,10 @@ pub fn verify_bundle(
             );
         }
     }
-    let complete = gaps.is_empty() && chain.first().map(|r| r.seq) != Some(u64::MAX);
+    // Complete iff contiguous (no internal gaps) and anchored at the genesis
+    // record seq 0 — a bundle that starts mid-chain is internally consistent
+    // but missing its prefix. An empty bundle is vacuously complete.
+    let complete = gaps.is_empty() && chain.first().map(|r| r.seq == 0).unwrap_or(true);
     if !gaps.is_empty() {
         bail!(
             "retrieval chain has {} gap(s), e.g. between sequence {} and {}: records were \

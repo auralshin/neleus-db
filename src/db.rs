@@ -166,8 +166,8 @@ impl Database {
         }
 
         match config.durability.as_deref() {
-            None | Some("os") => crate::atomic::set_full_durability(false),
-            Some("full") => crate::atomic::set_full_durability(true),
+            None | Some("full") => crate::atomic::set_full_durability(true),
+            Some("os") => crate::atomic::set_full_durability(false),
             Some(other) => {
                 return Err(anyhow::anyhow!(
                     "unknown durability '{other}' (expected \"os\" or \"full\")"

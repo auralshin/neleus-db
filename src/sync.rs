@@ -101,6 +101,17 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
             Some(local_hash) if local_hash == remote_hash => {}
             Some(local_hash) => {
                 if is_ancestor(db, local_hash, remote_hash)? {
+                    // Refuse to fast-forward over locally staged, uncommitted
+                    // writes: advancing the state ref to the remote root would
+                    // silently drop them (create_commit_at_head guards the same
+                    // way). A staged ref that still matches the local commit's
+                    // state has no pending work and is safe to advance.
+                    let local_state = db.commit_store.get_commit(local_hash)?.state_root;
+                    let staged = db.refs.state_get(&name)?;
+                    if matches!(staged, Some(s) if s != local_state) {
+                        report.refs_skipped.push(name);
+                        continue;
+                    }
                     db.refs.head_set(&name, remote_hash)?;
                     // Keep the staged-state ref in step so the next commit
                     // builds on the merged state rather than rolling it back.

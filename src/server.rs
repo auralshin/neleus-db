@@ -416,9 +416,11 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     if content_length > body_cap {
         return respond(&stream, 413, &err_json(413, "request body too large"));
     }
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
 
+    // Authenticate before allocating/reading the body: an unauthenticated
+    // client must never be able to make us buffer up to `body_cap` bytes
+    // (4 GiB on /v1/pack) in memory.
+    //
     // Fresh registry per request: revocation takes effect immediately. The
     // loopback bootstrap token authenticates as admin, but only from a loopback
     // peer — a leaked token is useless off-box.
@@ -445,6 +447,10 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
             }
         }
     };
+
+    // Body is read only after authentication succeeds.
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
 
     let request = Request {
         method,
@@ -725,7 +731,10 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
         }
 
         ("POST", "/v1/blobs") => {
-            require_untenanted(req, Role::Writer)?;
+            // Any writer, tenant-scoped or not: blobs are content-addressed and
+            // deduped globally, and run capture (the flagship SDK flow) uploads
+            // run content here with a tenant key. Reads stay untenanted.
+            require(req, Role::Writer)?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
             let hash = db.blob_store.put(&req.body)?;
             Ok(Response::Json(200, json!({"hash": hash.to_string()})))
@@ -1111,6 +1120,20 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 .get("include_content")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // The proof route takes an arbitrary (commit, chunk); with
+            // include_content it returns raw chunk bytes. A tenant-scoped key
+            // must not use it to read another tenant's content — deny the
+            // content-bearing form, same as the untenanted /v1/blobs read.
+            if include
+                && req
+                    .principal
+                    .as_ref()
+                    .is_some_and(|p| p.tenant.is_some())
+            {
+                bail!(
+                    "forbidden: include_content proofs are not available to tenant-scoped keys"
+                );
+            }
             let proof = engine.prove(commit, chunk, include)?;
             use base64::Engine as _;
             let bundle = base64::engine::general_purpose::STANDARD

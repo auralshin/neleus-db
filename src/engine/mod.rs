@@ -688,6 +688,14 @@ impl Engine {
         principal: Option<&str>,
         hits: &[EngineHit],
     ) -> Result<Hash> {
+        // Serialize the read-compute-commit-set of the audit tip across
+        // processes: two concurrent recorders on the same head must not read
+        // the same tip and mint the same sequence number, which would make
+        // verify_bundle reject the chain as duplicated.
+        let _audit_lock = crate::lock::flock_exclusive(
+            self.db.root.join(".audit.lock"),
+            std::time::Duration::from_secs(10),
+        )?;
         let prev = self.db.refs.query_get(head)?;
         let seq = match prev {
             Some(h) => self.db.manifest_store.get_query_manifest(h)?.seq + 1,

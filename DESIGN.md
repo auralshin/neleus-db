@@ -67,10 +67,12 @@ Domain tags include:
   branches are hashed uniformly as `dag_cbor(StateNode)`)
 - `state_level:` (key-boundary derivation, not an object domain)
 - `merkle_node:`
+- `merkle_root:` (transparency-log root, with the leaf count sealed in)
 - `commit:`
 - `commit_payload:`
 - `checkpoint:`
 - `checkpoint_payload:`
+- `checkpoint_leaf:` (a commit's leaf in the checkpoint transparency log)
 - `index_segment:`
 
 Representative formulas:
@@ -312,7 +314,7 @@ the carried bytes by hash equations.
 Checkpoints form an append-only hash chain per head under
 `refs/checkpoints/<head>`.
 
-Each checkpoint records (schema version `2`):
+Each checkpoint records (schema version `3`):
 
 - head name
 - commit hash

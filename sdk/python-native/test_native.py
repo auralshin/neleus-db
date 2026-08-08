@@ -56,8 +56,7 @@ class NativeBinding(unittest.TestCase):
 
     def test_audit_export(self):
         self._seed()
-        qm = self.db.record_query("main", "verifiable audit", principal="agent:py")
-        self.db.commit("main", "audit", manifests=[qm])
+        self.db.record_query("main", "verifiable audit", principal="agent:py")
         self.db.checkpoint("main")
 
         bundle = os.path.join(self.tmp, "q.nelaudit")

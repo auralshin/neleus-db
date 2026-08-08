@@ -55,12 +55,12 @@ pub struct Checkpoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
     /// Merkle root over every commit checkpointed on this head so far, this
-    /// one last (v2+). Lets a verifier check inclusion and append-onlyness in
+    /// one last. Lets a verifier check inclusion and append-onlyness in
     /// `O(log J)` instead of walking the chain.
     #[serde(default = "crate::merkle::empty_root")]
     pub log_root: Hash,
-    /// Roots of the perfect subtrees the log decomposes into, largest first
-    /// (v3+). Carrying it makes the next append `O(log J)` rather than a full
+    /// Roots of the perfect subtrees the log decomposes into, largest first.
+    /// Carrying it makes the next append `O(log J)` rather than a full
     /// rebuild; its width is the popcount of the entry count.
     #[serde(default)]
     pub log_spine: Vec<Hash>,
@@ -265,6 +265,29 @@ impl<'a> CheckpointStore<'a> {
                     return Err(anyhow!("checkpoint {hash} is unsigned"));
                 }
                 (None, _) => {}
+            }
+
+            // The transparency-log root must match the spine/count the
+            // checkpoint publishes, and that spine must be the predecessor's
+            // extended by exactly this commit — otherwise a forged log_root
+            // (or a rewritten log) would pass unnoticed.
+            let count = cp.sequence as usize + 1;
+            if root_from_spine(&cp.log_spine, count) != cp.log_root {
+                return Err(anyhow!(
+                    "checkpoint {hash}: published log_root does not match its spine"
+                ));
+            }
+            let expected_spine = match cp.prev {
+                None => spine_append(&[], 0, checkpoint_leaf(cp.commit)),
+                Some(prev) => {
+                    let p = self.get(prev)?;
+                    spine_append(&p.log_spine, p.sequence as usize + 1, checkpoint_leaf(cp.commit))
+                }
+            };
+            if expected_spine != cp.log_spine {
+                return Err(anyhow!(
+                    "checkpoint {hash}: log spine is not the predecessor's extended by this commit"
+                ));
             }
 
             genesis = hash;

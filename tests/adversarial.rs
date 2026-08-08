@@ -27,6 +27,7 @@ use tempfile::TempDir;
 
 /// One attack outcome. `detected` is what verification did; `expected` is what
 /// we claim in the paper.
+#[derive(Clone)]
 struct Outcome {
     attack: &'static str,
     detected: bool,
@@ -432,17 +433,16 @@ fn a12_reattach_erased_content() {
 
 // ---------------------------------------------------------------- report
 
-/// Runs last (alphabetically after the attacks) and prints the table.
+/// Prints whatever attacks have reported so far. Correctness is asserted per
+/// attack inside `record()` (before the shared lock is touched), so this test
+/// carries no assertions and no cross-test ordering dependency — it only
+/// snapshots and prints, never holding the lock across a panic.
 #[test]
 fn zz_report() {
-    // Give the attack tests a chance to run first when threads are in use.
-    for _ in 0..40 {
-        if RESULTS.lock().unwrap().len() >= 11 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let mut rows = RESULTS.lock().unwrap();
+    let mut rows = {
+        let guard = RESULTS.lock().unwrap();
+        guard.clone()
+    };
     rows.sort_by_key(|r| r.attack);
     eprintln!("\n  ADVERSARIAL EVALUATION: operator controls storage and serving code");
     eprintln!("  {:<42} {:<10} by", "attack", "detected");
@@ -463,10 +463,9 @@ fn zz_report() {
     }
     eprintln!("  {}", "-".repeat(84));
     eprintln!(
-        "  {caught} detected, {missed} undetected (of {} run)\n",
+        "  {caught} detected, {missed} undetected (of {} reported)\n",
         rows.len()
     );
-    assert!(rows.iter().all(|r| r.detected == r.expected));
 }
 
 /// Re-emit a bundle with a shortened `retrievals.jsonl`, a corrected count in

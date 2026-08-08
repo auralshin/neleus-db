@@ -15,13 +15,15 @@ use crate::lock::process_is_alive;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide durability policy (config `durability`):
-/// - os (default): no fsync. Renames stay crash-of-process atomic; power
-///   loss can drop recent writes but never corrupts (objects verifiable,
-///   refs WAL-recovered).
-/// - full: fsync file + dir per atomic write; power-loss durable.
+/// - full (default): fsync file + dir per atomic write, so the temp file's
+///   bytes reach disk before the publishing rename and the rename before the
+///   next op — power-loss durable, no torn commit/ref.
+/// - os: no fsync. Renames stay crash-of-process atomic and are faster, but a
+///   power loss can drop or tear a just-acknowledged write. Opt-in only.
 ///
-/// Global because `write_atomic` has no config context; set at open.
-static FSYNC_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Global because `write_atomic` has no config context; set at open. Defaults
+/// to durable so an unset config never silently trades away crash safety.
+static FSYNC_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Switch the process-wide durability policy (true = fsync everything).
 pub fn set_full_durability(enabled: bool) {

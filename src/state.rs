@@ -428,9 +428,9 @@ impl StateStore {
         verify_path(manifest.root, key, &proof.path, &proof.outcome)
     }
 
-    /// Every hash reachable from state `root`: the manifest, its nodes, and
-    /// each entry's value blob. GC asks the state store rather than re-deriving
-    /// the DAG shape.
+    /// Every hash reachable from state `root`: the manifest, its nodes, each
+    /// entry's value blob, and the content blob any session record points at.
+    /// GC asks the state store rather than re-deriving the DAG shape.
     pub fn reachable_from(&self, root: StateRoot) -> Result<Vec<Hash>> {
         let manifest = self.load_manifest_or_empty(root)?;
         let mut out = Vec::new();
@@ -446,6 +446,12 @@ impl StateStore {
                     for (_, v) in entries {
                         if let ValueRef::Value(h) = v {
                             out.push(*h);
+                        }
+                        // Session turns store their content in a separate blob
+                        // referenced from the CBOR record held here; GC must
+                        // follow it or `db gc --prune` deletes live turn content.
+                        if let Some(content) = session_content_ref(&self.read_value(v)?) {
+                            out.push(content);
                         }
                     }
                 }
@@ -700,6 +706,14 @@ fn new_state_manifest(root: Option<Hash>) -> StateManifest {
 /// `ObjectStore::put_serialized(STATE_TAG, node)` so proofs verify offline.
 fn node_hash(node: &StateNode) -> Result<Hash> {
     Ok(hash_typed(STATE_TAG, &to_cbor(node)?))
+}
+
+/// If `value` is a session record, its referenced content-blob hash. Returns
+/// `None` for any other state value. Used by GC to keep session turn content
+/// reachable.
+fn session_content_ref(value: &[u8]) -> Option<Hash> {
+    let record: crate::session::SessionRecord = crate::canonical::from_cbor(value).ok()?;
+    (record.schema_version == crate::session::SESSION_SCHEMA_VERSION).then_some(record.content)
 }
 
 fn value_commit(value: &ValueRef) -> Hash {

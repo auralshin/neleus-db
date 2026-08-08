@@ -2,7 +2,7 @@
 name = "neleus-db"
 version = "0.2.0"
 edition = "2024"
-description = "Tamper-evident state for AI agents — prove what your agent knew when it decided. Content-addressed Merkle-DAG database: cryptographic proofs, immutable versioning, retrieval audit, write-time policy engine."
+description = "Content-addressed database in Rust for AI agent memory. Every write becomes a Merkle-DAG object you can verify offline, so you can prove what an agent knew when it decided. Immutable history, retrieval audit, write-time policy checks."
 license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/auralshin/neleus-db"
@@ -48,7 +48,6 @@ zstd = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.5"
 rand = "0.8"
 rusqlite = "0.37"
 tempfile = "3.16"
@@ -79,7 +78,7 @@ codegen-units = 1
 # Crypto/hash/compression deps dominate test and bench runtime. Compiling them
 # at opt-level=3 while leaving this crate at opt-level=0 keeps incremental
 # builds fast and shrinks the test suite wall time dramatically — measured ~6×
-# on the state proptests. Cached after the first build.
+# on the state exhaustive tests. Cached after the first build.
 [profile.dev.package."*"]
 opt-level = 3
 

@@ -40,9 +40,8 @@ hits = db.search("main", "policy", mode="hybrid", top_k=5)
 proof = db.prove(commit, hits[0]["chunk"])       # bytes (CBOR bundle)
 assert db.verify_proof(proof)["valid"]
 
-# audit, fully in-process
+# audit, fully in-process — record_query commits the chained record itself
 qm = db.record_query("main", "policy", principal="agent:reviewer")
-db.commit("main", "audited retrieval", manifests=[qm])
 db.checkpoint("main")
 db.audit_export("main", "q1.nelaudit")              # offline-verifiable bundle
 
