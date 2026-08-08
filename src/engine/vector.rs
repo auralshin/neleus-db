@@ -454,6 +454,25 @@ fn prune(
     list.extend(scored.into_iter().take(m_max).map(|(_, id)| id));
 }
 
+/// Exact top-k over an explicit node list. Cost is the caller's candidate
+/// count, not the segment's: a tenant holding 100 of 50,000 vectors should not
+/// pay for the other 49,900.
+pub fn exact_search_over(
+    vectors: &[Vec<f32>],
+    nodes: &[u32],
+    query: &[f32],
+    k: usize,
+) -> Vec<(f32, u32)> {
+    let mut hits: Vec<(f32, u32)> = nodes
+        .iter()
+        .filter(|&&n| vectors[n as usize].len() == query.len())
+        .map(|&n| (dot(query, &vectors[n as usize]), n))
+        .collect();
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+    hits.truncate(k);
+    hits
+}
+
 /// Exact top-k scan: oracle + fallback path.
 pub fn exact_search(
     vectors: &[Vec<f32>],

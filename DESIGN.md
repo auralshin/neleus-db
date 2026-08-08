@@ -39,6 +39,7 @@ verified by hash equations.
     heads/<name>                 commit refs
     states/<name>                staged state refs
     checkpoints/<name>           checkpoint-chain refs
+    queries/<name>               retrieval audit-chain tip
   index/
     segments/<hash>              immutable retrieval index segments
     heads/<commit>               segment set serving a commit
@@ -62,9 +63,9 @@ Domain tags include:
 - `blob:`
 - `manifest:`
 - `manifest_leaf:`
-- `state_node:`
-- `state_leaf:`
-- `state_manifest_leaf:`
+- `state_node:` (covers state nodes *and* the state manifest; leaves and
+  branches are hashed uniformly as `dag_cbor(StateNode)`)
+- `state_level:` (key-boundary derivation, not an object domain)
 - `merkle_node:`
 - `commit:`
 - `commit_payload:`
@@ -166,7 +167,7 @@ cases are a single root→leaf path — proof size is the tree height
 
 ## 7. Manifests
 
-`MANIFEST_SCHEMA_VERSION` is `4`.
+`MANIFEST_SCHEMA_VERSION` is `5`.
 
 Implemented manifest families:
 
@@ -184,8 +185,11 @@ Implemented manifest families:
   each run is the *declared* identity; neleus records what the caller stated, it
   cannot cryptographically attest which remote model actually ran.
 - `QueryManifest`: content-addressed retrieval audit record containing query
-  text or embedding, filters, principal, commit, mode, top-k, and returned
-  chunk hashes.
+  text or embedding, filters, principal, commit, mode, top-k, returned chunk
+  hashes, and (v5) `seq` + `prev` linking it into the head's audit chain.
+  `Engine::record_query_at_head` allocates the sequence, commits the record,
+  and advances `refs/queries/<head>`. A gap in the sequence proves a record
+  was removed from an export; it cannot prove one was never recorded.
 
 `ChunkMetadata` supports retrieval filtering:
 
@@ -308,7 +312,7 @@ the carried bytes by hash equations.
 Checkpoints form an append-only hash chain per head under
 `refs/checkpoints/<head>`.
 
-Each checkpoint records:
+Each checkpoint records (schema version `2`):
 
 - head name
 - commit hash
@@ -317,6 +321,11 @@ Each checkpoint records:
 - author
 - optional signature
 - payload hash
+- `log_root`: Merkle root (RFC 6962 shape, leaf count sealed in) over every
+  commit checkpointed on this head so far, plus `log_spine` (the perfect
+  subtree roots) so the next append is O(log J) rather than a rebuild. `prove_commit_logged` and
+  `prove_append_only` yield O(log J) proofs that verify offline; the chain walk
+  remains available but is O(J).
 
 `CheckpointStore::verify_chain` walks from the current checkpoint tip to
 genesis, verifies hash links, and optionally requires signatures.
@@ -419,7 +428,6 @@ integrity footer. Pack verification checks structure and hashes.
 
 The implementation intentionally does not include:
 
-- Prolly-tree state storage; state proofs remain scan-prefix based.
 - In-process TLS; deploy TLS/mTLS in front of the server.
 - External KMS/HSM integration.
 - Distributed consensus; replication is git-style fast-forward sync.

@@ -2,13 +2,15 @@
 
 # 🔱 Neleus DB
 
-## The verifiable context engine for AI agents
+## Tamper-evident state for AI agents — prove what your agent knew when it decided
 
-Fast hybrid retrieval, git-like versioned state, and session memory — where
-every answer carries a cryptographic receipt. Sub-millisecond warm queries;
-any hit upgrades to an offline-verifiable Merkle proof. Ships with an audit
-surface: signed audit export and a standalone verifier (`neleus-verify`) an
-auditor runs without Neleus.
+neleus-db is a tamper-evident, content-addressed Merkle-DAG database for AI
+agent memory, written in Rust. Fast hybrid retrieval (BM25 + vectors),
+git-like immutable versioning, and session memory — where every answer
+carries a cryptographic receipt. Sub-millisecond warm queries; any hit
+upgrades to an offline-verifiable Merkle proof. Ships with an audit surface:
+signed audit export and a standalone verifier (`neleus-verify`) an auditor
+runs without Neleus.
 
 [Get started](docs/getting-started.md) · [CLI](docs/cli.md) · [HTTP API](docs/http-api.md) · [Benchmarks](BENCHMARKS.md) · [Design](DESIGN.md) · [Report Bug](https://github.com/auralshin/neleus-db/issues/new?labels=bug)
 
@@ -63,7 +65,8 @@ offers cryptographic tamper-evidence as of mid-2026 — see
 - Checkpoint chains: an append-only transparency log over each head
   (`checkpoint new/verify`); publish the latest hash anywhere to externally
   anchor the whole history
-- Content-addressed query audit records (`search --audit`)
+- Content-addressed query audit records (`search --audit`), sequence-chained
+  per head so a record dropped from an export is detectable
 - Offline chunk proofs spanning commit ancestry
 
 **Operations**
@@ -121,6 +124,12 @@ curl -H "Authorization: Bearer nlk_..." -d '{"at":"main","query":"reset policy"}
 Tenant keys (`auth add-key --tenant acme`) are hard-partitioned: they can
 only touch heads under `acme/`, every search is forced to their tenant
 filter, and raw blob/replication endpoints are unreachable.
+
+> **Note on scoring.** BM25 collection statistics are scoped to the caller's
+> partition, so a tenant's scores do not reveal documents it cannot see; a term
+> appearing only in hidden documents looks absent. Vector-search *timing* can
+> still depend on hidden data (HNSW traversal crosses non-matching nodes to
+> preserve recall) — see [BENCHMARKS.md §5](BENCHMARKS.md#fixed-bm25-collection-statistics-are-now-tenant-scoped).
 
 ### Web console + policy enforcement
 
@@ -204,9 +213,10 @@ refs/     heads, staged state,           in-memory caches: segments, state,
           checkpoint chains                               blobs (byte-budgeted)
 ```
 
-Hash domains: `blob:`, `manifest:`, `state_node:`, `commit:`, `checkpoint:`,
-`state_leaf:`, `merkle_node:`, `commit_payload:`, `checkpoint_payload:` —
-all BLAKE3 over canonical DAG-CBOR. Golden-byte tests lock the encodings.
+Hash domains: `blob:`, `manifest:`, `manifest_leaf:`, `state_node:`,
+`state_level:`, `commit:`, `commit_payload:`, `checkpoint:`,
+`checkpoint_payload:`, `merkle_node:`, `index_segment:` — all BLAKE3 over
+canonical DAG-CBOR. Golden-byte tests lock the encodings.
 
 The serving plane is never hashed into identity: delete `index/` and lose
 nothing but warm-up time.
@@ -218,7 +228,7 @@ nothing but warm-up time.
 | At rest | AES-256-GCM / ChaCha20-Poly1305 per object; Argon2id (19 MiB, t=2) master key; per-object HKDF keys; key rotation |
 | In transit | server is loopback-only unless `--allow-remote` + keys; TLS terminates in front (no in-process TLS by design) |
 | AuthN | `nlk_` bearer tokens, BLAKE3-hashed at rest, constant-time compare, instant revocation |
-| AuthZ | reader < writer < admin; tenant keys hard-partitioned structurally |
+| AuthZ | reader < writer < admin; tenant keys hard-partitioned structurally; BM25 statistics partition-scoped |
 | Tamper evidence | content addressing + signed commits + checkpoint chains + offline proofs |
 | Memory hygiene | keys zeroized on drop; 0600 key files; secrets never logged or stored |
 | Durability | `os` (crash-safe, fast) / `full` (power-loss durable) per database |
@@ -226,10 +236,12 @@ nothing but warm-up time.
 ## Testing & benchmarks
 
 ```bash
-cargo test            # 278 tests: determinism, proofs, recovery, tenancy,
+cargo test            # 311 tests: determinism, proofs, recovery, tenancy,
                       # HNSW recall >= 0.90 vs exact oracle, end-to-end HTTP
 cargo bench --bench compare_sql   # vs SQLite on your machine
 cargo bench --bench scale         # 100k chunks, 1536d vectors, coalesced writes
+cargo bench --bench state         # proof size + offline verification time
+cargo bench --bench verifiability # chain scaling, cold audit, tenant leakage
 ```
 
 See [BENCHMARKS.md](BENCHMARKS.md) for measured results and market context.
@@ -257,7 +269,9 @@ neleus-verify q1.nelaudit --public-key <hex>       # offline, no Neleus needed
 
 ## License
 
-neleus-db is source-available under [PolyForm Noncommercial 1.0.0](LICENSE):
-use it, modify it, and redistribute it freely for any noncommercial purpose.
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Commercial
-use requires a separate license from the maintainer; open an issue to ask.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in this work
+by you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions. Contributions are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md).

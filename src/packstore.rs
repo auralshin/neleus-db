@@ -246,7 +246,7 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
     if loose.is_empty() {
         return Ok(RepackStats::default());
     }
-    loose.sort_by(|a, b| a.0.cmp(&b.0));
+    loose.sort_by_key(|a| a.0);
     loose.dedup_by(|a, b| a.0 == b.0);
 
     let pack_dir = cas_root.join(PACK_DIR);
@@ -326,7 +326,7 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
 
         if !live_locs.is_empty() {
             let mut ordered = live_locs;
-            ordered.sort_by(|a, b| a.0.cmp(&b.0));
+            ordered.sort_by_key(|a| a.0);
             let count = ordered.len();
             let src_path = pack_path.clone();
             let sources = ordered.into_iter().map(move |(h, loc)| {

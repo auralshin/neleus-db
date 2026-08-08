@@ -415,8 +415,8 @@ pub fn enforce_write(db: &Database, ctx: &WriteContext) -> Result<()> {
             continue;
         }
         let enforced = policy.mode == Mode::Enforce;
-        if enforced || !policy.rule.is_global() {
-            if let Ok(event) = crate::events::append(
+        if (enforced || !policy.rule.is_global())
+            && let Ok(event) = crate::events::append(
                 &db.root,
                 "policy.violation",
                 serde_json::json!({
@@ -430,9 +430,9 @@ pub fn enforce_write(db: &Database, ctx: &WriteContext) -> Result<()> {
                     "enforced": enforced,
                     "detail": why,
                 }),
-            ) {
-                notify(set.webhook.as_deref(), &event);
-            }
+            )
+        {
+            notify(set.webhook.as_deref(), &event);
         }
         if enforced && blocked.is_none() {
             blocked = Some((policy.id.clone(), why));

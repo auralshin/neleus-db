@@ -19,35 +19,43 @@ default `durability: os` policy, which is the same durability class
 
 | Operation | neleus-db | SQLite | Ratio |
 |---|---|---|---|
-| Point get (warm) | **0.48 µs** | 2.17 µs | **4.5x faster** |
-| BM25 top-10 over 10k chunks | **115 µs** | 572 µs (FTS5) | **5.0x faster** |
-| Vector top-10 (HNSW, 5k × 128d) | **232 µs** | n/a — no native ANN in SQLite | — |
-| Hybrid top-10 (BM25 ∥ vector, RRF) | **408 µs** | n/a | — |
-| Point set, coalesced (8 concurrent writers) | **234 µs/op** | ~29 µs | ~8x slower |
-| Point set, direct single op | 398 µs | **29 µs** | ~13.7x slower |
+| Point get (warm) | **0.48 µs** | 3.19 µs | **6.7x faster** |
+| BM25 top-10 over 10k chunks | **164 µs** | 866 µs (FTS5) | **5.3x faster** |
+| Vector top-10 (HNSW, 5k × 128d) | **293 µs** | n/a — no native ANN in SQLite | — |
+| Hybrid top-10 (BM25 ∥ vector, RRF) | **482 µs** | n/a | — |
+| Point set, coalesced (8 concurrent writers) | **199 µs/op** | 35.8 µs | ~5.6x slower |
+| Point set, direct single op | 430 µs | **35.8 µs** | ~12.0x slower |
 
 The state store is a prolly tree (content-defined B+-tree, DESIGN §5). With
 fanout ~32 the tree is shallow (~3 node loads at 10k keys), so warm point-get
-measures **0.48 µs** — faster than the former segment store's 0.68 µs, not a
-regression. Single-op set is 398 µs (was 754 µs on the segment store);
-coalesced writes are 234 µs/op (tight CI, load-insensitive). BM25/vector/hybrid
-are unaffected by the state rewrite.
+measures **0.48 µs**. Single-op set is 430 µs; the coalescer amortizes 8
+concurrent writers to 199 µs/op.
+
+Each row is the mean of three independent runs. The engine's own figures vary
+by ≤1.3% run-to-run; SQLite is noisier (FTS5 3.7%, insert 4.1%), and its FTS5
+median moved 11% across our three runs, which alone shifts the BM25 ratio from
+4.8x to 5.3x. Do not read these ratios to better than half a significant figure.
 
 Scale points and ingest component breakdown (`cargo bench --bench scale`):
 
 | Component | Result |
 |---|---|
-| BLAKE3 hash-only, 100k chunks, 1 thread | 12.5 ms |
-| Bulk document ingest, 100k chunks (hash + encrypt + pack-first write + Merkle commit) | **0.22 s** |
-| Per-chunk-manifest ingest, 10k chunks with 1536d embeddings (3 loose objects per chunk) | 15.1 s (~0.5 ms/chunk) |
-| BM25 index build, 100k chunks | 1.4 s |
-| HNSW build, 10k × 1536d (SQ8 metric, batched-parallel) | 4.8 s |
-| BM25 top-10 over **100k** chunks | 1.13 ms |
-| Vector top-10, **10k × 1536d** (SQ8 traversal, f32 rerank) | 1.48 ms |
+| BLAKE3 hash-only, 101k chunks, 1 thread | 17.8 ms |
+| Bulk document ingest, 100k chunks (chunk + hash + pack-first write + Merkle commit) | **0.41 s** (~4.1 µs/chunk) |
+| Per-chunk-manifest ingest, 10k chunks with 1536d embeddings (3 loose objects per chunk) | 19.7 s (~2.0 ms/chunk) |
+| BM25 index build, 100k chunks | 1.64 s |
+| HNSW build, 10k × 1536d (SQ8 metric, batched-parallel) | 3.16 s |
+| BM25 top-10 over **100k** chunks | 1.65 ms |
+| Vector top-10, **10k × 1536d** (SQ8 traversal, f32 rerank) | 459 µs |
 
-These are separate measurements: the 0.22 s row is the 100k *text* corpus
-pipeline (no vectors); the 4.8 s row is graph construction for a 10k
-*vector* corpus. They are not one pipeline.
+These are separate measurements: the 0.41 s row is the 100k *text* corpus
+pipeline (no vectors); the 3.16 s row is graph construction for a 10k
+*vector* corpus. They are not one pipeline. Encryption is **off** in all of
+the above, so these figures isolate content-addressing cost, not AEAD cost.
+
+The bulk path is ~480x cheaper per chunk than the per-chunk-manifest path
+(4.1 µs vs 2.0 ms). That gap is per-file metadata operations, not hashing:
+BLAKE3 over the whole corpus is 17.8 ms, about 176 ns/chunk.
 
 Write path: the state store is a prolly tree (content-defined B+-tree,
 DESIGN §5). A `set` copy-on-writes its short root→leaf path — `~log32(n)` nodes
@@ -56,25 +64,24 @@ DESIGN §5). A `set` copy-on-writes its short root→leaf path — `~log32(n)` n
 ~60–100 µs each; SQLite pays one sequential WAL append. Bulk loads (`set_many`
 / `write_many` into an empty base) build the canonical tree bottom-up in one
 pass, writing each node once instead of re-walking the path per key. The
-coalescer batches concurrent single writes into one flush: **~234 µs/op** under
-8 writers, unchanged from the former segment store.
+coalescer batches concurrent single writes into one flush: **~199 µs/op** under
+8 writers, a 2.2x amortization of the 430 µs single-op path.
 
 Notes:
 
-- **BM25 beats SQL.** BM25 search is 5.0x faster than FTS5 on the same data
+- **BM25 beats SQL.** BM25 search is 5.3x faster than FTS5 on the same data
   (dense score accumulation + MaxScore term pruning). Every neleus read also
   carries provenance (commit + chunk hash) that SQLite rows do not have. Warm
   point-get is a shallow B+-tree descent (~3 node loads at 10k keys) measured
-  at 0.48 µs — faster than the segment store, recovering the read speed the
-  binary treap had regressed.
+  at 0.48 µs.
 - **BM25 scaling caveat:** 10k -> 100k chunks scaled latency ~10x on this
   synthetic corpus because its 34-word vocabulary makes every query term
   maximally dense — MaxScore's worst case. Real (Zipfian) corpora have
-  high-IDF rare terms where pruning skips most postings; treat 1.13 ms as
+  high-IDF rare terms where pruning skips most postings; treat 1.65 ms as
   the dense-corpus upper bound at 100k.
 - **Two ingestion shapes.** Bulk documents take the pack-first path: chunks
-  are hashed/encrypted in parallel and appended to one pack file + index
-  (two sequential files instead of 100k loose creates) — 0.22 s per 100k.
+  are hashed in parallel and appended to one pack file + index
+  (two sequential files instead of 100k loose creates) — 0.41 s per 100k.
   Per-chunk `ChunkManifest` ingestion (one text blob, one embedding blob,
   one manifest object per chunk) still writes loose objects individually;
   batch it with `BlobStore::put_many` where the call site allows.
@@ -100,7 +107,7 @@ encrypted-SQL baseline.
 
 neleus-db's model differs structurally: encryption is per content-addressed
 object, the master key is Argon2id-derived once at open, and the read cache
-holds plaintext in-process — so warm reads (the 0.67 µs path) pay zero
+holds plaintext in-process — so warm reads (the 0.48 µs path) pay zero
 decryption regardless of scan shape. There is no unindexed-scan cliff
 because retrieval always goes through the index segments.
 
@@ -116,8 +123,8 @@ buffer pool). Published reference points at the 100k–1M vector scale:
 - Typical production HNSW p99 at 1M vectors / 95–99% recall: 10–50 ms
   depending on hardware and ef_search.
 - These are all **server-side numbers before network** (add 0.1–5 ms per
-  hop in production). The measured neleus path is in-process: 239 µs at
-  128d, 1.69 ms at 1536d, zero hops. For agent loops where retrieval sits
+  hop in production). The measured neleus path is in-process: 293 µs at
+  128d, 459 µs at 1536d, zero hops. For agent loops where retrieval sits
   on the critical path of every LLM call, in-process beats client-server
   by the network round-trip alone, every call.
 
@@ -194,10 +201,10 @@ asymptotic shape each one moves along.
 
 | Artifact | Size | Generate | Verify (offline) |
 |---|---|---|---|
-| State inclusion proof (100 keys) | 2.4 KB | 3.4 µs | **7.7 µs** |
-| State non-inclusion proof (100 keys) | 1.2 KB | 1.5 µs | **4.3 µs** |
-| Chunk proof (depth-9 ancestry, content included) | 11.6 KB | 471 µs | **32 µs** |
-| Audit bundle (64 retrievals, unsigned) | 108 KB | 7.03 ms (export) | **0.95 ms** |
+| State inclusion proof (100 keys) | 2.4 KB | 3.35 µs | **7.48 µs** |
+| State non-inclusion proof (100 keys) | 1.2 KB | 1.45 µs | **4.40 µs** |
+| Chunk proof (depth-9 ancestry, content included) | 11.6 KB | 532 µs | **32.4 µs** |
+| Audit bundle (64 retrievals, unsigned) | 194 KB | 7.92 ms (export) | **1.32 ms** |
 
 - **State proofs** are a single root→leaf path in the prolly tree (a
   content-defined B+-tree) — both membership and non-membership are
@@ -221,16 +228,221 @@ asymptotic shape each one moves along.
   BST path; chunk/audit claims re-derive from carried bytes by BLAKE3 hash
   equations and a CBOR decode. Verify time tracks proof size.
 
-Still uninstrumented: size/verify *curves* across proof depth, state size,
-and bundle length (only the points above are measured), and signed-bundle
-verification.
+Still uninstrumented: size/verify curves across proof depth and state size,
+and signed-bundle verification. Chain-length and bundle-length curves are in
+§5.
+
+## 5. Measured: auditor-side cost and the tenant-statistics channel
+
+`cargo bench --bench verifiability`. Same machine as §1.
+
+**Checkpoint chains are linear.** ~43 µs per checkpoint to verify, tip to
+genesis:
+
+| Chain length J | 1 | 10 | 100 | 1,000 | 10,000 |
+|---|---|---|---|---|---|
+| `verify_chain` | 64 µs | 361 µs | 3.48 ms | 55.4 ms | **434 ms** |
+
+Projected by anchoring cadence: one/day → J≈365/yr → 16 ms. One/hour →
+J≈8.8k/yr → 380 ms. One/minute → J≈526k/yr → ~23 s. **Checkpoint cadence is a
+security-relevant setting**: anchoring more finely shrinks the
+post-compromise window but costs verification time linearly. A Merkle history
+tree would answer the same query in ~14 hashes at J=10⁴.
+
+**Audit bundles grow linearly at ~3.1 KB / 20 µs per retrieval.**
+
+| Retrievals R | 1 | 8 | 64 | 512 |
+|---|---|---|---|---|
+| Bundle bytes | 3,991 | 25,726 | 199,704 | 1,592,312 |
+| Per retrieval | — | 3,216 B | 3,120 B | **3,110 B** |
+| In-process verify | 47.9 µs | 187 µs | 1.41 ms | 10.5 ms |
+| Cold standalone (`neleus-verify` process) | 31.6 ms* | 2.61 ms | 4.37 ms | 13.6 ms |
+
+\*first run, binary not yet in page cache. Steady-state process overhead is
+2.4–3.2 ms, which dominates small bundles. Extrapolated: 1M retrievals ≈
+3.1 GB and ≈20 s to verify.
+
+**Cold vs warm state proofs.** A state proof verifies in **13.5 µs warm** but
+**109 ms** against a freshly opened database — almost all of it
+`Database::open` (recovery lock, WAL replay, orphan-temp sweep), not
+verification. Use `StateProof::verify`, which rebuilds and re-hashes the
+manifest from the proof's own bytes and needs no store at all.
+
+### Fixed: BM25 collection statistics are now tenant-scoped
+
+BM25 computes `idf` from `N` (chunk count) and `df` (document frequency).
+These were segment-global and computed **before** metadata filters, so a
+tenant's own score was a function of documents it could not see. Two queries
+recovered another tenant's corpus size and any term's document frequency
+*exactly*: probe a nonce term (df=1) to solve for `N`, then probe the target
+term to solve for its `df`. Inverting a measured score at (N, df) = (1001, 37)
+recovered df = 37.000000.
+
+Collection statistics are now scoped to the visible partition, and a term
+occurring only in hidden documents is indistinguishable from an absent one.
+Measured after the fix: the attacker's own score is bit-identical across 0,
+1, 2, 10, 100 and 500 hidden documents, whether or not those documents
+contain the probe term. Guarded by `tenant_scores_are_independent_of_hidden_documents`
+and by the `[q5]` assertion in `cargo bench --bench verifiability`.
+
+### Fixed: selective filters no longer degenerate HNSW into a full scan
+
+The beam admits a node when it beats the worst *matching* result, so under a
+selective filter that radius is set by the ef-th nearest **visible** vector and
+admits most of the segment; the early exit cannot fire until ef matching
+results exist. Traversal touched 79-89% of all vectors, at a cost proportional
+to rows the caller cannot see -- and was **slower than not using the index**.
+
+The graph/scan decision is now selectivity-aware (graph only when the filter
+leaves >= half the segment visible). Measured at 1200 visible vectors, dim 64:
+
+| hidden vectors | 0 | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|---|
+| before | 26.8 µs | 44.1 µs | 121 µs | **524 µs** |
+| after | 27.1 µs | 44.9 µs | 93.8 µs | **265 µs** |
+
+2x faster at 20k hidden, leak amplitude 19.6x -> 9.8x, zero recall cost (the
+exact path is the oracle the recall tests pin against).
+
+### Fixed (vector): segments carry a tenant index
+
+A tenant-scoped filter now starts from its own partition instead of scanning
+every chunk, and allowed docs map to vector nodes by binary search. Measured
+with a tenant holding **100 documents** as co-tenant volume grows:
+
+| co-tenant docs | 0 | 1,000 | 10,000 | 50,000 |
+|---|---|---|---|---|
+| vector before | 4.7 µs | 10.1 µs | 54.9 µs | **272 µs** |
+| vector after | 10.9 µs | 6.1 µs | 5.9 µs | **5.6 µs** |
+| bm25 before | 5.0 µs | 9.9 µs | 66.6 µs | **320 µs** |
+| bm25 after | 4.9 µs | 4.7 µs | 24.7 µs | **104 µs** |
+
+Vector is **flat**: 49x faster at 50k co-tenant docs, and no signal left.
+This is a performance fix as much as a leak fix -- a small tenant in a large
+database was paying 65x for data it cannot see.
+
+**Residual (lexical):** BM25 walks posting lists, and postings are shared
+across tenants, so a common term's list is as long as the segment regardless
+of who asks. The dense score accumulator and allowed-doc mask are also O(total).
+Closing it needs per-tenant *postings*, i.e. separate segments per tenant.
+Until then: **do not put mutually distrusting tenants in one segment.**
+
+### Fixed: retrieval records are sequence-chained
+
+Records now carry `seq` (contiguous per head) and `prev`. `verify_bundle`
+checks both, so removing a record from an exported bundle is caught even
+though every surviving record still hashes correctly and is still reachable
+from the tip. Covered by `withheld_retrieval_is_detected`. This detects
+post-hoc removal, **not** a retrieval that was never recorded: recording is
+still caller-requested, so the counter simply never advances.
+
+### Fixed: audit records were never committed
+
+`search --audit` recorded a `QueryManifest` but did not attach it to the head.
+`audit::collect` walks commits, so `audit export` returned **0 retrievals**,
+and `db gc --prune` reclaimed the record as unreachable garbage. The
+documented audit workflow produced empty bundles. `record_query_at_head` now
+commits the record; `tests/audit_flow.rs` covers export, offline verification,
+and survival of a prune.
+
+### Fixed: gc destroyed the transparency log
+
+The mark phase walked `refs/heads` and `refs/states` only. Checkpoints are
+referenced by no commit — that independence is what makes the chain survive a
+history rewrite — so `db gc --prune` swept the entire chain and
+`verify_chain` failed on a missing object. Checkpoint refs are now a mark
+root, and the commits they pin are kept alive with them. The same pass added
+`QueryManifest` and `SummaryManifest` to the fail-closed manifest classifier,
+which would otherwise abort every prune once either became reachable.
+
+### Fixed: Merkle roots now determine their own leaf count
+
+The tree paired leaves left-to-right and duplicated a lone trailing node, so
+`root([a,b,c]) == root([a,b,c,c])`: a root did not fix its leaf count and a
+proof could be replayed against a log the prover never had. (Reachable only
+from test-only helpers, so nothing on disk was affected.)
+
+Rebuilt in the RFC 6962 shape (split at the largest power of two below `n`),
+with the leaf count sealed into the published root. This adds **consistency
+proofs**, which a linear hash chain cannot express at any cost: given an old
+anchor and a new root, a verifier confirms the log only ever grew.
+
+| log size | inclusion | bytes | consistency | bytes |
+|---|---|---|---|---|
+| 10³ | 10 hashes | 694 | 9 hashes | 628 |
+| 10⁴ | 14 hashes | 958 | 12 hashes | 826 |
+| 10⁵ | 17 hashes | 1158 | 14 hashes | 960 |
+
+For reference, immudb's inclusion proof is a flat 622 B. About half our excess
+is that `Hash` serializes as a 64-char hex string rather than 32 raw bytes.
+
+**Now wired into checkpoints.** Each checkpoint publishes `log_root`, a Merkle
+root over every commit checkpointed on its head. Anchor verification stops
+being a chain walk:
+
+| J | chain walk (old) | inclusion proof | verify | consistency |
+|---|---|---|---|---|
+| 100 | 2.42 ms | 7 hashes, 494 B | 1.07 µs | 1.18 µs |
+| 1,000 | 29.2 ms | 10 hashes, 694 B | 1.50 µs | 1.80 µs |
+| 5,000 | 138 ms | 13 hashes, 892 B | **1.84 µs** | 2.06 µs |
+
+~75,000x faster at J=5000, and offline: proofs need no database. Consistency
+proofs are new capability, not just a speedup -- a verifier holding last
+quarter's digest can confirm history was appended to, not rewritten.
+
+Appending is incremental, not a rebuild: each checkpoint carries the perfect
+subtree roots its log decomposes into (width = popcount of the length), so a
+new entry is a binary increment over O(log J) hashes. Measured flat:
+
+| chain length J | 100 | 1,000 | 5,000 | 10,000 |
+|---|---|---|---|---|
+| cost per `checkpoint new` | 1.46 ms | 1.30 ms | 1.30 ms | 1.24 ms |
+
+A rebuild would have walked the chain instead: ~400 ms of object reads at
+J=10,000. Proof *generation* still gathers all leaves, which is inherent.
+
+## 6. Adversarial evaluation
+
+`cargo test --test adversarial -- --nocapture`. Twelve attacks by an operator
+that controls storage and serving code. Outcomes are asserted, **including the
+one that succeeds**, so a gap that later closes fails the suite rather than
+passing quietly.
+
+| attack | detected | by |
+|---|---|---|
+| Forge a commit into an anchored log | yes | log root |
+| Replay a proof at another index | yes | sealed index |
+| Rewrite history below an anchor | yes | consistency proof |
+| Truncate the log | yes | root mismatch |
+| Equivocate between verifiers | yes | anchor comparison |
+| Withhold a record from a bundle | yes | sequence gap |
+| Swap content into a chunk proof | yes | blob hash |
+| Truncate a chunk proof's ancestry | yes | parent link |
+| Replay a state proof at another root | yes | sealed root |
+| Claim a present key is absent | yes | leaf inspection |
+| Reattach erased content | yes | erasure flag |
+| **Serve retrievals, record none** | **NO** | *an empty log is a valid log* |
+
+Three of the history attacks were undetectable before the Merkle log landed:
+a linear chain cannot express consistency between two log sizes.
+
+The undetected one is structural. Sequence numbers make *removal* detectable;
+they cannot make *absence* detectable. Closing it needs the record to be
+created by something the operator does not control.
+
+Limits: the attacks are fixed in advance, not chosen adaptively in response to
+what verification rejected, and they exercise the library rather than a
+deployment.
 
 ## Reproducing
 
 ```bash
 cargo bench --bench compare_sql       # measured table, your machine
-cargo test                            # correctness suite (incl. HNSW recall >= 0.90 oracle test)
+cargo bench --bench scale             # 100k chunks, 1536d vectors, coalesced writes
+cargo bench --bench state             # proof size + offline verification time
+cargo bench --bench verifiability     # chain scaling, cold audit, tenant leakage
+cargo test                            # 311 tests (incl. HNSW recall >= 0.90 oracle)
 ```
 
-The bench prints ingest/index build times to stderr and writes criterion
-reports under `target/criterion/`.
+The benches print component timings to stderr and write criterion reports
+under `target/criterion/`.

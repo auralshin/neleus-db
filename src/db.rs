@@ -21,7 +21,29 @@ use crate::state::StateStore;
 use crate::wal::{Wal, WalRecoveryReport};
 
 const DB_CONFIG_SCHEMA_VERSION: u32 = 3;
-const DEFAULT_CAS_RETRIES: usize = 16;
+/// A loser re-runs `op` (a copy-on-write path rebuild) per attempt, so 16 was
+/// reachable with two competing writers.
+const DEFAULT_CAS_RETRIES: usize = 64;
+
+const CAS_BACKOFF_BASE: Duration = Duration::from_micros(50);
+/// Bounds total backoff across the budget at roughly a quarter second.
+const CAS_BACKOFF_CAP: Duration = Duration::from_millis(8);
+
+/// Jittered exponential backoff; without it contending writers retry in
+/// lockstep and burn the whole budget without either making progress.
+fn cas_backoff(attempt: usize) {
+    let window = CAS_BACKOFF_BASE
+        .saturating_mul(1u32 << attempt.min(6))
+        .min(CAS_BACKOFF_CAP);
+    let mut b = [0u8; 4];
+    // A failed draw costs jitter, not correctness.
+    let r = match getrandom::getrandom(&mut b) {
+        Ok(()) => u32::from_le_bytes(b),
+        Err(_) => std::process::id(),
+    };
+    let nanos = (r as u64) % (window.as_nanos() as u64).max(1);
+    std::thread::sleep(Duration::from_nanos(nanos));
+}
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -261,7 +283,7 @@ impl Database {
         message: &str,
         manifests: Vec<Hash>,
     ) -> Result<Hash> {
-        for _ in 0..DEFAULT_CAS_RETRIES {
+        for attempt in 0..DEFAULT_CAS_RETRIES {
             let parent = self.refs.head_get(head)?;
             let parents = parent.into_iter().collect::<Vec<_>>();
 
@@ -298,6 +320,7 @@ impl Database {
                 // otherwise fail loudly so the caller can react.
                 let parent_now = self.refs.head_get(head)?;
                 if parent_now != parent {
+                    cas_backoff(attempt);
                     continue;
                 }
                 return Err(anyhow::anyhow!(
@@ -310,6 +333,7 @@ impl Database {
             if self.refs.head_compare_and_set(head, parent, candidate)? {
                 return Ok(candidate);
             }
+            cas_backoff(attempt);
             // Head moved after we synced state. State ref now equals `state_root`,
             // so the next iteration's `staged_before` will be `Some(state_root)`
             // and the resolve will agree, making the next state CAS a no-op.
@@ -342,7 +366,7 @@ impl Database {
     where
         F: FnMut(Hash) -> Result<Hash>,
     {
-        for _ in 0..DEFAULT_CAS_RETRIES {
+        for attempt in 0..DEFAULT_CAS_RETRIES {
             let expected_state = self.refs.state_get(head)?;
             let base_root = self.resolve_base_root_for_state_update(head, expected_state)?;
             let new_root = op(base_root)?;
@@ -352,6 +376,7 @@ impl Database {
             {
                 return Ok(new_root);
             }
+            cas_backoff(attempt);
         }
 
         Err(anyhow::anyhow!(

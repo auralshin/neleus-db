@@ -1227,6 +1227,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "semantic",
                         Some(&q),
@@ -1252,6 +1253,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "vector",
                         None,
@@ -1292,6 +1294,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "hybrid",
                         q.as_deref(),
@@ -2049,6 +2052,7 @@ fn decode_key(key: &str, enc: &KeyEncoding) -> Result<Vec<u8>> {
 fn maybe_audit(
     engine: &neleus_db::Engine,
     audit: bool,
+    head: &str,
     commit: Hash,
     mode: &str,
     query: Option<&str>,
@@ -2060,7 +2064,10 @@ fn maybe_audit(
     if !audit {
         return Ok(None);
     }
-    Ok(Some(engine.record_query(
+    // Commits the record onto `head`: an unreferenced QueryManifest is
+    // invisible to `audit export` and is reclaimed by `db gc`.
+    Ok(Some(engine.record_query_at_head(
+        head,
         commit,
         mode,
         query,

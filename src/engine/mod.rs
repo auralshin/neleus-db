@@ -535,6 +535,7 @@ impl Engine {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk_hash.cmp(&b.chunk_hash))
         });
         out.truncate(top_k);
         out
@@ -633,10 +634,14 @@ impl Engine {
             }
         }
         let mut out: Vec<EngineHit> = fused.into_values().collect();
+        // Ties break on chunk hash: `HashMap` iteration order is randomized per
+        // process, so score alone leaves equal-ranked hits in an arbitrary and
+        // irreproducible order.
         out.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.chunk_hash.cmp(&b.chunk_hash))
         });
         out.truncate(top_k);
         Ok(out)
@@ -665,7 +670,45 @@ impl Engine {
 
     // ---------- audit ----------
 
-    /// Write a QueryManifest audit record. Attach to a commit to protect from GC.
+    /// Record a retrieval on `head`: chain it to the head's previous record,
+    /// commit it so it is reachable, and advance the audit-chain tip.
+    ///
+    /// The sequence number is what makes omission detectable. Integrity alone
+    /// cannot tell "no retrievals" from "retrievals withheld"; a gap can.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_query_at_head(
+        &self,
+        head: &str,
+        commit: CommitHash,
+        mode: &str,
+        query_text: Option<&str>,
+        embedding: Option<&[f32]>,
+        top_k: usize,
+        filter: &SearchFilter,
+        principal: Option<&str>,
+        hits: &[EngineHit],
+    ) -> Result<Hash> {
+        let prev = self.db.refs.query_get(head)?;
+        let seq = match prev {
+            Some(h) => self.db.manifest_store.get_query_manifest(h)?.seq + 1,
+            None => 0,
+        };
+        let manifest = self.build_query_manifest(
+            commit, mode, query_text, embedding, top_k, filter, principal, hits, seq, prev,
+        )?;
+        self.db.create_commit_at_head(
+            head,
+            principal.unwrap_or("audit"),
+            "audit: retrieval",
+            vec![manifest],
+        )?;
+        self.db.refs.query_set(head, manifest)?;
+        Ok(manifest)
+    }
+
+    /// Bare, unchained QueryManifest object (`seq = 0`, no `prev`).
+    /// Unreferenced and outside the audit chain: prefer
+    /// [`Self::record_query_at_head`].
     #[allow(clippy::too_many_arguments)]
     pub fn record_query(
         &self,
@@ -677,6 +720,25 @@ impl Engine {
         filter: &SearchFilter,
         principal: Option<&str>,
         hits: &[EngineHit],
+    ) -> Result<Hash> {
+        self.build_query_manifest(
+            commit, mode, query_text, embedding, top_k, filter, principal, hits, 0, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_query_manifest(
+        &self,
+        commit: CommitHash,
+        mode: &str,
+        query_text: Option<&str>,
+        embedding: Option<&[f32]>,
+        top_k: usize,
+        filter: &SearchFilter,
+        principal: Option<&str>,
+        hits: &[EngineHit],
+        seq: u64,
+        prev: Option<Hash>,
     ) -> Result<Hash> {
         let query_text = match query_text {
             Some(q) => Some(self.db.blob_store.put(q.as_bytes())?),
@@ -708,6 +770,8 @@ impl Engine {
                     score_micro: (h.score as f64 * 1_000_000.0).round() as i64,
                 })
                 .collect(),
+            seq,
+            prev,
         };
         self.db.manifest_store.put_manifest(&manifest)
     }
@@ -946,6 +1010,72 @@ mod tests {
             .search_semantic(commit, "cached", 5, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty(), "warm query must be served from memory");
+    }
+
+    /// Rankings must be byte-reproducible across processes. `HashMap`
+    /// iteration order is randomized per run, so a score-only sort leaves
+    /// equal-scored hits in an arbitrary order.
+    #[test]
+    fn hybrid_ranking_is_deterministic_under_ties() {
+        let (_tmp, db) = test_db();
+        // Identical text and identical embeddings force exact score ties.
+        let mut manifests = Vec::new();
+        for i in 0..12 {
+            let text = db
+                .blob_store
+                .put(format!("tied document {i} alpha beta").as_bytes())
+                .unwrap();
+            let emb = db
+                .blob_store
+                .put(&to_cbor(&vec![1.0f32, 0.0, 0.0]).unwrap())
+                .unwrap();
+            manifests.push(
+                db.manifest_store
+                    .put_manifest(&ChunkManifest {
+                        schema_version: crate::manifest::MANIFEST_SCHEMA_VERSION,
+                        chunk_text: text,
+                        start: 0,
+                        end: 8,
+                        embedding: Some(emb),
+                        metadata: None,
+                    })
+                    .unwrap(),
+            );
+        }
+        let commit = db
+            .create_commit_at_head("main", "agent", "ties", manifests)
+            .unwrap();
+        let engine = Engine::new(db);
+        let filter = SearchFilter::default();
+
+        let first: Vec<Hash> = engine
+            .search_hybrid(
+                commit,
+                Some("alpha beta"),
+                Some(&[1.0, 0.0, 0.0]),
+                10,
+                &filter,
+            )
+            .unwrap()
+            .iter()
+            .map(|h| h.chunk_hash)
+            .collect();
+        assert_eq!(first.len(), 10);
+        for _ in 0..25 {
+            let again: Vec<Hash> = engine
+                .search_hybrid(
+                    commit,
+                    Some("alpha beta"),
+                    Some(&[1.0, 0.0, 0.0]),
+                    10,
+                    &filter,
+                )
+                .unwrap()
+                .iter()
+                .map(|h| h.chunk_hash)
+                .collect();
+            assert_eq!(first, again, "hybrid ranking is not reproducible");
+        }
     }
 
     #[test]

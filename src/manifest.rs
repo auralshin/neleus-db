@@ -13,7 +13,7 @@ pub const MANIFEST_TAG: &[u8] = b"manifest:";
 const MANIFEST_REF_LEAF_TAG: &[u8] = b"manifest_leaf:";
 // All schema bumps are additive: older records decode with field defaults and
 // their hashes are unchanged.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 4;
+pub const MANIFEST_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkingSpec {
@@ -134,6 +134,14 @@ pub struct QueryManifest {
     pub principal: Option<String>,
     pub executed_at: u64,
     pub hits: Vec<QueryHit>,
+    /// Position in this head's retrieval chain, from 0. A gap proves a record
+    /// was withheld: integrity alone cannot distinguish that from silence (v5+).
+    #[serde(default)]
+    pub seq: u64,
+    /// Previous record on the same head, chaining retrievals independently of
+    /// the commit graph (v5+). `None` only for the first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev: Option<Hash>,
 }
 
 /// A single AI model invocation: inputs, outputs, retrieved context, provider metadata.

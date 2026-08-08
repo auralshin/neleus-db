@@ -1053,10 +1053,20 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             };
 
             let audit = v.get("audit").and_then(Value::as_bool).unwrap_or(false);
+            // The record is committed, so it needs a head to append to; a raw
+            // commit hash has none.
             let audit_manifest = if audit {
+                if at.len() == 64 {
+                    bail!(
+                        "bad request: 'audit' requires 'at' to name a head, not a commit hash \
+                         (the record must be committed to a head to be exportable)"
+                    );
+                }
+                let _w = state.write_lock.lock().expect("write lock poisoned");
                 Some(
                     engine
-                        .record_query(
+                        .record_query_at_head(
+                            at,
                             commit,
                             mode,
                             query,
@@ -1595,13 +1605,8 @@ mod tests {
             token,
             serde_json::json!({"at": "main", "mode": "semantic", "query": "policy", "audit": true}),
         );
-        let qm = search["audit_manifest"].as_str().unwrap();
-        post_json(
-            &url,
-            "/v1/commits",
-            token,
-            serde_json::json!({"head": "main", "message": "audit", "manifests": [qm]}),
-        );
+        // An audited search commits its own record; no follow-up commit needed.
+        assert!(search["audit_manifest"].is_string());
         post_json(
             &url,
             "/v1/checkpoints",
