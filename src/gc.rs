@@ -1,12 +1,19 @@
 //! Garbage collection: reclaim objects unreachable from any ref.
 //!
-//! Marks from `refs/heads/*` commits and `refs/states/*` roots, walking:
+//! Marks from `refs/heads/*` commits, `refs/states/*` roots, and
+//! `refs/checkpoints/*` chains, walking:
 //!
 //! ```text
 //! commit ── parents ──▶ commit
 //!   ├─ state_root ─▶ StateManifest ─▶ StateNode tree ─▶ value blob
 //!   └─ manifests  ─▶ {Doc,Run,Chunk,Provenance}Manifest ─▶ blobs / nested objects
+//! checkpoint ── prev ──▶ checkpoint
+//!   └─ commit ─▶ (as above)
+//! query ── prev ──▶ query        (retrieval audit chain)
 //! ```
+//!
+//! Checkpoints are their own root: no commit references them, so omitting
+//! them lets a prune reclaim the whole transparency log.
 //!
 //! Object and blob hashes share one reachable set — their hash-spaces are
 //! disjoint, so a hash protects only the store that holds it. Fail-closed: a
@@ -25,7 +32,9 @@ use crate::canonical::{from_cbor, to_cbor};
 use crate::db::Database;
 use crate::hash::Hash;
 use crate::lock::acquire_lock;
-use crate::manifest::{ChunkManifest, DocManifest, ManifestReferences, RunManifest};
+use crate::manifest::{
+    ChunkManifest, DocManifest, ManifestReferences, QueryManifest, RunManifest, SummaryManifest,
+};
 use crate::packstore;
 use crate::provenance::ProvenanceManifest;
 
@@ -79,8 +88,44 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
     // Empty state root is a structural constant; keep it live.
     mark_state(db, db.state_store.empty_root()?, &mut reach)?;
 
-    // Commits, transitively through parents.
+    // Walked first so the commits they pin seed the commit stack: a checkpoint
+    // outlives its head, and a chain pointing at a swept commit fails to verify.
+    let checkpoints = crate::checkpoint::CheckpointStore::new(db);
     let mut stack = collect_refs(&db.root.join("refs").join("heads"))?;
+    for tip in collect_refs(&db.root.join("refs").join("checkpoints"))? {
+        let mut cursor = Some(tip);
+        while let Some(hash) = cursor {
+            if !reach.insert(hash) {
+                break; // chain already walked from another tip
+            }
+            let cp = checkpoints
+                .get(hash)
+                .with_context(|| format!("gc: reading checkpoint {hash}"))?;
+            stack.push(cp.commit);
+            cursor = cp.prev;
+        }
+    }
+
+    // Audit-chain tips. Records are normally reachable through the commit that
+    // carries them; the ref keeps the chain intact if that commit is orphaned.
+    for tip in collect_refs(&db.root.join("refs").join("queries"))? {
+        let mut cursor = Some(tip);
+        while let Some(hash) = cursor {
+            if reach.contains(&hash) {
+                break;
+            }
+            let Ok(bytes) = db.manifest_store.raw_manifest_bytes(hash) else {
+                break;
+            };
+            let Some(qm) = exact_type::<QueryManifest>(&bytes) else {
+                break;
+            };
+            mark_manifest(db, hash, &mut reach)?;
+            cursor = qm.prev;
+        }
+    }
+
+    // Commits, transitively through parents.
     while let Some(commit_hash) = stack.pop() {
         if !reach.insert(commit_hash) {
             continue;
@@ -150,6 +195,20 @@ fn mark_manifest(db: &Database, hash: Hash, reach: &mut HashSet<Hash>) -> Result
     }
     if let Some(chunk) = exact_type::<ChunkManifest>(&bytes) {
         for h in chunk.referenced_blobs() {
+            mark_manifest(db, h, reach)?;
+        }
+        matched = true;
+    }
+    if let Some(summary) = exact_type::<SummaryManifest>(&bytes) {
+        for h in summary.referenced_blobs() {
+            mark_manifest(db, h, reach)?;
+        }
+        matched = true;
+    }
+    // Referenced blobs include the returned chunks, so the evidence a retrieval
+    // attests to outlives the record.
+    if let Some(query) = exact_type::<QueryManifest>(&bytes) {
+        for h in query.referenced_blobs() {
             mark_manifest(db, h, reach)?;
         }
         matched = true;
@@ -299,6 +358,125 @@ mod tests {
         Database::init(&root).unwrap();
         let db = Database::open(&root).unwrap();
         (root, db)
+    }
+
+    /// Regression: checkpoints are referenced by no commit, so a mark that
+    /// walks only heads and states reclaims the entire transparency log and
+    /// destroys the tamper-evidence it exists to provide.
+    #[test]
+    fn gc_preserves_the_checkpoint_chain() {
+        use crate::checkpoint::CheckpointStore;
+
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+        db.create_commit_at_head("main", "a", "c1", vec![]).unwrap();
+        let store = CheckpointStore::new(&db);
+        let cp1 = store.create("main", None).unwrap();
+        db.create_commit_at_head("main", "a", "c2", vec![]).unwrap();
+        let cp2 = store.create("main", None).unwrap();
+
+        gc(&db, true, NO_GRACE).unwrap();
+
+        assert!(db.object_store.exists(cp1), "genesis checkpoint pruned");
+        assert!(db.object_store.exists(cp2), "tip checkpoint pruned");
+        assert_eq!(
+            store.verify_chain("main", None, false).unwrap().length,
+            2,
+            "chain must still verify after a prune"
+        );
+    }
+
+    /// A checkpoint pins its commit even once the head has moved past it, so
+    /// the commit it anchors must survive the sweep too.
+    #[test]
+    fn gc_keeps_commits_pinned_only_by_a_checkpoint() {
+        use crate::checkpoint::CheckpointStore;
+
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+        let pinned = db
+            .create_commit_at_head("main", "a", "pinned", vec![])
+            .unwrap();
+        let cp = CheckpointStore::new(&db).create("main", None).unwrap();
+
+        // Move the head somewhere with no ancestry link to `pinned`.
+        db.refs
+            .head_set("main", db.state_store.empty_root().unwrap())
+            .ok();
+        let orphan = db
+            .commit_store
+            .create_commit(
+                vec![],
+                db.state_store.empty_root().unwrap(),
+                vec![],
+                "a".into(),
+                "orphan".into(),
+            )
+            .unwrap();
+        db.refs.head_set("main", orphan).unwrap();
+
+        gc(&db, true, NO_GRACE).unwrap();
+
+        assert!(db.object_store.exists(cp), "checkpoint pruned");
+        assert!(
+            db.object_store.exists(pinned),
+            "commit referenced only by a checkpoint was pruned"
+        );
+    }
+
+    /// Regression: the classifier is fail-closed, so a reachable manifest
+    /// family it does not know aborts every prune.
+    #[test]
+    fn gc_classifies_query_and_summary_manifests() {
+        use crate::manifest::{QueryHit, QueryManifest, SummaryManifest};
+
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+        let text = db.blob_store.put(b"chunk text").unwrap();
+        let summary_text = db.blob_store.put(b"summary text").unwrap();
+
+        let summary = db
+            .manifest_store
+            .put_manifest(&SummaryManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                summary_text,
+                embedding: None,
+                children: vec![text],
+                level: 1,
+                metadata: None,
+            })
+            .unwrap();
+        let query = db
+            .manifest_store
+            .put_manifest(&QueryManifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                commit: Hash::zero(),
+                mode: "semantic".into(),
+                query_text: None,
+                query_embedding: None,
+                top_k: 5,
+                filters: None,
+                principal: Some("cli".into()),
+                executed_at: 1,
+                hits: vec![QueryHit {
+                    chunk: text,
+                    score_micro: 1,
+                }],
+                seq: 0,
+                prev: None,
+            })
+            .unwrap();
+        db.create_commit_at_head("main", "t", "records", vec![summary, query])
+            .unwrap();
+
+        gc(&db, true, NO_GRACE).unwrap();
+
+        for h in [summary, query, text, summary_text] {
+            assert!(
+                db.object_store.exists(h) || db.blob_store.exists(h),
+                "pruned {h}"
+            );
+        }
     }
 
     #[test]

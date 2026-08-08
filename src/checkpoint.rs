@@ -11,11 +11,34 @@ use crate::clock::now_unix;
 use crate::commit::CommitHash;
 use crate::db::Database;
 use crate::hash::{Hash, hash_typed};
+use crate::merkle::{
+    ConsistencyProof, MerkleLeaf, MerkleProof, prove_consistency, prove_inclusion,
+    root as log_root, root_from_spine, spine, spine_append, verify_consistency, verify_inclusion,
+};
 use crate::signing::{Ed25519Signer, Ed25519Verifier, sign_raw};
 
 const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
 const CHECKPOINT_PAYLOAD_TAG: &[u8] = b"checkpoint_payload:";
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const CHECKPOINT_LEAF_TAG: &[u8] = b"checkpoint_leaf:";
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+
+/// Leaf for the append-only log over checkpointed commits.
+pub fn checkpoint_leaf(commit: CommitHash) -> MerkleLeaf {
+    MerkleLeaf::new(CHECKPOINT_LEAF_TAG, commit.as_bytes())
+}
+
+/// Check that `commit` was the `index`-th entry of a log with this root.
+/// Offline: no store, no chain walk, `O(log J)`.
+pub fn verify_commit_logged(root: Hash, commit: CommitHash, proof: &MerkleProof) -> bool {
+    verify_inclusion(root, checkpoint_leaf(commit), proof)
+}
+
+/// Check that the log behind `old_root` is a prefix of the log behind
+/// `new_root`: the history was appended to, never rewritten. Offline,
+/// `O(log J)`. A linear chain cannot answer this without replaying everything.
+pub fn verify_append_only(old_root: Hash, new_root: Hash, proof: &ConsistencyProof) -> bool {
+    verify_consistency(old_root, new_root, proof)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -31,6 +54,16 @@ pub struct Checkpoint {
     pub signature: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// Merkle root over every commit checkpointed on this head so far, this
+    /// one last. Lets a verifier check inclusion and append-onlyness in
+    /// `O(log J)` instead of walking the chain.
+    #[serde(default = "crate::merkle::empty_root")]
+    pub log_root: Hash,
+    /// Roots of the perfect subtrees the log decomposes into, largest first.
+    /// Carrying it makes the next append `O(log J)` rather than a full
+    /// rebuild; its width is the popcount of the entry count.
+    #[serde(default)]
+    pub log_spine: Vec<Hash>,
 }
 
 impl Checkpoint {
@@ -80,6 +113,31 @@ impl<'a> CheckpointStore<'a> {
             None => 0,
         };
 
+        // Extend the log from the predecessor's spine: O(log J), not a rebuild.
+        // A predecessor carrying no spine falls back to recomputation rather
+        // than producing a wrong root.
+        let prev_state = match prev_hash {
+            Some(h) => {
+                let p = self.get(h)?;
+                Some((p.log_spine, p.sequence as usize + 1))
+            }
+            None => None,
+        };
+        let (log_spine, count) = match prev_state {
+            None => (spine_append(&[], 0, checkpoint_leaf(commit)), 1),
+            Some((sp, n)) if sp.len() == (n as u64).count_ones() as usize => {
+                (spine_append(&sp, n, checkpoint_leaf(commit)), n + 1)
+            }
+            Some((_, n)) => {
+                let mut commits = self.logged_commits(head)?;
+                commits.push(commit);
+                let leaves: Vec<MerkleLeaf> =
+                    commits.iter().copied().map(checkpoint_leaf).collect();
+                debug_assert_eq!(leaves.len(), n + 1);
+                (spine(&leaves), leaves.len())
+            }
+        };
+
         let mut checkpoint = Checkpoint {
             schema_version: CHECKPOINT_SCHEMA_VERSION,
             prev: prev_hash,
@@ -89,6 +147,8 @@ impl<'a> CheckpointStore<'a> {
             created_at: now_unix()?,
             signature: None,
             key_id: None,
+            log_root: root_from_spine(&log_spine, count),
+            log_spine,
         };
         if let Some(signer) = signer {
             let payload = checkpoint.payload_hash()?;
@@ -102,6 +162,43 @@ impl<'a> CheckpointStore<'a> {
             .put_serialized(CHECKPOINT_TAG, &checkpoint)?;
         self.db.refs.checkpoint_set(head, hash)?;
         Ok(hash)
+    }
+
+    /// Checkpointed commits for `head`, genesis first.
+    pub fn logged_commits(&self, head: &str) -> Result<Vec<CommitHash>> {
+        let mut out = Vec::new();
+        let mut cursor = self.db.refs.checkpoint_get(head)?;
+        while let Some(hash) = cursor {
+            let cp = self.get(hash)?;
+            out.push(cp.commit);
+            cursor = cp.prev;
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// `(log_root, proof)` showing the `index`-th checkpointed commit is in the
+    /// log the current tip publishes.
+    pub fn prove_commit_logged(&self, head: &str, index: usize) -> Result<(Hash, MerkleProof)> {
+        let commits = self.logged_commits(head)?;
+        let leaves: Vec<MerkleLeaf> = commits.iter().copied().map(checkpoint_leaf).collect();
+        let proof = prove_inclusion(&leaves, index)
+            .ok_or_else(|| anyhow!("no checkpoint at index {index} on head '{head}'"))?;
+        Ok((log_root(&leaves), proof))
+    }
+
+    /// `(old_root, new_root, proof)` showing the log grew from `old_count`
+    /// entries to its current size without rewriting anything.
+    pub fn prove_append_only(
+        &self,
+        head: &str,
+        old_count: usize,
+    ) -> Result<(Hash, Hash, ConsistencyProof)> {
+        let commits = self.logged_commits(head)?;
+        let leaves: Vec<MerkleLeaf> = commits.iter().copied().map(checkpoint_leaf).collect();
+        let proof = prove_consistency(&leaves, old_count)
+            .ok_or_else(|| anyhow!("cannot prove consistency from {old_count} entries"))?;
+        Ok((log_root(&leaves[..old_count]), log_root(&leaves), proof))
     }
 
     pub fn get(&self, hash: Hash) -> Result<Checkpoint> {
@@ -168,6 +265,29 @@ impl<'a> CheckpointStore<'a> {
                     return Err(anyhow!("checkpoint {hash} is unsigned"));
                 }
                 (None, _) => {}
+            }
+
+            // The transparency-log root must match the spine/count the
+            // checkpoint publishes, and that spine must be the predecessor's
+            // extended by exactly this commit — otherwise a forged log_root
+            // (or a rewritten log) would pass unnoticed.
+            let count = cp.sequence as usize + 1;
+            if root_from_spine(&cp.log_spine, count) != cp.log_root {
+                return Err(anyhow!(
+                    "checkpoint {hash}: published log_root does not match its spine"
+                ));
+            }
+            let expected_spine = match cp.prev {
+                None => spine_append(&[], 0, checkpoint_leaf(cp.commit)),
+                Some(prev) => {
+                    let p = self.get(prev)?;
+                    spine_append(&p.log_spine, p.sequence as usize + 1, checkpoint_leaf(cp.commit))
+                }
+            };
+            if expected_spine != cp.log_spine {
+                return Err(anyhow!(
+                    "checkpoint {hash}: log spine is not the predecessor's extended by this commit"
+                ));
             }
 
             genesis = hash;
@@ -250,6 +370,102 @@ mod tests {
         store.create("main", None).unwrap();
         assert!(store.verify_chain("main", None, true).is_err());
         store.verify_chain("main", None, false).unwrap();
+    }
+
+    /// The log must let a verifier check inclusion and append-onlyness with no
+    /// store and no chain walk.
+    #[test]
+    fn log_proves_inclusion_and_append_only_offline() {
+        let (_tmp, db) = test_db();
+        let store = CheckpointStore::new(&db);
+        let mut commits = Vec::new();
+        for i in 0..12 {
+            commits.push(commit(&db, &format!("c{i}")));
+            store.create("main", None).unwrap();
+        }
+
+        // Every checkpointed commit proves against the published root.
+        for (i, c) in commits.iter().enumerate() {
+            let (root, proof) = store.prove_commit_logged("main", i).unwrap();
+            assert!(verify_commit_logged(root, *c, &proof), "index {i}");
+            // Bound to its position: the same proof must not carry another commit.
+            let other = commits[(i + 1) % commits.len()];
+            if other != *c {
+                assert!(!verify_commit_logged(root, other, &proof));
+            }
+        }
+
+        // The tip checkpoint publishes that same root.
+        let tip = store
+            .get(db.refs.checkpoint_get("main").unwrap().unwrap())
+            .unwrap();
+        let (root, _) = store.prove_commit_logged("main", 0).unwrap();
+        assert_eq!(tip.log_root, root, "tip must publish the current log root");
+
+        // Append-onlyness between an old anchor and the current root.
+        let (old_root, new_root, proof) = store.prove_append_only("main", 5).unwrap();
+        assert!(verify_append_only(old_root, new_root, &proof));
+        assert!(!verify_append_only(new_root, old_root, &proof));
+
+        // Proof size is logarithmic, not linear in the chain.
+        let (_, incl) = store.prove_commit_logged("main", 3).unwrap();
+        assert!(
+            incl.siblings.len() <= 4,
+            "got {} hashes",
+            incl.siblings.len()
+        );
+    }
+
+    /// The incrementally-extended root must equal a from-scratch rebuild at
+    /// every chain length, or the published anchor is wrong.
+    #[test]
+    fn incremental_log_root_matches_rebuild() {
+        let (_tmp, db) = test_db();
+        let store = CheckpointStore::new(&db);
+        for i in 0..40 {
+            commit(&db, &format!("c{i}"));
+            let h = store.create("main", None).unwrap();
+            let cp = store.get(h).unwrap();
+            let commits = store.logged_commits("main").unwrap();
+            let leaves: Vec<crate::merkle::MerkleLeaf> =
+                commits.iter().copied().map(checkpoint_leaf).collect();
+            assert_eq!(
+                cp.log_root,
+                crate::merkle::root(&leaves),
+                "incremental root diverged at length {}",
+                i + 1
+            );
+            assert_eq!(
+                cp.log_spine.len(),
+                (commits.len() as u64).count_ones() as usize,
+                "spine width must be the popcount of the length"
+            );
+            // And the published root still proves inclusion.
+            let (root, proof) = store.prove_commit_logged("main", i).unwrap();
+            assert_eq!(root, cp.log_root);
+            assert!(verify_commit_logged(root, commits[i], &proof));
+        }
+    }
+
+    /// A rewritten history must fail the append-only check even though every
+    /// individual checkpoint still hashes correctly.
+    #[test]
+    fn rewritten_history_fails_append_only() {
+        let (_tmp, db) = test_db();
+        let store = CheckpointStore::new(&db);
+        for i in 0..8 {
+            commit(&db, &format!("c{i}"));
+            store.create("main", None).unwrap();
+        }
+        let (old_root, new_root, proof) = store.prove_append_only("main", 4).unwrap();
+        assert!(verify_append_only(old_root, new_root, &proof));
+        // An anchor from a different history of the same length is rejected.
+        let forged = crate::merkle::root(
+            &(0..4)
+                .map(|i| checkpoint_leaf(crate::hash::hash_typed(b"forged:", &[i as u8])))
+                .collect::<Vec<_>>(),
+        );
+        assert!(!verify_append_only(forged, new_root, &proof));
     }
 
     #[test]

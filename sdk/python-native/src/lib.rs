@@ -193,24 +193,25 @@ impl Neleus {
         Ok(commit.to_string())
     }
 
-    /// Record a retrieval as a content-addressed audit manifest. Returns its
-    /// hash; attach it with `commit(...)` to make it durable.
-    #[pyo3(signature = (at, query, top_k=10, principal=None))]
+    /// Record a retrieval as a chained, committed audit manifest on `head` and
+    /// return its hash. The record is durable and exportable immediately — do
+    /// not attach it with `commit(...)`.
+    #[pyo3(signature = (head, query, top_k=10, principal=None))]
     fn record_query(
         &self,
-        at: &str,
+        head: &str,
         query: &str,
         top_k: usize,
         principal: Option<&str>,
     ) -> PyResult<String> {
         let engine = self.engine.lock().map_err(err)?;
-        let commit = engine.resolve_commit(at).map_err(err)?;
+        let commit = engine.resolve_commit(head).map_err(err)?;
         let filter = SearchFilter::default();
         let hits = engine
             .search_semantic(commit, query, top_k, &filter)
             .map_err(err)?;
         let qm = engine
-            .record_query(commit, "semantic", Some(query), None, top_k, &filter, principal, &hits)
+            .record_query_at_head(head, commit, "semantic", Some(query), None, top_k, &filter, principal, &hits)
             .map_err(err)?;
         Ok(qm.to_string())
     }

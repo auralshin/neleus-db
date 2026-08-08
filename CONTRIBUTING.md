@@ -5,10 +5,11 @@ a round trip.
 
 ## License of contributions
 
-neleus-db is source-available under [PolyForm Noncommercial 1.0.0](LICENSE).
-By submitting a contribution you license it under the project license and grant
-the maintainer the right to offer it under other terms (e.g. commercial
-licenses). Don't submit code you can't license this way.
+neleus-db is dual-licensed under [Apache-2.0](LICENSE-APACHE) and
+[MIT](LICENSE-MIT). Unless you explicitly state otherwise, any contribution
+you intentionally submit for inclusion, as defined in the Apache-2.0 license,
+is dual licensed as above, without any additional terms or conditions. Don't
+submit code you can't license this way.
 
 ## The one rule that matters: don't break the byte format
 
@@ -17,10 +18,11 @@ identities, so a change to how they serialize silently invalidates every
 existing database and every proof:
 
 - `src/canonical.rs` — DAG-CBOR encoding, golden-byte tests
-- hash domains in `src/hash.rs` (`blob:`, `manifest:`, `commit:`,
-  `state_node:`, `checkpoint:`, `state_leaf:`, `merkle_node:`,
-  `commit_payload:`, `checkpoint_payload:`)
-- on-disk shapes of `Commit`, `StateSegment`/`StateManifest`, the manifest
+- hash domains applied through `src/hash.rs` (`blob:`, `manifest:`,
+  `manifest_leaf:`, `state_node:`, `state_level:`, `commit:`,
+  `commit_payload:`, `checkpoint:`, `checkpoint_payload:`, `checkpoint_leaf:`,
+  `merkle_node:`, `merkle_root:`, `index_segment:`)
+- on-disk shapes of `Commit`, `StateNode`/`StateManifest`, the manifest
   types, `Checkpoint`, and the encryption envelope
 
 If you change any of these, you are changing the format. That needs a schema

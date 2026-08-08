@@ -63,6 +63,11 @@ pub struct AuditRecord {
     pub top_k: u32,
     pub filters: Option<String>,
     pub hits: Vec<AuditHit>,
+    /// Position in the head's retrieval chain; a gap means a withheld record.
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +110,9 @@ pub struct VerifyReport {
     pub checkpoints: usize,
     pub checkpoints_signed: usize,
     pub bundle_key_id: Option<String>,
+    /// Retrieval sequence numbers form a contiguous run: nothing was withheld
+    /// between the first and last record in the window.
+    pub chain_complete: bool,
 }
 
 /// QueryManifest decode pinned by canonical round-trip, so other manifest
@@ -130,6 +138,9 @@ pub fn collect(
 
     let mut records = Vec::new();
     let mut carrying = Vec::new();
+    // Records are content-addressed, so the same retrieval committed twice is
+    // one retrieval, not two.
+    let mut seen: HashSet<Hash> = HashSet::new();
     let mut cursor = Some(tip);
     let mut steps = 0usize;
     while let Some(commit_hash) = cursor {
@@ -147,7 +158,7 @@ pub fn collect(
             let Some(qm) = decode_query_manifest(&bytes) else {
                 continue;
             };
-            if qm.executed_at < from || qm.executed_at > to {
+            if qm.executed_at < from || qm.executed_at > to || !seen.insert(m) {
                 continue;
             }
             carries = true;
@@ -168,6 +179,8 @@ pub fn collect(
                         score_micro: h.score_micro,
                     })
                     .collect(),
+                seq: qm.seq,
+                prev: qm.prev.map(|h| h.to_string()),
             });
         }
         if carries {
@@ -506,6 +519,47 @@ pub fn verify_bundle(
         }
     }
 
+    // Retrieval chain: sequence numbers must be contiguous and the prev-links
+    // must agree. This is the only check that can catch a *withheld* record;
+    // every other check assumes what is present is all there was.
+    let mut chain: Vec<&AuditRecord> = records.iter().collect();
+    chain.sort_by_key(|r| r.seq);
+    let mut gaps = Vec::new();
+    for pair in chain.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if b.seq == a.seq {
+            bail!("duplicate retrieval sequence {}", a.seq);
+        }
+        if b.seq != a.seq + 1 {
+            gaps.push((a.seq, b.seq));
+        }
+        if let Some(prev) = &b.prev
+            && prev != &a.manifest
+            && b.seq == a.seq + 1
+        {
+            bail!(
+                "retrieval {} claims predecessor {} but sequence {} is {}",
+                b.seq,
+                prev,
+                a.seq,
+                a.manifest
+            );
+        }
+    }
+    // Complete iff contiguous (no internal gaps) and anchored at the genesis
+    // record seq 0 — a bundle that starts mid-chain is internally consistent
+    // but missing its prefix. An empty bundle is vacuously complete.
+    let complete = gaps.is_empty() && chain.first().map(|r| r.seq == 0).unwrap_or(true);
+    if !gaps.is_empty() {
+        bail!(
+            "retrieval chain has {} gap(s), e.g. between sequence {} and {}: records were \
+             withheld from this bundle",
+            gaps.len(),
+            gaps[0].0,
+            gaps[0].1
+        );
+    }
+
     // Checkpoint chain: hashes, prev-links, sequences, signatures.
     let mut checkpoints_count = 0usize;
     let mut checkpoints_signed = 0usize;
@@ -551,6 +605,7 @@ pub fn verify_bundle(
         checkpoints: checkpoints_count,
         checkpoints_signed,
         bundle_key_id,
+        chain_complete: complete,
     })
 }
 
@@ -587,8 +642,9 @@ mod tests {
             let hits = engine
                 .search_semantic(commit, "retrieval corpus", 5, &SearchFilter::default())
                 .unwrap();
-            let qm = engine
-                .record_query(
+            engine
+                .record_query_at_head(
+                    "main",
                     commit,
                     "semantic",
                     Some("retrieval corpus"),
@@ -599,7 +655,6 @@ mod tests {
                     &hits,
                 )
                 .unwrap();
-            engine.commit("main", "auditor", "audit", vec![qm]).unwrap();
         }
         let db = Database::open(&root).unwrap();
         (tmp, db, "main".to_string())

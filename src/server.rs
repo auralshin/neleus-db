@@ -416,9 +416,11 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     if content_length > body_cap {
         return respond(&stream, 413, &err_json(413, "request body too large"));
     }
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
 
+    // Authenticate before allocating/reading the body: an unauthenticated
+    // client must never be able to make us buffer up to `body_cap` bytes
+    // (4 GiB on /v1/pack) in memory.
+    //
     // Fresh registry per request: revocation takes effect immediately. The
     // loopback bootstrap token authenticates as admin, but only from a loopback
     // peer — a leaked token is useless off-box.
@@ -445,6 +447,10 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
             }
         }
     };
+
+    // Body is read only after authentication succeeds.
+    let mut body = vec![0u8; content_length];
+    reader.read_exact(&mut body)?;
 
     let request = Request {
         method,
@@ -725,7 +731,10 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
         }
 
         ("POST", "/v1/blobs") => {
-            require_untenanted(req, Role::Writer)?;
+            // Any writer, tenant-scoped or not: blobs are content-addressed and
+            // deduped globally, and run capture (the flagship SDK flow) uploads
+            // run content here with a tenant key. Reads stay untenanted.
+            require(req, Role::Writer)?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
             let hash = db.blob_store.put(&req.body)?;
             Ok(Response::Json(200, json!({"hash": hash.to_string()})))
@@ -1053,10 +1062,20 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             };
 
             let audit = v.get("audit").and_then(Value::as_bool).unwrap_or(false);
+            // The record is committed, so it needs a head to append to; a raw
+            // commit hash has none.
             let audit_manifest = if audit {
+                if at.len() == 64 {
+                    bail!(
+                        "bad request: 'audit' requires 'at' to name a head, not a commit hash \
+                         (the record must be committed to a head to be exportable)"
+                    );
+                }
+                let _w = state.write_lock.lock().expect("write lock poisoned");
                 Some(
                     engine
-                        .record_query(
+                        .record_query_at_head(
+                            at,
                             commit,
                             mode,
                             query,
@@ -1101,6 +1120,20 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 .get("include_content")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // The proof route takes an arbitrary (commit, chunk); with
+            // include_content it returns raw chunk bytes. A tenant-scoped key
+            // must not use it to read another tenant's content — deny the
+            // content-bearing form, same as the untenanted /v1/blobs read.
+            if include
+                && req
+                    .principal
+                    .as_ref()
+                    .is_some_and(|p| p.tenant.is_some())
+            {
+                bail!(
+                    "forbidden: include_content proofs are not available to tenant-scoped keys"
+                );
+            }
             let proof = engine.prove(commit, chunk, include)?;
             use base64::Engine as _;
             let bundle = base64::engine::general_purpose::STANDARD
@@ -1595,13 +1628,8 @@ mod tests {
             token,
             serde_json::json!({"at": "main", "mode": "semantic", "query": "policy", "audit": true}),
         );
-        let qm = search["audit_manifest"].as_str().unwrap();
-        post_json(
-            &url,
-            "/v1/commits",
-            token,
-            serde_json::json!({"head": "main", "message": "audit", "manifests": [qm]}),
-        );
+        // An audited search commits its own record; no follow-up commit needed.
+        assert!(search["audit_manifest"].is_string());
         post_json(
             &url,
             "/v1/checkpoints",

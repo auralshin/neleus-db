@@ -79,6 +79,68 @@ pub struct StateProof {
     pub outcome: StateOutcome,
 }
 
+impl StateProof {
+    /// Verify with no store, database or network: the manifest is rebuilt from
+    /// the proof's own fields and re-hashed, so `state_root` is checked rather
+    /// than trusted. Prefer this over [`StateStore::verify_proof`], which
+    /// resolves the root through the object store.
+    pub fn verify(&self, state_root: StateRoot, key: &[u8]) -> bool {
+        let manifest = StateManifest {
+            schema_version: self.manifest_schema_version,
+            root: self.root,
+        };
+        // The manifest hash is the state root, so re-hashing binds the claimed
+        // tree root to the one the caller was given.
+        match to_cbor(&manifest) {
+            Ok(bytes) if hash_typed(STATE_TAG, &bytes) == state_root => {}
+            _ => return false,
+        }
+        verify_path(self.root, key, &self.path, &self.outcome)
+    }
+}
+
+/// Shared path check: recompute each node hash, anchor the first to `root`,
+/// confirm every branch routes toward `key`, and validate the terminal leaf.
+fn verify_path(root: Option<Hash>, key: &[u8], path: &[StateNode], outcome: &StateOutcome) -> bool {
+    if root.is_none() {
+        return path.is_empty() && *outcome == StateOutcome::Missing;
+    }
+    if path.is_empty() {
+        return false;
+    }
+    let hashes: Vec<Hash> = match path.iter().map(node_hash).collect::<Result<Vec<Hash>>>() {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    if Some(hashes[0]) != root {
+        return false;
+    }
+
+    for (i, node) in path.iter().enumerate() {
+        let last = i + 1 == path.len();
+        match &node.items {
+            NodeItems::Leaf(entries) => {
+                if !last || !leaf_sorted_unique(entries) {
+                    return false;
+                }
+                return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    Ok(j) => *outcome == StateOutcome::Found(value_commit(&entries[j].1)),
+                    Err(_) => *outcome == StateOutcome::Missing,
+                };
+            }
+            NodeItems::Branch(entries) => {
+                if last || entries.is_empty() || !branch_sorted_unique(entries) {
+                    return false;
+                }
+                if entries[route(entries, key)].1 != hashes[i + 1] {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[derive(Clone, Debug)]
 pub struct StateStore {
     objects: ObjectStore,
@@ -360,60 +422,15 @@ impl StateStore {
             Ok(m) => m,
             Err(_) => return false,
         };
-        if proof.manifest_schema_version != manifest.schema_version {
+        if proof.manifest_schema_version != manifest.schema_version || proof.root != manifest.root {
             return false;
         }
-        if proof.root != manifest.root {
-            return false;
-        }
-        if manifest.root.is_none() {
-            return proof.path.is_empty() && proof.outcome == StateOutcome::Missing;
-        }
-        if proof.path.is_empty() {
-            return false;
-        }
-        let hashes: Vec<Hash> = match proof
-            .path
-            .iter()
-            .map(node_hash)
-            .collect::<Result<Vec<Hash>>>()
-        {
-            Ok(h) => h,
-            Err(_) => return false,
-        };
-        if Some(hashes[0]) != manifest.root {
-            return false;
-        }
-
-        for i in 0..proof.path.len() {
-            let node = &proof.path[i];
-            let last = i + 1 == proof.path.len();
-            match &node.items {
-                NodeItems::Leaf(entries) => {
-                    if !last || !leaf_sorted_unique(entries) {
-                        return false;
-                    }
-                    return match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                        Ok(j) => proof.outcome == StateOutcome::Found(value_commit(&entries[j].1)),
-                        Err(_) => proof.outcome == StateOutcome::Missing,
-                    };
-                }
-                NodeItems::Branch(entries) => {
-                    if last || entries.is_empty() || !branch_sorted_unique(entries) {
-                        return false;
-                    }
-                    if entries[route(entries, key)].1 != hashes[i + 1] {
-                        return false;
-                    }
-                }
-            }
-        }
-        false
+        verify_path(manifest.root, key, &proof.path, &proof.outcome)
     }
 
-    /// Every hash reachable from state `root`: the manifest, its nodes, and
-    /// each entry's value blob. GC asks the state store rather than re-deriving
-    /// the DAG shape.
+    /// Every hash reachable from state `root`: the manifest, its nodes, each
+    /// entry's value blob, and the content blob any session record points at.
+    /// GC asks the state store rather than re-deriving the DAG shape.
     pub fn reachable_from(&self, root: StateRoot) -> Result<Vec<Hash>> {
         let manifest = self.load_manifest_or_empty(root)?;
         let mut out = Vec::new();
@@ -429,6 +446,12 @@ impl StateStore {
                     for (_, v) in entries {
                         if let ValueRef::Value(h) = v {
                             out.push(*h);
+                        }
+                        // Session turns store their content in a separate blob
+                        // referenced from the CBOR record held here; GC must
+                        // follow it or `db gc --prune` deletes live turn content.
+                        if let Some(content) = session_content_ref(&self.read_value(v)?) {
+                            out.push(content);
                         }
                     }
                 }
@@ -685,6 +708,14 @@ fn node_hash(node: &StateNode) -> Result<Hash> {
     Ok(hash_typed(STATE_TAG, &to_cbor(node)?))
 }
 
+/// If `value` is a session record, its referenced content-blob hash. Returns
+/// `None` for any other state value. Used by GC to keep session turn content
+/// reachable.
+fn session_content_ref(value: &[u8]) -> Option<Hash> {
+    let record: crate::session::SessionRecord = crate::canonical::from_cbor(value).ok()?;
+    (record.schema_version == crate::session::SESSION_SCHEMA_VERSION).then_some(record.content)
+}
+
 fn value_commit(value: &ValueRef) -> Hash {
     match value {
         ValueRef::Value(h) => *h,
@@ -887,6 +918,64 @@ mod tests {
             "proof path was {} nodes",
             absent.path.len()
         );
+    }
+
+    /// The offline path must accept exactly what the store-backed path
+    /// accepts, without touching the store.
+    #[test]
+    fn offline_verify_matches_store_verify() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut root = s.empty_root().unwrap();
+        for i in 0..500u32 {
+            root = s.set(root, format!("key_{i:05}").as_bytes(), b"v").unwrap();
+        }
+        for probe in [b"key_00042".as_slice(), b"key_99999", b"", b"zzz"] {
+            let p = s.proof(root, probe).unwrap();
+            assert_eq!(
+                p.verify(root, probe),
+                s.verify_proof(root, probe, &p),
+                "offline and store-backed verdicts diverged for {probe:?}"
+            );
+            assert!(p.verify(root, probe));
+        }
+        // Empty state.
+        let empty = s.empty_root().unwrap();
+        let p = s.proof(empty, b"k").unwrap();
+        assert!(p.verify(empty, b"k"));
+    }
+
+    /// Offline verification must anchor to the state root it is handed, not
+    /// to whatever root the proof claims for itself.
+    #[test]
+    fn offline_verify_rejects_wrong_state_root_and_tampering() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut root = s.empty_root().unwrap();
+        for i in 0..200u32 {
+            root = s.set(root, format!("key_{i:05}").as_bytes(), b"v").unwrap();
+        }
+        let other = s.set(root, b"extra", b"v").unwrap();
+
+        let p = s.proof(root, b"key_00100").unwrap();
+        assert!(p.verify(root, b"key_00100"));
+        // Same proof, different state root: the rebuilt manifest no longer
+        // hashes to the root, so it must fail without any store lookup.
+        assert!(!p.verify(other, b"key_00100"));
+
+        let mut forged = p.clone();
+        forged.outcome = StateOutcome::Missing;
+        assert!(!forged.verify(root, b"key_00100"));
+
+        let mut truncated = p.clone();
+        if truncated.path.len() > 1 {
+            truncated.path.pop();
+            assert!(!truncated.verify(root, b"key_00100"));
+        }
+
+        let mut relabelled = p.clone();
+        relabelled.manifest_schema_version += 1;
+        assert!(!relabelled.verify(root, b"key_00100"));
     }
 
     #[test]

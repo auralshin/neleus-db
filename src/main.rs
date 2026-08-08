@@ -984,6 +984,7 @@ fn main() -> Result<()> {
                 } => {
                     let key_bytes = decode_key(&key, &key_encoding)?;
                     let value = fs::read(value_file.clone())?;
+                    enforce_cli_write(&db, "state", &head)?;
                     let new_root = db.state_set_at_head(&head, &key_bytes, &value)?;
                     emit(
                         json_output,
@@ -1111,6 +1112,7 @@ fn main() -> Result<()> {
                         .into_iter()
                         .map(|m| m.parse::<Hash>())
                         .collect::<Result<Vec<_>, _>>()?;
+                    enforce_cli_write(&db, "commits", &head)?;
                     let commit_hash = match sign_key {
                         None => {
                             db.create_commit_at_head(&head, &author, &message, manifest_hashes)?
@@ -1227,6 +1229,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "semantic",
                         Some(&q),
@@ -1252,6 +1255,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "vector",
                         None,
@@ -1292,6 +1296,7 @@ fn main() -> Result<()> {
                     let audit_hash = maybe_audit(
                         &engine,
                         audit,
+                        &head,
                         commit,
                         "hybrid",
                         q.as_deref(),
@@ -1872,6 +1877,7 @@ fn main() -> Result<()> {
                             ));
                         }
                     };
+                    enforce_cli_write(&db, "sessions", &head)?;
                     let (seq, content_hash) =
                         sessions.append(&head, &session_id, role.as_deref(), &bytes, ttl_secs)?;
                     emit(
@@ -2046,9 +2052,25 @@ fn decode_key(key: &str, enc: &KeyEncoding) -> Result<Vec<u8>> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Apply enforce-mode policies to a local write, mirroring the server routes so
+/// filesystem access cannot bypass compliance rules. The local operator is the
+/// principal; provenance is not asserted (CLI has no run-capture endpoint).
+fn enforce_cli_write(db: &Database, op: &str, head: &str) -> Result<()> {
+    neleus_db::policy::enforce_write(
+        db,
+        &neleus_db::policy::WriteContext {
+            op,
+            head,
+            principal: Some("cli"),
+            has_provenance: false,
+        },
+    )
+}
+
 fn maybe_audit(
     engine: &neleus_db::Engine,
     audit: bool,
+    head: &str,
     commit: Hash,
     mode: &str,
     query: Option<&str>,
@@ -2060,7 +2082,19 @@ fn maybe_audit(
     if !audit {
         return Ok(None);
     }
-    Ok(Some(engine.record_query(
+    // The record is committed onto a head to be exportable; a raw commit hash
+    // (time-travel query) has no head to append to. Reject rather than mint a
+    // bogus head named the hash, matching the server's /v1/search behavior.
+    if head.len() == 64 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "'--audit' requires '--head' to name a head, not a commit hash \
+             (the record must be committed to a head to be exportable)"
+        ));
+    }
+    // Commits the record onto `head`: an unreferenced QueryManifest is
+    // invisible to `audit export` and is reclaimed by `db gc`.
+    Ok(Some(engine.record_query_at_head(
+        head,
         commit,
         mode,
         query,

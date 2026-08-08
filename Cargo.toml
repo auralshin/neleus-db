@@ -2,15 +2,15 @@
 name = "neleus-db"
 version = "0.2.0"
 edition = "2024"
-description = "Local-first Merkle-DAG database for AI agents with cryptographic proofs and immutable versioning"
-license-file = "LICENSE"
+description = "Content-addressed database in Rust for AI agent memory. Every write becomes a Merkle-DAG object you can verify offline, so you can prove what an agent knew when it decided. Immutable history, retrieval audit, write-time policy checks."
+license = "MIT OR Apache-2.0"
 publish = false
 repository = "https://github.com/auralshin/neleus-db"
 homepage = "https://github.com/auralshin/neleus-db"
 documentation = "https://docs.rs/neleus-db"
 readme = "README.md"
-keywords = ["database", "merkle", "ai-agents", "content-addressed", "versioning"]
-categories = ["database-implementations", "cryptography", "data-structures"]
+keywords = ["merkle", "ai-agents", "provenance", "audit", "content-addressed"]
+categories = ["database-implementations", "artificial-intelligence", "cryptography", "data-structures", "finance"]
 build = "build.rs"
 
 [features]
@@ -48,7 +48,6 @@ zstd = "0.13"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.5"
 rand = "0.8"
 rusqlite = "0.37"
 tempfile = "3.16"
@@ -79,7 +78,7 @@ codegen-units = 1
 # Crypto/hash/compression deps dominate test and bench runtime. Compiling them
 # at opt-level=3 while leaving this crate at opt-level=0 keeps incremental
 # builds fast and shrinks the test suite wall time dramatically — measured ~6×
-# on the state proptests. Cached after the first build.
+# on the state exhaustive tests. Cached after the first build.
 [profile.dev.package."*"]
 opt-level = 3
 
@@ -92,6 +91,10 @@ harness = false
 
 [[bench]]
 name = "scale"
+harness = false
+
+[[bench]]
+name = "verifiability"
 harness = false
 
 [[bin]]

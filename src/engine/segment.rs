@@ -10,15 +10,27 @@ use serde::{Deserialize, Serialize};
 use crate::hash::Hash;
 use crate::manifest::ChunkMetadata;
 
-use super::vector::{EF_SEARCH, HnswGraph, dot, dot_q, exact_search, normalize, quantize};
+use super::vector::{
+    EF_SEARCH, HnswGraph, dot, dot_q, exact_search, exact_search_over, normalize, quantize,
+};
 
-pub const SEGMENT_SCHEMA_VERSION: u32 = 1;
+pub const SEGMENT_SCHEMA_VERSION: u32 = 2;
 
 /// Below this many vectors, exact scan beats the graph.
 const HNSW_BUILD_THRESHOLD: usize = 256;
 
 /// Filters narrower than this skip the graph entirely.
 const EXACT_SCAN_LIMIT: usize = 1024;
+
+/// Minimum visible fraction of a segment for graph traversal to be worth it.
+///
+/// The beam admits a node when its distance beats the worst *matching* result,
+/// so under a selective filter that radius is set by the ef-th nearest visible
+/// vector and is wide enough to admit most of the segment. Traversal then
+/// degenerates to a near-full scan that is slower than the exact path and whose
+/// cost scales with rows the caller cannot see. Measured at 1200 visible of
+/// 21200: graph 4.3 ms vs exact 0.2 ms.
+const GRAPH_MIN_VISIBLE_FRACTION: usize = 2; // i.e. >= 1/2 of the segment
 
 /// SQ8 traversal pays off when dot products are memory-bound; below this
 /// dimensionality f32 traversal is faster than quantize+rerank overhead.
@@ -69,6 +81,13 @@ pub struct IndexSegment {
     /// Any chunk carries an ACL; gates the no-filter fast path.
     #[serde(default)]
     pub any_acl: bool,
+    /// Tenant to its doc ids, ascending. Lets a tenant-scoped query cost its
+    /// own partition instead of the whole segment, which is both the dominant
+    /// residual leak and, for a small tenant in a large database, most of its
+    /// query latency. Empty means no index: callers fall back to a full scan,
+    /// which is what old segments and untenanted corpora get.
+    #[serde(default)]
+    pub tenants: BTreeMap<String, Vec<u32>>,
 }
 
 /// Retrieval filter over [`ChunkMetadata`]; conditions AND together.
@@ -239,6 +258,12 @@ impl IndexSegment {
         let any_acl = chunks
             .iter()
             .any(|c| c.meta.as_ref().is_some_and(|m| !m.acl.is_empty()));
+        let mut tenants: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+        for (doc, chunk) in chunks.iter().enumerate() {
+            if let Some(t) = chunk.meta.as_ref().and_then(|m| m.tenant.as_deref()) {
+                tenants.entry(t.to_string()).or_default().push(doc as u32);
+            }
+        }
 
         Self {
             schema_version: SEGMENT_SCHEMA_VERSION,
@@ -254,6 +279,7 @@ impl IndexSegment {
             vec_scale,
             hnsw,
             any_acl,
+            tenants,
         }
     }
 
@@ -269,6 +295,18 @@ impl IndexSegment {
     pub fn filter_docs(&self, filter: &SearchFilter) -> Option<Vec<u32>> {
         if filter.is_unrestricted() && !self.any_acl {
             return None;
+        }
+        // Tenant-scoped: start from the partition rather than scanning every
+        // chunk, so cost tracks the caller's own data.
+        if let Some(tenant) = &filter.tenant
+            && !self.tenants.is_empty()
+        {
+            let ids = self.tenants.get(tenant).cloned().unwrap_or_default();
+            return Some(
+                ids.into_iter()
+                    .filter(|&d| filter.matches(self.chunks[d as usize].meta.as_ref()))
+                    .collect(),
+            );
         }
         Some(
             self.chunks
@@ -304,18 +342,47 @@ impl IndexSegment {
             set
         });
 
-        let n_docs = self.chunks.len() as f32;
-        let avg_dl = self.avg_doc_len();
+        // Scoped to the visible partition: segment-global `N`/`df` let a caller
+        // invert its own score to recover another tenant's exact counts.
+        let (n_docs, avg_dl) = match &allowed_set {
+            None => (self.chunks.len() as f32, self.avg_doc_len()),
+            Some(mask) => {
+                let mut visible = 0usize;
+                let mut total_len = 0u64;
+                for (doc, &ok) in mask.iter().enumerate() {
+                    if ok {
+                        visible += 1;
+                        total_len += self.doc_len[doc] as u64;
+                    }
+                }
+                if visible == 0 {
+                    return Vec::new();
+                }
+                (visible as f32, (total_len as f32 / visible as f32).max(1.0))
+            }
+        };
 
         // (postings, idf, upper_bound); ub = idf * (k1 + 1) bounds any single
         // term's contribution since tf*(k1+1)/(tf+norm) < k1+1.
         let mut term_data: Vec<(&PostingList, f32, f32)> = terms
             .iter()
             .filter_map(|term| self.lexicon.get(term))
-            .map(|postings| {
-                let df = postings.docs.len() as f32;
+            .filter_map(|postings| {
+                let df = match &allowed_set {
+                    None => postings.docs.len(),
+                    Some(mask) => postings
+                        .docs
+                        .iter()
+                        .filter(|&&doc| mask[doc as usize])
+                        .count(),
+                };
+                // Present only in hidden docs = absent, for this caller.
+                if df == 0 {
+                    return None;
+                }
+                let df = df as f32;
                 let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
-                (postings, idf, idf * (BM25_K1 + 1.0))
+                Some((postings, idf, idf * (BM25_K1 + 1.0)))
             })
             .collect();
         if term_data.is_empty() {
@@ -393,31 +460,43 @@ impl IndexSegment {
         }
 
         let allowed = self.filter_docs(filter);
-        // Map the doc-id filter onto vector-node ids.
-        let node_allowed: Option<Vec<bool>> = allowed.as_ref().map(|ids| {
-            let mut doc_ok = vec![false; self.chunks.len()];
-            for &id in ids {
-                doc_ok[id as usize] = true;
-            }
-            self.vec_docs
-                .iter()
-                .map(|&doc| doc_ok[doc as usize])
+        // Allowed doc ids to vector-node ids. `vec_docs` is ascending, so this
+        // is a binary search per candidate rather than a pass over the segment.
+        let allowed_nodes: Option<Vec<u32>> = allowed.as_ref().map(|ids| {
+            ids.iter()
+                .filter_map(|&doc| self.vec_docs.binary_search(&doc).ok().map(|n| n as u32))
                 .collect()
         });
-        let candidate_count = match &node_allowed {
-            Some(mask) => mask.iter().filter(|&&ok| ok).count(),
+        let candidate_count = match &allowed_nodes {
+            Some(nodes) => nodes.len(),
             None => self.vec_data.len(),
         };
         if candidate_count == 0 {
             return Vec::new();
         }
 
-        let predicate = node_allowed
-            .as_ref()
-            .map(|mask| move |node: u32| mask[node as usize]);
+        // Graph only when it can actually prune: a large candidate set *and* a
+        // filter that leaves most of the segment visible.
+        let graph_pays = candidate_count > EXACT_SCAN_LIMIT
+            && candidate_count * GRAPH_MIN_VISIBLE_FRACTION >= self.vec_data.len();
 
+        // The graph needs a predicate over arbitrary nodes, so it pays one pass
+        // to build the mask. That is only reached when the filter is
+        // unselective, where the pass is a small part of the traversal anyway.
+        let mask: Option<Vec<bool>> = if graph_pays {
+            allowed_nodes.as_ref().map(|nodes| {
+                let mut ok = vec![false; self.vec_data.len()];
+                for &n in nodes {
+                    ok[n as usize] = true;
+                }
+                ok
+            })
+        } else {
+            None
+        };
+        let predicate = mask.as_ref().map(|m| move |node: u32| m[node as usize]);
         let results = match &self.hnsw {
-            Some(graph) if candidate_count > EXACT_SCAN_LIMIT => {
+            Some(graph) if graph_pays => {
                 let ef = EF_SEARCH.max(top_k * 4);
                 let pred_ref: Option<&dyn Fn(u32) -> bool> =
                     predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
@@ -443,17 +522,23 @@ impl IndexSegment {
                 if hits.len() >= top_k.min(candidate_count) {
                     hits
                 } else {
-                    // Graph under-delivered (rare, filter-heavy) — go exact.
-                    let pred_ref: Option<&dyn Fn(u32) -> bool> =
-                        predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
-                    exact_search(&self.vec_data, &q, top_k, pred_ref)
+                    // Completeness guard, not a hot path: the graph has never
+                    // been observed to under-deliver, including when asked for
+                    // every visible node at exactly the selectivity threshold.
+                    // It is not *provably* unreachable though (HNSW gives no
+                    // connectivity guarantee, and pruning could isolate a node),
+                    // and the check costs one comparison against silently
+                    // returning a short result set. Kept deliberately.
+                    match &allowed_nodes {
+                        Some(nodes) => exact_search_over(&self.vec_data, nodes, &q, top_k),
+                        None => exact_search(&self.vec_data, &q, top_k, None),
+                    }
                 }
             }
-            _ => {
-                let pred_ref: Option<&dyn Fn(u32) -> bool> =
-                    predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
-                exact_search(&self.vec_data, &q, top_k, pred_ref)
-            }
+            _ => match &allowed_nodes {
+                Some(nodes) => exact_search_over(&self.vec_data, nodes, &q, top_k),
+                None => exact_search(&self.vec_data, &q, top_k, None),
+            },
         };
 
         results
@@ -610,6 +695,230 @@ mod tests {
         assert_eq!(seg.bm25("temporal", 10, &at(300)).len(), 0);
         // No `at` = no temporal filtering (replay semantics).
         assert_eq!(seg.bm25("temporal", 10, &SearchFilter::default()).len(), 2);
+    }
+
+    /// Regression: a tenant's own score must not move when documents it
+    /// cannot see are added or removed. Before collection statistics were
+    /// partition-scoped, this score was strictly monotone in the hidden
+    /// count, letting one tenant read another's per-term document frequency
+    /// exactly (BENCHMARKS.md §5).
+    #[test]
+    fn tenant_scores_are_independent_of_hidden_documents() {
+        let mine = ChunkMetadata {
+            tenant: Some("attacker".into()),
+            ..Default::default()
+        };
+        let theirs = ChunkMetadata {
+            tenant: Some("victim".into()),
+            ..Default::default()
+        };
+        let filter = SearchFilter {
+            tenant: Some("attacker".into()),
+            ..Default::default()
+        };
+
+        let score_with = |victim_docs: usize, victim_has_term: bool| {
+            let mut inputs = vec![chunk(0, "secret probe term", Some(mine.clone()))];
+            for j in 0..victim_docs {
+                let text = if victim_has_term {
+                    "secret probe term"
+                } else {
+                    "unrelated filler words"
+                };
+                inputs.push(chunk(1000 + j, text, Some(theirs.clone())));
+            }
+            let seg = IndexSegment::build(vec![], inputs);
+            let hits = seg.bm25("probe", 10, &filter);
+            assert_eq!(hits.len(), 1, "filter must hide every victim document");
+            hits[0].score
+        };
+
+        let baseline = score_with(0, true);
+        for victim_docs in [1usize, 2, 10, 100, 500] {
+            for has_term in [true, false] {
+                let observed = score_with(victim_docs, has_term);
+                assert_eq!(
+                    observed.to_bits(),
+                    baseline.to_bits(),
+                    "score leaked {victim_docs} hidden docs (term present: {has_term})"
+                );
+            }
+        }
+    }
+
+    /// A term occurring only in hidden documents must be indistinguishable
+    /// from a term that does not occur at all.
+    #[test]
+    fn term_only_in_hidden_docs_yields_no_hits() {
+        let mine = ChunkMetadata {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let theirs = ChunkMetadata {
+            tenant: Some("b".into()),
+            ..Default::default()
+        };
+        let seg = IndexSegment::build(
+            vec![],
+            vec![
+                chunk(0, "alpha", Some(mine)),
+                chunk(1, "confidential", Some(theirs)),
+            ],
+        );
+        let filter = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        assert!(seg.bm25("confidential", 10, &filter).is_empty());
+        assert!(seg.bm25("nonexistentword", 10, &filter).is_empty());
+    }
+
+    /// The tenant index must not change *what* a filter returns, only what it
+    /// costs. Correctness is checked against the unindexed scan.
+    #[test]
+    fn tenant_index_matches_full_scan() {
+        let meta = |t: &str, lang: Option<&str>| {
+            Some(ChunkMetadata {
+                tenant: Some(t.into()),
+                language: lang.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let mut inputs = vec![
+            chunk(0, "alpha shared", meta("a", Some("en"))),
+            chunk(1, "alpha shared", meta("a", Some("fr"))),
+            chunk(2, "alpha shared", meta("b", Some("en"))),
+            chunk(3, "alpha shared", None),
+        ];
+        for i in 0..50 {
+            inputs.push(chunk(100 + i, "alpha shared", meta("b", Some("en"))));
+        }
+        let seg = IndexSegment::build(vec![], inputs);
+        assert_eq!(seg.tenants.len(), 2, "index must cover both tenants");
+
+        // Every filter shape must agree with a scan that ignores the index.
+        for filter in [
+            SearchFilter {
+                tenant: Some("a".into()),
+                ..Default::default()
+            },
+            SearchFilter {
+                tenant: Some("a".into()),
+                language: Some("en".into()),
+                ..Default::default()
+            },
+            SearchFilter {
+                tenant: Some("absent".into()),
+                ..Default::default()
+            },
+            SearchFilter::default(),
+        ] {
+            let via_index = seg.filter_docs(&filter);
+            let via_scan: Option<Vec<u32>> = if filter.is_unrestricted() && !seg.any_acl {
+                None
+            } else {
+                Some(
+                    seg.chunks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| filter.matches(c.meta.as_ref()))
+                        .map(|(i, _)| i as u32)
+                        .collect(),
+                )
+            };
+            assert_eq!(
+                via_index, via_scan,
+                "filter {filter:?} diverged from a full scan"
+            );
+        }
+
+        // An untenanted chunk is not reachable through a tenant filter.
+        let a = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        assert!(!seg.filter_docs(&a).unwrap().contains(&3));
+    }
+
+    /// A selective filter must not route to the graph. The beam cannot prune
+    /// when its radius is set by visible results, so traversal degenerates to a
+    /// near-full scan: slower than the exact path, and its cost scales with rows
+    /// the caller cannot see.
+    #[test]
+    fn selective_filter_avoids_degenerate_graph_traversal() {
+        const DIM: usize = 32;
+        const VISIBLE: usize = 1100;
+        let mine = ChunkMetadata {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let theirs = ChunkMetadata {
+            tenant: Some("b".into()),
+            ..Default::default()
+        };
+        let mut inputs: Vec<ChunkInput> = (0..VISIBLE)
+            .map(|i| {
+                let mut v = synthetic(i, DIM);
+                super::super::vector::normalize(&mut v);
+                ChunkInput {
+                    chunk_hash: hash_typed(b"sel:", format!("v{i}").as_bytes()),
+                    text: "doc".into(),
+                    embedding: Some(v),
+                    meta: Some(mine.clone()),
+                }
+            })
+            .collect();
+        for j in 0..5000 {
+            let mut v = synthetic(100_000 + j, DIM);
+            super::super::vector::normalize(&mut v);
+            inputs.push(ChunkInput {
+                chunk_hash: hash_typed(b"sel:", format!("h{j}").as_bytes()),
+                text: "doc".into(),
+                embedding: Some(v),
+                meta: Some(theirs.clone()),
+            });
+        }
+        let seg = IndexSegment::build(vec![], inputs);
+        assert!(seg.hnsw.is_some(), "graph should exist at this size");
+
+        let filter = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let mut q = synthetic(7, DIM);
+        super::super::vector::normalize(&mut q);
+        let hits = seg.vector(&q, 10, &filter);
+        assert_eq!(hits.len(), 10);
+
+        // Routing to the exact path makes it the oracle, so the filtered result
+        // must equal exact search over the visible set.
+        let allowed = seg.filter_docs(&filter).unwrap();
+        let mut doc_ok = vec![false; seg.chunks.len()];
+        for id in &allowed {
+            doc_ok[*id as usize] = true;
+        }
+        let mask: Vec<bool> = seg.vec_docs.iter().map(|&d| doc_ok[d as usize]).collect();
+        let pred = |n: u32| mask[n as usize];
+        let oracle = super::super::vector::exact_search(&seg.vec_data, &q, 10, Some(&pred));
+        let oracle_hashes: Vec<Hash> = oracle
+            .iter()
+            .map(|(_, n)| seg.chunks[seg.vec_docs[*n as usize] as usize].chunk_hash)
+            .collect();
+        let got: Vec<Hash> = hits.iter().map(|h| h.chunk_hash).collect();
+        assert_eq!(
+            got, oracle_hashes,
+            "selective filter must match exact search"
+        );
+    }
+
+    fn synthetic(i: usize, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|j| {
+                let mut x = (i * dim + j) as u64;
+                x = x.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(31);
+                ((x % 2000) as f32 / 1000.0) - 1.0
+            })
+            .collect()
     }
 
     #[test]

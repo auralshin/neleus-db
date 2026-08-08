@@ -203,8 +203,12 @@ fn bench_audit_bundle(c: &mut Criterion) {
         let hits = engine
             .search_semantic(doc_commit, "vector retrieval proof", 10, &filter)
             .unwrap();
-        let qm = engine
-            .record_query(
+        // Sequence-chained so the 64 records stay 64 distinct objects; the
+        // bare recorder would emit byte-identical manifests that collapse to
+        // one under content addressing.
+        engine
+            .record_query_at_head(
+                "main",
                 doc_commit,
                 "semantic",
                 Some("vector retrieval proof"),
@@ -214,10 +218,6 @@ fn bench_audit_bundle(c: &mut Criterion) {
                 Some("bench"),
                 &hits,
             )
-            .unwrap();
-        engine
-            .db()
-            .create_commit_at_head("main", "bench", "audit", vec![qm])
             .unwrap();
     }
 

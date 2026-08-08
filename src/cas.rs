@@ -90,7 +90,7 @@ impl CasStore {
             .into_iter()
             .filter(|(h, _)| !packs.contains(*h) && !self.path_for(*h).exists())
             .collect();
-        fresh.sort_by(|a, b| a.0.cmp(&b.0));
+        fresh.sort_by_key(|a| a.0);
         fresh.dedup_by(|a, b| a.0 == b.0);
         if fresh.is_empty() {
             return Ok(());
