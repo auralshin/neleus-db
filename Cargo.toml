@@ -1,10 +1,9 @@
 [package]
 name = "neleus-db"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Content-addressed database in Rust for AI agent memory. Every write becomes a Merkle-DAG object you can verify offline, so you can prove what an agent knew when it decided. Immutable history, retrieval audit, write-time policy checks."
+description = "Content-addressed database in Rust for AI agent memory. Every write is a Merkle-DAG object with an offline proof, so you can show what an agent retrieved and when. Immutable history, a retrieval audit log, and policy checks at write time. Local-first, no async runtime."
 license = "MIT OR Apache-2.0"
-publish = false
 repository = "https://github.com/auralshin/neleus-db"
 homepage = "https://github.com/auralshin/neleus-db"
 documentation = "https://docs.rs/neleus-db"
@@ -12,6 +11,19 @@ readme = "README.md"
 keywords = ["merkle", "ai-agents", "provenance", "audit", "content-addressed"]
 categories = ["database-implementations", "artificial-intelligence", "cryptography", "data-structures", "finance"]
 build = "build.rs"
+# Publish only what the crate needs to build and run. Embeds the prebuilt
+# console/dist (gitignored, so listed explicitly) so `serve --open` ships a
+# working UI; drops sdk/, docs/, console sources, and CI files.
+include = [
+    "/src/**/*",
+    "/benches/**/*",
+    "/build.rs",
+    "/console/dist/**/*",
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+]
 
 [features]
 # Embed the prebuilt web console (console/dist) into the binary and serve it
