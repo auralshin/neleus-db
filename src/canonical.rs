@@ -1,11 +1,14 @@
 use anyhow::Result;
 use serde::{Serialize, de::DeserializeOwned};
 
+/// Encode `value` as canonical DAG-CBOR bytes (deterministic, sorted map keys).
+/// The exact bytes hashed into every object's identity.
 pub fn to_cbor<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     // DAG-CBOR requires deterministic encoding and map key ordering.
     Ok(serde_ipld_dagcbor::to_vec(value)?)
 }
 
+/// Decode canonical DAG-CBOR `bytes` into `T`.
 pub fn from_cbor<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(serde_ipld_dagcbor::from_slice(bytes)?)
 }

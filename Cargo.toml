@@ -1,7 +1,11 @@
 [package]
 name = "neleus-db"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+# Let-chains in the engine and server need 1.88.
+rust-version = "1.88"
+# Two binaries ship; without this `cargo run` cannot pick one.
+default-run = "neleus-db"
 description = "Content-addressed database in Rust for AI agent memory. Every write is a Merkle-DAG object with an offline proof, so you can show what an agent retrieved and when. Immutable history, a retrieval audit log, and policy checks at write time. Local-first, no async runtime."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/auralshin/neleus-db"
@@ -49,7 +53,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_ipld_dagcbor = "0.6"
 serde_json = "1.0"
 sha2 = "0.10"
-thiserror = "2.0"
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
 zstd = "0.13"
 

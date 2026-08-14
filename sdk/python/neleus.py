@@ -254,9 +254,12 @@ class Client:
     def __init__(self, url: str, token: Optional[str] = None):
         self._t = HttpTransport(url, token)
 
+    # chunk_size/overlap default server-side: it derives overlap from
+    # chunk_size, and 64 is invalid below 128.
     def put_document(
         self, head: str, source: str, text: str, *,
-        chunk_size: int = 512, overlap: int = 64, metadata: Optional[dict] = None,
+        chunk_size: Optional[int] = None, overlap: Optional[int] = None,
+        metadata: Optional[dict] = None,
     ) -> dict:
         return self._t.request("POST", "/v1/documents", {
             "head": head, "source": source, "text": text,

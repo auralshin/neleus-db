@@ -190,8 +190,10 @@ impl Client {
                 "head": head,
                 "source": source,
                 "text": text,
-                "chunk_size": opts.chunk_size.unwrap_or(512),
-                "overlap": opts.overlap.unwrap_or(64),
+                // Omitted rather than defaulted here: the server derives
+                // overlap from chunk_size, and 64 is invalid below 128.
+                "chunk_size": opts.chunk_size,
+                "overlap": opts.overlap,
                 "metadata": opts.metadata,
             }),
         )

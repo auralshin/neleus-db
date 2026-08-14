@@ -3,7 +3,7 @@
 //! commit identity, layout free to change.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,8 +16,10 @@ use super::vector::{
 
 pub const SEGMENT_SCHEMA_VERSION: u32 = 2;
 
-/// Below this many vectors, exact scan beats the graph.
-const HNSW_BUILD_THRESHOLD: usize = 256;
+/// Below this many vectors, exact scan beats the graph. Kept above
+/// [`EXACT_SCAN_LIMIT`]: the query path never routes to a graph at or below
+/// that size, so building one there is pure waste.
+const HNSW_BUILD_THRESHOLD: usize = EXACT_SCAN_LIMIT + 1;
 
 /// Filters narrower than this skip the graph entirely.
 const EXACT_SCAN_LIMIT: usize = 1024;
@@ -52,6 +54,70 @@ pub struct SegmentChunk {
 pub struct PostingList {
     pub docs: Vec<u32>,
     pub tfs: Vec<u32>,
+}
+
+impl PostingList {
+    /// Term frequency for `doc`, or `None` if the term does not occur in it.
+    /// `docs` is appended in ascending doc order, so this is a binary search.
+    fn tf_for(&self, doc: u32) -> Option<u32> {
+        self.docs.binary_search(&doc).ok().map(|i| self.tfs[i])
+    }
+}
+
+/// Below this fraction of a segment, a filtered query probes its own documents
+/// against the posting lists instead of walking every posting and masking. The
+/// tenant index exists so a small tenant's query costs its own partition; the
+/// scoring loop has to honor that too, or the saving is given straight back.
+const SELECTIVE_FILTER_RATIO: usize = 8;
+
+/// Query-time corpus statistics, gathered across every segment serving a commit
+/// and restricted to what the caller may see.
+///
+/// BM25 scores are only comparable between two hits if both were computed from
+/// the same `N`, `df` and average document length. Per-segment statistics make
+/// a hit from a three-document delta segment outrank a better hit from a
+/// four-hundred-document base, because idf is computed against a corpus of
+/// three. Statistics stay scoped to the visible partition: segment-global
+/// counts would let a caller invert its own score to recover another tenant's.
+#[derive(Debug, Clone, Default)]
+pub struct CorpusStats {
+    pub n_docs: f32,
+    pub avg_dl: f32,
+    /// Visible document frequency per query term. Terms absent everywhere the
+    /// caller can see are omitted.
+    pub df: HashMap<String, usize>,
+}
+
+impl CorpusStats {
+    /// Sum every segment's contribution for `terms` under `filter`.
+    pub fn gather<'a>(
+        segments: impl IntoIterator<Item = &'a IndexSegment>,
+        terms: &[String],
+        filter: &SearchFilter,
+    ) -> Self {
+        let mut visible = 0usize;
+        let mut total_len = 0u64;
+        let mut df: HashMap<String, usize> = HashMap::new();
+        for seg in segments {
+            let (n, len, per_term) = seg.stats_for(terms, filter);
+            visible += n;
+            total_len += len;
+            for (term, count) in terms.iter().zip(per_term) {
+                if count > 0 {
+                    *df.entry(term.clone()).or_default() += count;
+                }
+            }
+        }
+        Self {
+            n_docs: visible as f32,
+            avg_dl: if visible == 0 {
+                1.0
+            } else {
+                (total_len as f32 / visible as f32).max(1.0)
+            },
+            df,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -318,14 +384,71 @@ impl IndexSegment {
         )
     }
 
-    /// BM25 top-k over this segment, restricted to `filter`.
-    ///
-    /// TAAT MaxScore: terms process in descending upper-bound order; once
-    /// the remaining terms cannot lift any unseen doc into the top-k, they
-    /// only update already-touched docs. Cost tracks result density, not
-    /// posting-list length. Scores accumulate in a dense vec — no per-entry
-    /// allocator traffic on the hot path.
+    /// This segment's contribution to [`CorpusStats`]: visible document count,
+    /// their total length, and visible df for each of `terms` in order.
+    pub fn stats_for(&self, terms: &[String], filter: &SearchFilter) -> (usize, u64, Vec<usize>) {
+        let Some(ids) = self.filter_docs(filter) else {
+            let dfs = terms
+                .iter()
+                .map(|t| self.lexicon.get(t).map_or(0, |p| p.docs.len()))
+                .collect();
+            return (self.chunks.len(), self.total_len, dfs);
+        };
+        if ids.is_empty() {
+            return (0, 0, vec![0; terms.len()]);
+        }
+        let total_len: u64 = ids.iter().map(|&d| self.doc_len[d as usize] as u64).sum();
+
+        // Probing beats masking exactly when the visible set is small, which is
+        // the case the tenant index is meant to make cheap.
+        let dfs = if ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len() {
+            terms
+                .iter()
+                .map(|t| {
+                    self.lexicon.get(t).map_or(0, |p| {
+                        ids.iter().filter(|&&d| p.tf_for(d).is_some()).count()
+                    })
+                })
+                .collect()
+        } else {
+            let mut mask = vec![false; self.chunks.len()];
+            for &d in &ids {
+                mask[d as usize] = true;
+            }
+            terms
+                .iter()
+                .map(|t| {
+                    self.lexicon
+                        .get(t)
+                        .map_or(0, |p| p.docs.iter().filter(|&&d| mask[d as usize]).count())
+                })
+                .collect()
+        };
+        (ids.len(), total_len, dfs)
+    }
+
+    /// BM25 top-k over this segment alone. Prefer [`Self::bm25_with`] when the
+    /// segment is one of several serving a commit: scores computed against
+    /// different corpora are not comparable, so merging them ranks wrongly.
     pub fn bm25(&self, query: &str, top_k: usize, filter: &SearchFilter) -> Vec<SegmentHit> {
+        self.bm25_with(query, top_k, filter, None)
+    }
+
+    /// BM25 top-k over this segment, restricted to `filter`, scored against
+    /// `corpus` when supplied (this segment alone otherwise).
+    ///
+    /// Unfiltered and weakly filtered queries use TAAT MaxScore: terms process
+    /// in descending upper-bound order, and once the remaining terms cannot lift
+    /// any unseen doc into the top-k they only update already-touched docs.
+    /// Strongly filtered queries take the probing path instead, where cost
+    /// tracks the visible partition rather than posting-list length.
+    pub fn bm25_with(
+        &self,
+        query: &str,
+        top_k: usize,
+        filter: &SearchFilter,
+        corpus: Option<&CorpusStats>,
+    ) -> Vec<SegmentHit> {
         if top_k == 0 || self.chunks.is_empty() {
             return Vec::new();
         }
@@ -334,6 +457,72 @@ impl IndexSegment {
             return Vec::new();
         }
         let allowed = self.filter_docs(filter);
+        if allowed.as_ref().is_some_and(|ids| ids.is_empty()) {
+            return Vec::new();
+        }
+
+        let local;
+        let stats = match corpus {
+            Some(c) => c,
+            None => {
+                local = CorpusStats::gather(std::iter::once(self), &terms, filter);
+                &local
+            }
+        };
+        if stats.n_docs < 1.0 {
+            return Vec::new();
+        }
+
+        // (postings, idf, upper_bound); ub = idf * (k1 + 1) bounds any single
+        // term's contribution since tf*(k1+1)/(tf+norm) < k1+1.
+        let mut term_data: Vec<(&PostingList, f32, f32)> = terms
+            .iter()
+            .filter_map(|term| {
+                let postings = self.lexicon.get(term)?;
+                // Present only in hidden docs = absent, for this caller.
+                let df = *stats.df.get(term)? as f32;
+                if df <= 0.0 {
+                    return None;
+                }
+                let idf = ((stats.n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+                Some((postings, idf, idf * (BM25_K1 + 1.0)))
+            })
+            .collect();
+        if term_data.is_empty() {
+            return Vec::new();
+        }
+
+        let avg_dl = stats.avg_dl;
+        if let Some(ids) = &allowed
+            && ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len()
+        {
+            // Few enough visible docs that scoring all of them beats walking
+            // every posting list and discarding most of it. No pruning needed:
+            // the candidate set is already the answer set.
+            let mut hits: Vec<SegmentHit> = Vec::new();
+            for &doc in ids {
+                let dl = self.doc_len[doc as usize] as f32;
+                let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / avg_dl));
+                let mut score = 0.0f32;
+                for (postings, idf, _) in &term_data {
+                    if let Some(tf) = postings.tf_for(doc) {
+                        let tf = tf as f32;
+                        score += idf * ((tf * (BM25_K1 + 1.0)) / (tf + norm));
+                    }
+                }
+                if score > 0.0 {
+                    hits.push(SegmentHit {
+                        chunk_hash: self.chunks[doc as usize].chunk_hash,
+                        score,
+                        doc,
+                    });
+                }
+            }
+            hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+            hits.truncate(top_k);
+            return hits;
+        }
+
         let allowed_set: Option<Vec<bool>> = allowed.as_ref().map(|ids| {
             let mut set = vec![false; self.chunks.len()];
             for &id in ids {
@@ -341,53 +530,6 @@ impl IndexSegment {
             }
             set
         });
-
-        // Scoped to the visible partition: segment-global `N`/`df` let a caller
-        // invert its own score to recover another tenant's exact counts.
-        let (n_docs, avg_dl) = match &allowed_set {
-            None => (self.chunks.len() as f32, self.avg_doc_len()),
-            Some(mask) => {
-                let mut visible = 0usize;
-                let mut total_len = 0u64;
-                for (doc, &ok) in mask.iter().enumerate() {
-                    if ok {
-                        visible += 1;
-                        total_len += self.doc_len[doc] as u64;
-                    }
-                }
-                if visible == 0 {
-                    return Vec::new();
-                }
-                (visible as f32, (total_len as f32 / visible as f32).max(1.0))
-            }
-        };
-
-        // (postings, idf, upper_bound); ub = idf * (k1 + 1) bounds any single
-        // term's contribution since tf*(k1+1)/(tf+norm) < k1+1.
-        let mut term_data: Vec<(&PostingList, f32, f32)> = terms
-            .iter()
-            .filter_map(|term| self.lexicon.get(term))
-            .filter_map(|postings| {
-                let df = match &allowed_set {
-                    None => postings.docs.len(),
-                    Some(mask) => postings
-                        .docs
-                        .iter()
-                        .filter(|&&doc| mask[doc as usize])
-                        .count(),
-                };
-                // Present only in hidden docs = absent, for this caller.
-                if df == 0 {
-                    return None;
-                }
-                let df = df as f32;
-                let idf = ((n_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
-                Some((postings, idf, idf * (BM25_K1 + 1.0)))
-            })
-            .collect();
-        if term_data.is_empty() {
-            return Vec::new();
-        }
         term_data.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
         let mut remaining_ub: f32 = term_data.iter().map(|(_, _, ub)| ub).sum();
 
@@ -585,6 +727,51 @@ mod tests {
             embedding: Some(emb),
             ..chunk(i, text, None)
         }
+    }
+
+    /// A tenant owning a sliver of a large segment takes the probing path. It
+    /// must return exactly the masking path would, and must not leak a
+    /// neighbour's document.
+    #[test]
+    fn selective_filter_matches_the_unselective_answer() {
+        let tenant = |name: &str| ChunkMetadata {
+            tenant: Some(name.into()),
+            ..Default::default()
+        };
+        let mut inputs: Vec<ChunkInput> = (0..4000)
+            .map(|i| chunk(i, "shared term filler body", Some(tenant("bulk"))))
+            .collect();
+        // Ten visible documents against four thousand hidden ones: far past the
+        // ratio, so this query probes instead of walking every posting list.
+        for i in 0..10 {
+            inputs.push(chunk(
+                10_000 + i,
+                if i == 3 {
+                    "shared term shared term shared"
+                } else {
+                    "shared term filler body"
+                },
+                Some(tenant("small")),
+            ));
+        }
+        let seg = IndexSegment::build(vec![], inputs);
+
+        let filter = SearchFilter {
+            tenant: Some("small".into()),
+            ..Default::default()
+        };
+        let hits = seg.bm25("shared term", 20, &filter);
+
+        assert_eq!(hits.len(), 10, "every visible doc matches the query");
+        assert!(
+            hits.iter().all(|h| h.doc >= 4000),
+            "a tenant query must not return another tenant's chunks"
+        );
+        assert_eq!(
+            hits[0].doc, 4003,
+            "the term-dense document must still rank first"
+        );
+        assert!(hits.windows(2).all(|w| w[0].score >= w[1].score));
     }
 
     #[test]
@@ -946,7 +1133,11 @@ mod tests {
 
     #[test]
     fn large_segment_builds_hnsw_and_recall_holds() {
-        let inputs: Vec<ChunkInput> = (0..600)
+        // Above EXACT_SCAN_LIMIT so the query path actually routes to the
+        // graph. A self-query is at distance 0, so any graph that can be
+        // entered and left must return it at rank 1; anything less means
+        // traversal is trapped.
+        let inputs: Vec<ChunkInput> = (0..1400)
             .map(|i| {
                 let mut v: Vec<f32> = (0..16)
                     .map(|j| {

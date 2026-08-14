@@ -71,10 +71,11 @@ impl CasStore {
                 fs::remove_file(&path).with_context(|| format!("shredding loose object {h}"))?;
             }
         }
-        let packed: HashSet<Hash> = self.packs().hashes().into_iter().collect();
-        if packed.intersection(&targets).next().is_some() {
-            let live: HashSet<Hash> = packed.difference(&targets).copied().collect();
-            crate::packstore::rewrite_packs_keeping(&self.root, &live)?;
+        // Name the objects to drop rather than the ones to keep: a keep-set
+        // derived from this handle's cached index would classify every object in
+        // a pack written since that snapshot as dead and unlink the whole pack.
+        let (removed, _) = crate::packstore::rewrite_packs_dropping(&self.root, &targets)?;
+        if removed > 0 {
             self.refresh_packs();
         }
         Ok(())

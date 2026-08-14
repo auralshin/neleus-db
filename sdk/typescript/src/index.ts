@@ -158,8 +158,10 @@ export class Client {
       head,
       source,
       text,
-      chunk_size: opts.chunkSize ?? 512,
-      overlap: opts.overlap ?? 64,
+      // Omitted rather than defaulted here: the server derives overlap from
+      // chunk_size, and 64 is invalid below 128.
+      chunk_size: opts.chunkSize ?? null,
+      overlap: opts.overlap ?? null,
       metadata: opts.metadata ?? null,
     });
   }

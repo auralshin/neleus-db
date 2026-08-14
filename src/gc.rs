@@ -31,7 +31,7 @@ use anyhow::{Context, Result, bail};
 use crate::canonical::{from_cbor, to_cbor};
 use crate::db::Database;
 use crate::hash::Hash;
-use crate::lock::acquire_lock;
+use crate::lock::flock_exclusive;
 use crate::manifest::{
     ChunkManifest, DocManifest, ManifestReferences, QueryManifest, RunManifest, SummaryManifest,
 };
@@ -56,7 +56,7 @@ pub struct GcStats {
 /// stores. Dry run unless `prune`. Held under `meta/maintenance.lock` (shared
 /// with repack) so the two never run at once.
 pub fn gc(db: &Database, prune: bool, grace: Duration) -> Result<GcStats> {
-    let _lock = acquire_lock(
+    let _lock = flock_exclusive(
         db.root.join("meta").join("maintenance.lock"),
         Duration::from_secs(30),
     )?;
@@ -325,13 +325,19 @@ fn sweep_store(
     }
 
     // Packed objects: rewrite packs to drop the dead ones, or just count them.
-    let (packed_n, packed_bytes) = if prune {
-        packstore::rewrite_packs_keeping(cas_root, reach)?
+    // Same grace as the loose branch: a peer's freshly written pack holds
+    // committed objects that no ref reaches yet.
+    let cutoff = start
+        .checked_sub(grace)
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let (packed_n, packed_bytes, packed_skipped) = if prune {
+        packstore::rewrite_packs_keeping(cas_root, reach, cutoff)?
     } else {
-        packstore::packed_garbage(cas_root, reach)?
+        packstore::packed_garbage(cas_root, reach, cutoff)?
     };
     unreachable += packed_n;
     bytes += packed_bytes;
+    skipped += packed_skipped;
 
     Ok((unreachable, bytes, skipped))
 }

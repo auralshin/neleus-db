@@ -177,8 +177,22 @@ remote.
 | [`sdk/rust`](sdk/rust) | HTTP (std-only) | Rust clients of a remote `serve` |
 
 The Rust crate itself (`neleus_db::Engine`) is the embedded path for Rust.
-Every SDK covers the same surface: ingest, hybrid search, proofs, sessions,
-audit export, and run-capture.
+Ingest, hybrid search, proofs and session append are in every SDK; the rest of
+the surface is not yet uniform:
+
+| | python | typescript | rust | python-native |
+|---|---|---|---|---|
+| ingest, search, prove, verify | yes | yes | yes | yes |
+| session append | yes | yes | yes | yes |
+| session list | yes | yes | yes | no |
+| state get/set | yes | yes | no | no |
+| checkpoints | yes | yes | yes | yes |
+| run capture | yes | yes | yes | no |
+| audit export | no | yes | yes | yes |
+| blob get/put | put only | yes | yes | get only |
+
+TypeScript is the most complete HTTP client. Anything missing is reachable over
+the [HTTP API](docs/http-api.md) directly.
 
 ```python
 # native, in-process
@@ -198,8 +212,9 @@ const proof = await c.prove(res.commit, res.hits[0].chunk);
 console.assert((await c.verify(proof)).valid);
 ```
 
-Each SDK has its own README and a real test suite. The Rust and TS suites spin
-up a server; the native suite runs in-process.
+The TypeScript, Rust and native SDKs each have a README and a test suite: the
+Rust and TS suites spin up a server, the native suite runs in-process.
+`sdk/python` is a single stdlib-only module with neither.
 
 ## Architecture
 

@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -27,6 +27,14 @@ const MAX_JSON_BODY: usize = 8 * 1024 * 1024;
 const MAX_PACK_BODY: usize = 4 * 1024 * 1024 * 1024;
 const MAX_TOP_K: usize = 1000;
 const MAX_CONNECTIONS: usize = 256;
+/// Smallest accepted chunk window; with overlap capped at half of it, one
+/// request can produce at most `body_len / 32` chunks.
+const MIN_CHUNK_SIZE: usize = 64;
+/// Per-read and whole-phase budgets for the header phase. One thread per
+/// connection against a fixed connection cap means a slow header reader is a
+/// denial of service, so headers get a much tighter budget than bodies.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const HEADER_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -43,6 +51,10 @@ pub struct ServerConfig {
     /// injected into the served console, so localhost "just works". Ignored on
     /// remote binds and under `--no-auth`. Default on.
     pub bootstrap: bool,
+    /// ed25519 seed file used to sign audit bundles exported over HTTP. Without
+    /// it, bundles carry only the unkeyed integrity footer, which anyone editing
+    /// the file can recompute. See the `/v1/audit/export` route.
+    pub audit_signing_key: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -53,6 +65,7 @@ impl Default for ServerConfig {
             no_auth: false,
             cors_origin: None,
             bootstrap: true,
+            audit_signing_key: None,
         }
     }
 }
@@ -61,6 +74,9 @@ pub struct ServerHandle {
     pub addr: SocketAddr,
     /// The per-process loopback bootstrap admin token, if one was minted.
     pub bootstrap_token: Option<String>,
+    /// Public half of the audit signing key, when exports are signed. An
+    /// auditor needs this hex to run `neleus-verify --public-key`.
+    pub audit_public_key: Option<String>,
     stop: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
@@ -84,6 +100,8 @@ struct ServerState {
     auth_root: Option<std::path::PathBuf>,
     /// Loopback-only admin token (see [`ServerConfig::bootstrap`]).
     bootstrap_token: Option<String>,
+    /// Signs audit bundles exported over HTTP, when configured.
+    audit_signer: Option<crate::signing::Ed25519Signer>,
     write_lock: Mutex<()>,
 }
 
@@ -105,6 +123,17 @@ pub fn start(engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
     } else {
         None
     };
+
+    // Load the audit signing key up front: a key that only fails at export time
+    // would let an operator run for weeks believing exports were signed.
+    let audit_signer = match &config.audit_signing_key {
+        Some(path) => Some(
+            crate::signing::Ed25519Signer::from_seed_file(path)
+                .with_context(|| format!("loading audit signing key {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let audit_public_key = audit_signer.as_ref().map(|s| s.public_key_hex());
 
     let auth_root = if config.no_auth {
         None
@@ -138,6 +167,7 @@ pub fn start(engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
         cors_origin: config.cors_origin.clone(),
         auth_root,
         bootstrap_token: bootstrap_token.clone(),
+        audit_signer,
         write_lock: Mutex::new(()),
     });
     let stop = Arc::new(AtomicBool::new(false));
@@ -172,6 +202,7 @@ pub fn start(engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
     Ok(ServerHandle {
         addr,
         bootstrap_token,
+        audit_public_key,
         stop,
         join: Some(join),
     })
@@ -251,12 +282,7 @@ fn build_static(
             (bytes.to_vec(), Some("zstd"))
         } else {
             // Rare client without zstd: decompress with the same crate.
-            (
-                crate::compression::decompress_if_compressed(bytes)
-                    .ok()?
-                    .into_owned(),
-                None,
-            )
+            (crate::compression::decompress(bytes).ok()?, None)
         }
     } else {
         (inject_bootstrap(path, bytes, bootstrap), None)
@@ -316,11 +342,140 @@ struct Request {
     method: String,
     path: String,
     body: Vec<u8>,
+    /// Set instead of `body` for uploads streamed straight to disk. Only
+    /// `/v1/pack` uses it; the route owns the file and unlinks it.
+    body_path: Option<std::path::PathBuf>,
     principal: Option<Principal>,
 }
 
+/// Unlinks a staged upload on every exit path. A `?` unwind mid-copy leaves
+/// `handle_connection` before any explicit cleanup, and the temp name carries
+/// the live server's PID, which `cleanup_orphan_temps` skips.
+struct StagedUpload(std::path::PathBuf);
+
+impl Drop for StagedUpload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+enum HeadRead {
+    Complete(String),
+    TooLarge,
+    TimedOut,
+    PeerClosed,
+}
+
+/// Read the request line and headers, bounded in bytes *and* in wall-clock.
+///
+/// `BufRead::read_line` can do neither: it grows its buffer until it sees a
+/// newline, and it loops on `read()` internally, so the socket timeout (which is
+/// per syscall and resets on every byte) never bounds it. A client dribbling one
+/// byte at a time with no newline would hold a connection, and one of the 256
+/// worker threads, for as long as the byte budget lasted. Checking the deadline
+/// between lines does not help either, because that client never finishes a line.
+fn read_head<R: BufRead>(reader: &mut R, deadline: Instant) -> std::io::Result<HeadRead> {
+    let mut head = String::new();
+    let mut line_start = 0usize;
+    let mut total = 0usize;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(HeadRead::TimedOut);
+        }
+        let buf = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // How a stalled peer surfaces once the socket read timeout fires.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(HeadRead::TimedOut);
+            }
+            Err(e) => return Err(e),
+        };
+        if buf.is_empty() {
+            return Ok(HeadRead::PeerClosed);
+        }
+        let newline = buf.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(buf.len(), |i| i + 1);
+        if total + take > MAX_HEADER_BYTES {
+            return Ok(HeadRead::TooLarge);
+        }
+        head.push_str(&String::from_utf8_lossy(&buf[..take]));
+        reader.consume(take);
+        total += take;
+        if newline.is_some() {
+            // A blank line ends the header block; drop it from the result.
+            if matches!(&head[line_start..], "\r\n" | "\n") {
+                head.truncate(line_start);
+                return Ok(HeadRead::Complete(head));
+            }
+            line_start = head.len();
+        }
+    }
+}
+
+/// Policy gate for a write route. Every path that lands bytes in the store goes
+/// through this: the CLI gates the same operations, so an ungated HTTP route
+/// would make the server the weaker of the two surfaces. Callers hold the write
+/// lock, which serializes the event-log append inside `enforce_write`.
+fn gate_write(db: &crate::db::Database, req: &Request, op: &'static str, head: &str) -> Result<()> {
+    crate::policy::enforce_write(
+        db,
+        &crate::policy::WriteContext {
+            op,
+            head,
+            principal: req.principal.as_ref().map(|p| p.key_id.as_str()),
+            has_provenance: false,
+        },
+    )
+}
+
+/// True when the client addressed us by a loopback name. Paired with a loopback
+/// peer address this rules out DNS rebinding, where an attacker's domain
+/// resolves to 127.0.0.1 but the browser origin stays the attacker's.
+fn host_is_local(host: Option<&str>) -> bool {
+    // HTTP/1.1 requires Host; treat its absence as untrusted rather than local.
+    let Some(host) = host.map(str::trim) else {
+        return false;
+    };
+    let name = match host.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        },
+        None => host.rsplit_once(':').map_or(host, |(h, _)| h),
+    };
+    // Must be a loopback literal or exactly "localhost". A prefix test would
+    // accept an attacker-registered `127.0.0.1.evil.com`, which is a hostname,
+    // not an address.
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Constant-time bearer comparison. The registry path already scans every
+/// record without early exit; this keeps the bootstrap token consistent.
+fn bearer_matches(bearer: Option<&str>, expected: &str) -> bool {
+    let Some(bearer) = bearer else { return false };
+    if bearer.len() != expected.len() {
+        return false;
+    }
+    bearer
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
 fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+    // Short timeout while reading headers: the 600s body timeout is per read
+    // call and resets on every byte, so a client dribbling one byte at a time
+    // would hold a connection (and a thread) open indefinitely.
+    stream.set_read_timeout(Some(HEADER_READ_TIMEOUT))?;
     stream.set_write_timeout(Some(Duration::from_secs(600)))?;
     let loopback_peer = stream
         .peer_addr()
@@ -328,25 +483,17 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
         .unwrap_or(false);
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    // Request line + headers, bounded.
-    let mut head = String::new();
-    let mut total = 0usize;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            return Ok(()); // peer closed
-        }
-        total += n;
-        if total > MAX_HEADER_BYTES {
+    // Request line + headers, bounded in both bytes and wall-clock.
+    let head = match read_head(&mut reader, Instant::now() + HEADER_DEADLINE)? {
+        HeadRead::Complete(head) => head,
+        HeadRead::PeerClosed => return Ok(()),
+        HeadRead::TooLarge => {
             return respond(&stream, 431, &err_json(431, "request headers too large"));
         }
-        if line == "\r\n" || line == "\n" {
-            break;
+        HeadRead::TimedOut => {
+            return respond(&stream, 408, &err_json(408, "request headers timed out"));
         }
-        head.push_str(&line);
-    }
+    };
 
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or_default();
@@ -357,12 +504,14 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     let mut content_length = 0usize;
     let mut bearer: Option<String> = None;
     let mut accepts_zstd = false;
+    let mut host: Option<String> = None;
     for line in lines {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
         let v = v.trim();
         match k.to_ascii_lowercase().as_str() {
+            "host" => host = Some(v.to_string()),
             "content-length" => content_length = v.parse().unwrap_or(0),
             "authorization" => {
                 bearer = v
@@ -387,8 +536,15 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
     // Console assets are public — the browser fetches them before it has any
     // token — so they are served ahead of the auth gate. The API (`/v1/*`)
     // never takes this path and stays authenticated.
+    // A loopback peer address does not prove a local *origin*: a page on an
+    // attacker's domain can rebind that domain's DNS to 127.0.0.1, at which
+    // point it is same-origin with itself and can read our response body. The
+    // bootstrap token is therefore gated on the client also addressing us by a
+    // local name, which a rebound request cannot do.
+    let local_origin = loopback_peer && host_is_local(host.as_deref());
+
     if method == "GET" && !path.starts_with("/v1/") {
-        let bootstrap = if loopback_peer {
+        let bootstrap = if local_origin {
             state.bootstrap_token.as_deref()
         } else {
             None
@@ -430,8 +586,8 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
             let registry = AuthRegistry::load(root)?;
             match bearer.as_deref().and_then(|t| registry.authenticate(t)) {
                 Some(p) => Some(p),
-                None => match (&state.bootstrap_token, loopback_peer) {
-                    (Some(bt), true) if bearer.as_deref() == Some(bt.as_str()) => Some(Principal {
+                None => match (&state.bootstrap_token, local_origin) {
+                    (Some(bt), true) if bearer_matches(bearer.as_deref(), bt) => Some(Principal {
                         key_id: "bootstrap".into(),
                         role: Role::Admin,
                         tenant: None,
@@ -448,17 +604,52 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
         }
     };
 
-    // Body is read only after authentication succeeds.
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
+    // Body is read only after authentication succeeds. Grow as bytes actually
+    // arrive rather than pre-allocating `Content-Length`, which on /v1/pack
+    // would let one request claim 4 GiB it never sends.
+    stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+    let mut body = Vec::new();
+    let mut staged: Option<StagedUpload> = None;
+    let short_body = if method == "POST" && path == "/v1/pack" {
+        // A pack upload is up to 4 GiB and its only consumer reads it back from
+        // a file, so buffering it in memory first is pure overhead. Stream it.
+        // Inside the root: beside it, it sits outside the encryption boundary.
+        let dir = state.engine.db().root.join("meta");
+        std::fs::create_dir_all(&dir)?;
+        let tmp = dir.join(crate::atomic::build_temp_name("recv-pack")?);
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("staging pack upload at {}", tmp.display()))?;
+        // Armed before the first operation that can fail with bytes on disk.
+        staged = Some(StagedUpload(tmp));
+        let written = std::io::copy(&mut (&mut reader).take(content_length as u64), &mut f)?;
+        f.sync_all()?;
+        drop(f);
+        written != content_length as u64
+    } else {
+        (&mut reader)
+            .take(content_length as u64)
+            .read_to_end(&mut body)?;
+        body.len() != content_length
+    };
+    if short_body {
+        return respond(
+            &stream,
+            400,
+            &err_json(400, "request body shorter than Content-Length"),
+        );
+    }
 
     let request = Request {
         method,
         path,
         body,
+        body_path: staged.as_ref().map(|s| s.0.clone()),
         principal,
     };
-    let (status, content_type, payload): (u16, &str, Vec<u8>) = match route(state, &request) {
+    let routed = route(state, &request);
+    // Reclaim before the response is written rather than at end of scope.
+    drop(staged);
+    let (status, content_type, payload): (u16, &str, Vec<u8>) = match routed {
         Ok(Response::Json(status, value)) => {
             (status, "application/json", value.to_string().into_bytes())
         }
@@ -520,6 +711,10 @@ fn error_meta(status: u16, msg: &str) -> (&'static str, Option<&'static str>) {
         413 => (
             "payload_too_large",
             Some("shrink the body (JSON ≤ 8 MiB, pack ≤ 4 GiB)"),
+        ),
+        408 => (
+            "request_timeout",
+            Some("send the complete request headers within 30s"),
         ),
         431 => ("headers_too_large", None),
         503 => (
@@ -605,6 +800,7 @@ fn respond_with_headers(
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
@@ -736,6 +932,9 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // run content here with a tenant key. Reads stay untenanted.
             require(req, Role::Writer)?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
+            // No head to scope against; global rules (encryption at rest,
+            // retention) apply regardless of the selector.
+            gate_write(db, req, "blobs", "")?;
             let hash = db.blob_store.put(&req.body)?;
             Ok(Response::Json(200, json!({"hash": hash.to_string()})))
         }
@@ -775,6 +974,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let key = b64_field(&v, "key")?;
             let value = b64_field(&v, "value")?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
+            gate_write(db, req, "state", head)?;
             let root = db.state_set_at_head(head, &key, &value)?;
             Ok(Response::Json(200, json!({"root": root.to_string()})))
         }
@@ -785,6 +985,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let key = b64_field(&v, "key")?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
+            gate_write(db, req, "state", head)?;
             let root = db.state_del_at_head(head, &key)?;
             Ok(Response::Json(200, json!({"root": root.to_string()})))
         }
@@ -812,7 +1013,22 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let source = str_field(&v, "source")?;
             let text = str_field(&v, "text")?;
             let chunk_size = v.get("chunk_size").and_then(Value::as_u64).unwrap_or(512) as usize;
-            let overlap = v.get("overlap").and_then(Value::as_u64).unwrap_or(64) as usize;
+            // Default the overlap to the window, so shrinking `chunk_size`
+            // alone cannot fail the bound below on a value the caller never set.
+            let overlap = v
+                .get("overlap")
+                .and_then(Value::as_u64)
+                .map_or_else(|| 64.min(chunk_size / 2), |o| o as usize);
+            // Chunking advances by `chunk_size - overlap`, so a near-equal pair
+            // steps one byte at a time: an 8 MiB body would yield ~8M chunks,
+            // one CAS entry each. Keeping the advance at half the window bounds
+            // that at body_len / (MIN_CHUNK_SIZE / 2).
+            if chunk_size < MIN_CHUNK_SIZE || overlap > chunk_size / 2 {
+                bail!(
+                    "bad request: chunk_size must be at least {MIN_CHUNK_SIZE} and overlap at \
+                     most half of it"
+                );
+            }
             let mut metadata: Option<crate::manifest::ChunkMetadata> = match v.get("metadata") {
                 None | Some(Value::Null) => None,
                 Some(m) => Some(
@@ -1071,7 +1287,12 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                          (the record must be committed to a head to be exportable)"
                     );
                 }
+                // Recording the query commits a QueryManifest and advances the
+                // head, so it is a write however it is spelled: a reader key
+                // must not be able to grow the DAG or move a ref.
+                require(req, Role::Writer)?;
                 let _w = state.write_lock.lock().expect("write lock poisoned");
+                gate_write(db, req, "search", at)?;
                 Some(
                     engine
                         .record_query_at_head(
@@ -1124,15 +1345,8 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // include_content it returns raw chunk bytes. A tenant-scoped key
             // must not use it to read another tenant's content — deny the
             // content-bearing form, same as the untenanted /v1/blobs read.
-            if include
-                && req
-                    .principal
-                    .as_ref()
-                    .is_some_and(|p| p.tenant.is_some())
-            {
-                bail!(
-                    "forbidden: include_content proofs are not available to tenant-scoped keys"
-                );
+            if include && req.principal.as_ref().is_some_and(|p| p.tenant.is_some()) {
+                bail!("forbidden: include_content proofs are not available to tenant-scoped keys");
             }
             let proof = engine.prove(commit, chunk, include)?;
             use base64::Engine as _;
@@ -1168,6 +1382,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let role = v.get("role").and_then(Value::as_str);
             let ttl_secs = v.get("ttl_secs").and_then(Value::as_u64);
             let _w = state.write_lock.lock().expect("write lock poisoned");
+            gate_write(db, req, "sessions", head)?;
             let (seq, content_hash) =
                 engine
                     .sessions()
@@ -1211,15 +1426,16 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let v = parse_json(&req.body)?;
             let head = scope_head(req, str_field(&v, "head")?)?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
+            gate_write(db, req, "checkpoints", head)?;
             let hash = engine.checkpoints().create(head, None)?;
             Ok(Response::Json(200, json!({"checkpoint": hash.to_string()})))
         }
 
         ("GET", "/v1/pack") => {
             require_untenanted(req, Role::Admin)?;
-            let tmp = db
-                .root
-                .with_extension(format!("serve-pack-{}", std::process::id()));
+            let dir = db.root.join("meta");
+            std::fs::create_dir_all(&dir)?;
+            let tmp = dir.join(crate::atomic::build_temp_name("serve-pack")?);
             crate::pack::pack(&db.root, &tmp, true)?;
             let bytes = std::fs::read(&tmp);
             let _ = std::fs::remove_file(&tmp);
@@ -1228,14 +1444,13 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
 
         ("POST", "/v1/pack") => {
             require_untenanted(req, Role::Admin)?;
-            let tmp = db
-                .root
-                .with_extension(format!("recv-pack-{}", std::process::id()));
-            std::fs::write(&tmp, &req.body)?;
+            let tmp = req
+                .body_path
+                .clone()
+                .ok_or_else(|| anyhow!("pack upload was not staged"))?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
-            let result = crate::sync::merge_pack_file(db, &tmp);
-            let _ = std::fs::remove_file(&tmp);
-            let report = result?;
+            gate_write(db, req, "pack", "")?;
+            let report = crate::sync::merge_pack_file(db, &tmp)?;
             Ok(Response::Json(
                 200,
                 json!({
@@ -1312,16 +1527,31 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
             let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            // Server export carries the integrity footer (tamper-evident,
-            // offline-verifiable). Origin signing is a CLI/KMS operation.
-            let (bytes, _) = crate::audit::export_bytes(db, head, from, to, None)?;
+            // Signed when `--sign-key` is configured. Without it the bundle
+            // carries only the unkeyed integrity footer: that detects corruption
+            // and a careless edit, but anyone modifying the file recomputes it,
+            // so an unsigned bundle is NOT evidence against its own exporter.
+            let (bytes, _) =
+                crate::audit::export_bytes(db, head, from, to, state.audit_signer.as_ref())?;
             Ok(Response::Bytes("application/octet-stream", bytes))
         }
 
         // ---- policy-as-code ----
         ("GET", "/v1/policy") => {
             require_untenanted(req, Role::Reader)?;
-            let set = crate::policy::load(&db.root)?;
+            let mut set = crate::policy::load(&db.root)?;
+            // The webhook URL is a bearer secret (Slack/PagerDuty embed the
+            // token in the path), so only an admin sees it. Under `--no-auth`
+            // there is no principal and every caller is already admin, so
+            // redacting there would only make the console's read-modify-write
+            // of the policy set silently drop the webhook.
+            let admin = req
+                .principal
+                .as_ref()
+                .map_or(state.auth_root.is_none(), |p| p.role == Role::Admin);
+            if !admin {
+                set.webhook = None;
+            }
             Ok(Response::Json(200, json!({"policy": set})))
         }
 
@@ -1362,6 +1592,9 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 Some(after) => crate::events::read_since(&db.root, after),
                 None => crate::events::read(&db.root),
             };
+            // Sampled before the read; an event landing between the two is
+            // then caught by the read rather than hidden by a matching tip.
+            let mut tip = crate::events::tip_seq(&db.root)?;
             let mut events = read(db)?;
             // Long-poll: hold the connection up to `wait` (≤30s) for new events.
             if let Some(wait) = param("wait").map(|w| w.min(30)) {
@@ -1369,10 +1602,22 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 while events.is_empty() && waited < wait {
                     std::thread::sleep(Duration::from_secs(1));
                     waited += 1;
-                    events = read(db)?;
+                    // Poll the tip, not the log: a full re-read per second cost
+                    // O(log length) for as long as a console stayed connected.
+                    let latest = crate::events::tip_seq(&db.root)?;
+                    if latest != tip {
+                        tip = latest;
+                        events = read(db)?;
+                    }
                 }
             }
-            Ok(Response::Json(200, json!({"events": events})))
+            // Opt-in: verify walks the whole log. Absent rather than `false`
+            // when unasked, so "not checked" cannot read as "checked".
+            let mut body = json!({ "events": events });
+            if param("verify") == Some(1) {
+                body["chain_verified"] = json!(crate::events::verify(&db.root).is_ok());
+            }
+            Ok(Response::Json(200, body))
         }
 
         // ---- erasure (GDPR right-to-be-forgotten) ----
@@ -1418,6 +1663,92 @@ mod tests {
     use crate::db::Database;
     use crate::sync::http_request;
 
+    #[test]
+    fn only_loopback_names_count_as_local_origin() {
+        for ok in [
+            "localhost",
+            "localhost:7117",
+            "127.0.0.1",
+            "127.0.0.1:7117",
+            "127.1.2.3:80",
+            "[::1]",
+            "[::1]:7117",
+        ] {
+            assert!(host_is_local(Some(ok)), "{ok} should be local");
+        }
+        // A rebound attacker domain resolves to 127.0.0.1 but still sends its
+        // own name in Host, which is what makes the token unreadable to it.
+        for bad in [
+            "evil.com",
+            "evil.com:7117",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com",
+            "[dead::beef]:7117",
+            "",
+        ] {
+            assert!(!host_is_local(Some(bad)), "{bad} should not be local");
+        }
+        assert!(!host_is_local(None), "absent Host is not local");
+    }
+
+    #[test]
+    fn header_read_parses_then_stops_at_the_blank_line() {
+        let raw = b"GET /v1/health HTTP/1.1\r\nHost: localhost\r\n\r\nBODYBYTES";
+        let mut r = BufReader::new(&raw[..]);
+        let out = read_head(&mut r, Instant::now() + Duration::from_secs(5)).unwrap();
+        let HeadRead::Complete(head) = out else {
+            panic!("expected a complete header block")
+        };
+        assert_eq!(head, "GET /v1/health HTTP/1.1\r\nHost: localhost\r\n");
+        // The body must be left unconsumed for the caller.
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, b"BODYBYTES");
+    }
+
+    #[test]
+    fn header_read_rejects_an_oversized_block() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        raw.extend_from_slice(b"X-Pad: ");
+        raw.extend(std::iter::repeat_n(b'A', MAX_HEADER_BYTES));
+        raw.extend_from_slice(b"\r\n\r\n");
+        let mut r = BufReader::new(&raw[..]);
+        let out = read_head(&mut r, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert!(matches!(out, HeadRead::TooLarge));
+    }
+
+    #[test]
+    fn header_read_stops_at_the_deadline_mid_line() {
+        // One byte at a time and never a newline: the shape `read_line` cannot
+        // bound, because its internal loop resets the socket timeout on every
+        // byte. Checking the deadline only between lines never fires here.
+        struct Dribble;
+        impl std::io::Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(1));
+                buf[0] = b'A';
+                Ok(1)
+            }
+        }
+        let started = Instant::now();
+        let mut r = BufReader::with_capacity(1, Dribble);
+        let out = read_head(&mut r, started + Duration::from_millis(60)).unwrap();
+        assert!(matches!(out, HeadRead::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "deadline must bound a single unterminated line"
+        );
+    }
+
+    #[test]
+    fn bearer_compare_matches_only_exact_tokens() {
+        assert!(bearer_matches(Some("nlk_abc"), "nlk_abc"));
+        assert!(!bearer_matches(Some("nlk_abd"), "nlk_abc"));
+        assert!(!bearer_matches(Some("nlk_ab"), "nlk_abc"));
+        assert!(!bearer_matches(Some("nlk_abcd"), "nlk_abc"));
+        assert!(!bearer_matches(None, "nlk_abc"));
+    }
+
     fn start_server(tmp: &TempDir, no_auth: bool) -> (ServerHandle, String, Option<String>) {
         let root = tmp.path().join("db");
         Database::init(&root).unwrap();
@@ -1435,6 +1766,7 @@ mod tests {
                 no_auth: false,
                 cors_origin: None,
                 bootstrap: false,
+                audit_signing_key: None,
             },
         )
         .unwrap();
@@ -1545,6 +1877,7 @@ mod tests {
                 no_auth: false,
                 cors_origin: None,
                 bootstrap: false,
+                audit_signing_key: None,
             },
         )
         .unwrap();
@@ -1669,6 +2002,73 @@ mod tests {
         std::fs::write(&path, &bundle).unwrap();
         let report = crate::audit::verify_bundle(&path, None, false).unwrap();
         assert_eq!(report.retrievals, 1);
+        // No --sign-key configured, so this bundle carries only the unkeyed
+        // footer and must not pass as signed evidence.
+        assert!(
+            crate::audit::verify_bundle(&path, None, true).is_err(),
+            "an unsigned bundle must fail when a signature is required"
+        );
+
+        handle.shutdown();
+    }
+
+    #[test]
+    fn configured_signing_key_makes_http_exports_verifiable() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("db");
+        Database::init(&root).unwrap();
+        let key = add_key(&root, "k", Role::Admin, None).unwrap();
+        let token = Some(key.as_str());
+        let key_path = tmp.path().join("audit.key");
+        let public_hex = crate::signing::generate_keypair_file(&key_path).unwrap();
+
+        let engine = Engine::open(&root).unwrap();
+        let handle = start(
+            engine,
+            ServerConfig {
+                addr: "127.0.0.1:0".into(),
+                allow_remote: false,
+                no_auth: false,
+                cors_origin: None,
+                bootstrap: false,
+                audit_signing_key: Some(key_path),
+            },
+        )
+        .unwrap();
+        let url = format!("http://{}", handle.addr);
+
+        post_json(
+            &url,
+            "/v1/documents",
+            token,
+            serde_json::json!({"head": "main", "source": "kb", "text": "alpha beta corpus"}),
+        );
+        post_json(
+            &url,
+            "/v1/search",
+            token,
+            serde_json::json!({"at": "main", "mode": "semantic", "query": "corpus", "audit": true}),
+        );
+
+        let bundle = http_request(
+            &url,
+            "POST",
+            "/v1/audit/export",
+            token,
+            &[("content-type", "application/json")],
+            Some(br#"{"head":"main"}"#),
+        )
+        .unwrap();
+        let path = tmp.path().join("signed.nelaudit");
+        std::fs::write(&path, &bundle).unwrap();
+
+        let report = crate::audit::verify_bundle(&path, Some(&public_hex), true)
+            .expect("a server-signed bundle must verify under require_signature");
+        assert_eq!(
+            report.bundle_key_id,
+            Some(format!("ed25519:{public_hex}")),
+            "bundle must name the signing key"
+        );
 
         handle.shutdown();
     }
@@ -1688,6 +2088,7 @@ mod tests {
                 no_auth: false,
                 cors_origin: Some("http://localhost:8089".into()),
                 bootstrap: false,
+                audit_signing_key: None,
             },
         )
         .unwrap();
@@ -1713,6 +2114,7 @@ mod tests {
                 no_auth: false,
                 cors_origin: None,
                 bootstrap: true,
+                audit_signing_key: None,
             },
         )
         .unwrap();
@@ -1866,6 +2268,110 @@ mod tests {
             "violation must be logged: {body}"
         );
         assert!(body.contains("\"enc\""));
+        handle.shutdown();
+    }
+
+    /// The regression this guard exists for: a client that dies mid-upload
+    /// unwinds past every explicit cleanup, and the temp carries the live
+    /// server's PID, so `cleanup_orphan_temps` will not reclaim it either.
+    #[test]
+    fn an_interrupted_upload_is_unlinked_on_unwind() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".recv-pack.tmp-1-2-3");
+        std::fs::write(&path, b"partial upload").unwrap();
+
+        let err = (|| -> Result<()> {
+            let _staged = StagedUpload(path.clone());
+            bail!("connection reset mid-copy")
+        })();
+
+        assert!(err.is_err());
+        assert!(
+            !path.exists(),
+            "a staged upload must not survive the request that sent it"
+        );
+    }
+
+    #[test]
+    fn chain_verification_is_opt_in() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, url, token) = start_server(&tmp, false);
+        let token = token.as_deref();
+        crate::events::append(
+            &tmp.path().join("db"),
+            "test.event",
+            serde_json::json!({"n": 1}),
+        )
+        .unwrap();
+
+        let plain = http_request(&url, "GET", "/v1/events", token, &[], None).unwrap();
+        let v: Value = serde_json::from_slice(&plain).unwrap();
+        assert!(
+            v.get("chain_verified").is_none(),
+            "unchecked must be absent, never a verdict: {v}"
+        );
+
+        let asked = http_request(&url, "GET", "/v1/events?verify=1", token, &[], None).unwrap();
+        let v: Value = serde_json::from_slice(&asked).unwrap();
+        assert_eq!(v["chain_verified"], serde_json::json!(true));
+
+        handle.shutdown();
+    }
+
+    /// The long poll waits on the tip rather than re-reading; it must still
+    /// return an event that lands mid-wait.
+    #[test]
+    fn long_poll_returns_an_event_that_lands_while_waiting() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, url, token) = start_server(&tmp, false);
+        let root = tmp.path().join("db");
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            crate::events::append(&root, "late.event", serde_json::json!({"n": 1})).unwrap();
+        });
+
+        let body = http_request(
+            &url,
+            "GET",
+            "/v1/events?wait=10",
+            token.as_deref(),
+            &[],
+            None,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["events"].as_array().unwrap().len(),
+            1,
+            "tip polling must not miss a late event: {v}"
+        );
+
+        writer.join().unwrap();
+        handle.shutdown();
+    }
+
+    /// Completed transfer only; the crash path is not observable from here.
+    #[test]
+    fn pack_transfer_leaves_nothing_beside_the_database() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, url, token) = start_server(&tmp, false);
+
+        let source_root = tmp.path().join("source");
+        Database::init(&source_root).unwrap();
+        let source = Database::open(&source_root).unwrap();
+        source.blob_store.put(b"pushed payload").unwrap();
+        crate::sync::push(&source, &url, token.as_deref()).unwrap();
+
+        let strays: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "db" && n != "source")
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "pack staging escaped the database root: {strays:?}"
+        );
+
         handle.shutdown();
     }
 

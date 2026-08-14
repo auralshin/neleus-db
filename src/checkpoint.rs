@@ -40,6 +40,15 @@ pub fn verify_append_only(old_root: Hash, new_root: Hash, proof: &ConsistencyPro
     verify_consistency(old_root, new_root, proof)
 }
 
+/// Leaves logged up to and including `sequence`. Deserialized sequences are
+/// attacker-controlled, so the `+ 1` must not be allowed to wrap.
+fn leaf_count(sequence: u64, hash: Hash) -> Result<usize> {
+    usize::try_from(sequence)
+        .ok()
+        .and_then(|s| s.checked_add(1))
+        .ok_or_else(|| anyhow!("checkpoint {hash}: sequence {sequence} out of range"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub schema_version: u32,
@@ -119,7 +128,8 @@ impl<'a> CheckpointStore<'a> {
         let prev_state = match prev_hash {
             Some(h) => {
                 let p = self.get(h)?;
-                Some((p.log_spine, p.sequence as usize + 1))
+                let n = leaf_count(p.sequence, h)?;
+                Some((p.log_spine, n))
             }
             None => None,
         };
@@ -238,13 +248,18 @@ impl<'a> CheckpointStore<'a> {
                     cp.sequence
                 ));
             }
-            expected_seq = cp.sequence.checked_sub(1);
-            if cp.prev.is_none() && cp.sequence != 0 {
+            // Genesis is exactly "sequence 0 and no predecessor". Checking only
+            // one direction would let a forged `sequence: 0` that still carries
+            // a `prev` reset the chain: `checked_sub` then yields `None` and the
+            // continuity check above is skipped for everything below it.
+            if cp.prev.is_none() != (cp.sequence == 0) {
                 return Err(anyhow!(
-                    "checkpoint {hash} is genesis-shaped but has sequence {}",
-                    cp.sequence
+                    "checkpoint {hash} has sequence {} but {} predecessor",
+                    cp.sequence,
+                    if cp.prev.is_none() { "no" } else { "a" }
                 ));
             }
+            expected_seq = cp.sequence.checked_sub(1);
 
             if !self.db.object_store.exists(cp.commit) {
                 return Err(anyhow!(
@@ -271,7 +286,7 @@ impl<'a> CheckpointStore<'a> {
             // checkpoint publishes, and that spine must be the predecessor's
             // extended by exactly this commit — otherwise a forged log_root
             // (or a rewritten log) would pass unnoticed.
-            let count = cp.sequence as usize + 1;
+            let count = leaf_count(cp.sequence, hash)?;
             if root_from_spine(&cp.log_spine, count) != cp.log_root {
                 return Err(anyhow!(
                     "checkpoint {hash}: published log_root does not match its spine"
@@ -281,7 +296,8 @@ impl<'a> CheckpointStore<'a> {
                 None => spine_append(&[], 0, checkpoint_leaf(cp.commit)),
                 Some(prev) => {
                     let p = self.get(prev)?;
-                    spine_append(&p.log_spine, p.sequence as usize + 1, checkpoint_leaf(cp.commit))
+                    let pcount = leaf_count(p.sequence, prev)?;
+                    spine_append(&p.log_spine, pcount, checkpoint_leaf(cp.commit))
                 }
             };
             if expected_spine != cp.log_spine {

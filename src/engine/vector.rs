@@ -436,7 +436,16 @@ fn search_layer_with(
     out
 }
 
-/// Keep only the `m_max` closest neighbors of `node` on `layer`.
+/// Select up to `m_max` neighbors for `node` on `layer` (HNSW's Algorithm 4).
+///
+/// A candidate is kept only if it is closer to `node` than to every neighbor
+/// already kept. Keeping the `m_max` *nearest* instead is what the naive
+/// version did, and in low dimension a tight cluster's nearest 32 are all
+/// inside the cluster: pruning is one-directional, so the layer-0 graph grows
+/// absorbing components that a beam can enter and never leave. Measured at
+/// 1400 vectors in 16 dimensions, 1329 of them had a partial out-closure and
+/// self-recall (a distance-0 query) sat at 0.83 no matter how wide the beam.
+/// The diversity condition keeps the long edges that let traversal escape.
 /// Distances are computed once per candidate, not per comparison.
 fn prune(
     dist: &(dyn Fn(u32, u32) -> f32 + Sync),
@@ -445,13 +454,24 @@ fn prune(
     layer: usize,
     m_max: usize,
 ) {
-    let list = &mut links[node as usize][layer];
+    let list = &links[node as usize][layer];
     let mut scored: Vec<(f32, u32)> = list.iter().map(|&x| (dist(node, x), x)).collect();
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
     // Duplicate ids share a distance, so they sort adjacent.
     scored.dedup_by_key(|e| e.1);
+
+    let mut kept: Vec<u32> = Vec::with_capacity(m_max);
+    for (to_node, cand) in scored {
+        if kept.len() >= m_max {
+            break;
+        }
+        if kept.iter().all(|&k| dist(cand, k) > to_node) {
+            kept.push(cand);
+        }
+    }
+    let list = &mut links[node as usize][layer];
     list.clear();
-    list.extend(scored.into_iter().take(m_max).map(|(_, id)| id));
+    list.extend(kept);
 }
 
 /// Exact top-k over an explicit node list. Cost is the caller's candidate

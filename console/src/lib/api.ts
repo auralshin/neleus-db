@@ -238,12 +238,15 @@ export class Conn {
     return this.json<EvalReport>("POST", "/v1/policy/evaluate", head ? { head } : {});
   }
   // since: only events with seq > since. wait (≤30): long-poll seconds.
-  events(since?: number, wait?: number, signal?: AbortSignal) {
+  // verify: full chain walk — compliance reads only, never a poll.
+  // chain_verified is absent unless asked: undefined = unchecked, not intact.
+  events(since?: number, wait?: number, signal?: AbortSignal, verify?: boolean) {
     const q = new URLSearchParams();
     if (since !== undefined) q.set("since", String(since));
     if (wait !== undefined) q.set("wait", String(wait));
+    if (verify) q.set("verify", "1");
     const qs = q.toString();
-    return this.json<{ events: NeleusEvent[] }>("GET", `/v1/events${qs ? `?${qs}` : ""}`, undefined, signal);
+    return this.json<{ events: NeleusEvent[]; chain_verified?: boolean }>("GET", `/v1/events${qs ? `?${qs}` : ""}`, undefined, signal);
   }
 }
 

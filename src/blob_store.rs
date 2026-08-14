@@ -81,14 +81,10 @@ impl BlobStore {
     pub fn put(&self, bytes: &[u8]) -> Result<Hash> {
         // Hash is always over the original (uncompressed, unencrypted) bytes.
         let hash = hash_blob(bytes);
-        let after_compress: Vec<u8> = if self.compress {
-            compression::compress(bytes)?
-        } else {
-            bytes.to_vec()
-        };
+        let framed = compression::frame(bytes, self.compress)?;
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(&after_compress)?,
-            None => after_compress,
+            Some(runtime) => runtime.encrypt(&framed)?,
+            None => framed,
         };
         self.cas.put_existing_hash(hash, &stored)?;
         Ok(hash)
@@ -100,14 +96,10 @@ impl BlobStore {
     pub fn put_many(&self, blobs: Vec<Vec<u8>>) -> Result<Vec<Hash>> {
         let prepared = crate::par::parallel_map(blobs, |bytes| -> Result<(Hash, Vec<u8>)> {
             let hash = hash_blob(&bytes);
-            let after_compress = if self.compress {
-                compression::compress(&bytes)?
-            } else {
-                bytes
-            };
+            let framed = compression::frame(&bytes, self.compress)?;
             let stored = match &self.encryption {
-                Some(runtime) => runtime.encrypt(&after_compress)?,
-                None => after_compress,
+                Some(runtime) => runtime.encrypt(&framed)?,
+                None => framed,
             };
             Ok((hash, stored))
         });
@@ -142,9 +134,7 @@ impl BlobStore {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
-        // Always try-decompress; the helper returns a borrow when no
-        // decompression was needed, so the uncompressed path pays no copy.
-        let bytes = compression::decompress_if_compressed(&after_decrypt)?;
+        let bytes = compression::unframe(&after_decrypt)?;
         if self.verify_on_read {
             let computed = hash_blob(&bytes);
             if computed != hash {

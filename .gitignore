@@ -62,13 +62,11 @@ node_modules/
 .claude
 .gstack/
 
-# LaTeX build products (paper.tex + references.bib are the sources)
+# LaTeX: the paper and everything latex generates from it
+paper.*
+references.bib
 *.aux
 *.bbl
 *.blg
-*.log
 *.out
 *.synctex.gz
-paper.pdf
-paper.tex
-references.bib

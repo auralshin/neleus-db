@@ -113,7 +113,8 @@ impl Rule {
 
 /// What an incoming mutating request carries, for write-time gating.
 pub struct WriteContext<'a> {
-    /// `documents` | `runs` | `commits`.
+    /// Write route: `documents`, `runs`, `commits`, `state`, `blobs`,
+    /// `sessions`, `checkpoints`, `pack`, or `search` (audited).
     pub op: &'a str,
     pub head: &'a str,
     pub principal: Option<&'a str>,

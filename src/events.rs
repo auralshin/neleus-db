@@ -7,6 +7,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,50 @@ pub fn read(db_root: &Path) -> Result<Vec<Event>> {
     }
 }
 
+/// Tail window scanned for the last entry. Comfortably larger than any event
+/// this crate writes; a longer final line falls back to a full read.
+const TIP_WINDOW: u64 = 64 * 1024;
+
+/// Last entry, without parsing the whole log.
+///
+/// `append` only needs the tip, and reading every line to find it made each
+/// append cost O(log length), so a write path that records an event per call
+/// (a monitor-mode policy, say) degraded quadratically as the log grew.
+fn read_tip(db_root: &Path) -> Result<Option<Event>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = log_path(db_root);
+    let mut f = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let window = len.min(TIP_WINDOW);
+    f.seek(SeekFrom::Start(len - window))?;
+    let mut buf = vec![0u8; window as usize];
+    f.read_exact(&mut buf)?;
+
+    // The last line is whole (every append ends in a newline). A window that
+    // caught no line break at all may have split one, so re-read in full.
+    let text = String::from_utf8_lossy(&buf);
+    let last = text.lines().rfind(|l| !l.trim().is_empty());
+    match last {
+        Some(line) if window == len || text[..text.len() - line.len()].contains('\n') => {
+            Ok(Some(serde_json::from_str(line)?))
+        }
+        _ => Ok(read(db_root)?.pop()),
+    }
+}
+
+/// Newest entry's sequence, or `None` if empty. Reads a tail window, not the log.
+pub fn tip_seq(db_root: &Path) -> Result<Option<u64>> {
+    Ok(read_tip(db_root)?.map(|e| e.seq))
+}
+
 /// Events with `seq > after` (the long-poll / live-feed cursor).
 pub fn read_since(db_root: &Path, after: u64) -> Result<Vec<Event>> {
     Ok(read(db_root)?
@@ -65,13 +110,19 @@ pub fn read_since(db_root: &Path, after: u64) -> Result<Vec<Event>> {
         .collect())
 }
 
-/// Append one event, chaining it to the current tip. Callers must serialize
-/// appends (the server holds its write lock); concurrent appends could fork the
-/// chain.
+/// Append one event, chaining it to the current tip.
+///
+/// Takes a cross-process lock: the server's write mutex only serializes its own
+/// threads, and a CLI command (or a second server) appending concurrently would
+/// mint a duplicate `seq`, after which [`verify`] fails permanently on an
+/// append-only file.
 pub fn append(db_root: &Path, kind: &str, data: Value) -> Result<Event> {
-    let existing = read(db_root)?;
-    let (seq, prev) = match existing.last() {
-        Some(e) => (e.seq + 1, e.hash.clone()),
+    let dir = db_root.join("meta");
+    fs::create_dir_all(&dir)?;
+    let _lock = crate::lock::flock_exclusive(dir.join(".events.lock"), Duration::from_secs(10))?;
+
+    let (seq, prev) = match read_tip(db_root)? {
+        Some(tip) => (tip.seq + 1, tip.hash),
         None => (0, String::new()),
     };
     let timestamp = crate::clock::now_unix()?;
@@ -124,6 +175,20 @@ pub fn verify(db_root: &Path) -> Result<u64> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn tip_survives_an_entry_larger_than_the_tail_window() {
+        // The tail scan reads a fixed window. An entry longer than it would
+        // leave the window holding a fragment with no line break, so the scan
+        // must fall back to a full read rather than chain onto garbage.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        append(root, "small", json!({"i": 0})).unwrap();
+        let big = "x".repeat(TIP_WINDOW as usize + 1024);
+        append(root, "big", json!({"blob": big})).unwrap();
+        append(root, "after", json!({"i": 2})).unwrap();
+        assert_eq!(verify(root).unwrap(), 3, "chain must stay intact");
+    }
 
     #[test]
     fn append_chains_and_verifies() {

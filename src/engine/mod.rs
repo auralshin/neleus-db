@@ -8,7 +8,7 @@
 //! Hits carry (commit, chunk_hash) -> upgradeable via retrieval_proof.
 
 pub mod segment;
-pub mod vector;
+pub(crate) mod vector;
 pub mod writer;
 
 use std::collections::{HashMap, HashSet};
@@ -343,8 +343,14 @@ impl Engine {
             if !new_manifests.is_empty() {
                 let inputs = self.ingest_manifests(&new_manifests)?;
                 indexed.extend(new_manifests.iter().copied());
-                let seg = IndexSegment::build(new_manifests, inputs);
-                segments.push(self.write_segment(seg)?);
+                // A commit can carry only manifests with nothing to index, such as a
+                // recorded query, say. Writing an empty segment for one would
+                // let read traffic grow the segment chain and trip a full merge
+                // (and HNSW rebuild) every MERGE_THRESHOLD audited searches.
+                if !inputs.is_empty() {
+                    let seg = IndexSegment::build(new_manifests, inputs);
+                    segments.push(self.write_segment(seg)?);
+                }
             }
             if segments.len() > MERGE_THRESHOLD {
                 segments = vec![self.merge_segments(&segments)?];
@@ -541,6 +547,7 @@ impl Engine {
         out
     }
 
+    /// Top-`k` BM25 hits for `query` at `commit`, honoring `filter`.
     pub fn search_semantic(
         &self,
         commit: CommitHash,
@@ -550,16 +557,28 @@ impl Engine {
     ) -> Result<Vec<EngineHit>> {
         let segments = self.segment_set(commit)?;
         let fetch = top_k.saturating_mul(2).max(top_k);
+        // One corpus for every segment. Scored per segment, idf is computed
+        // against however many documents that delta happens to hold, and
+        // `merge_hits` then sorts numbers from different scales against each
+        // other: a hit from a three-document delta outranks a better hit from
+        // the base it was appended to.
+        let stats = segment::CorpusStats::gather(
+            segments.iter().map(|s| s.as_ref()),
+            &segment::tokenize(query),
+            filter,
+        );
         let per_segment = segments
             .into_iter()
             .map(|seg| {
-                let hits = seg.bm25(query, fetch, filter);
+                let hits = seg.bm25_with(query, fetch, filter, Some(&stats));
                 (seg, hits)
             })
             .collect();
         Ok(Self::merge_hits(commit, per_segment, top_k))
     }
 
+    /// Top-`k` nearest-vector (HNSW) hits for `embedding` at `commit`, honoring
+    /// `filter`.
     pub fn search_vector(
         &self,
         commit: CommitHash,
@@ -832,6 +851,61 @@ mod tests {
         Database::init(&root).unwrap();
         let db = Database::open(&root).unwrap();
         (tmp, db)
+    }
+
+    fn doc_manifest(db: &Database, text: &[u8]) -> Hash {
+        db.manifest_store
+            .put_doc_manifest_from_bytes_with_metadata(
+                &db.blob_store,
+                "src".into(),
+                text,
+                ChunkingSpec {
+                    method: "fixed".into(),
+                    chunk_size: 64,
+                    overlap: 0,
+                },
+                Some(1),
+                None,
+            )
+            .unwrap()
+    }
+
+    /// idf must come from the whole corpus, not one segment. A base commit whose
+    /// documents all contain the term (idf near zero there) plus a tiny delta
+    /// where the same term is rare (idf large there) is where per-segment
+    /// scoring inverts the ranking: the merge sorts numbers from two scales.
+    #[test]
+    fn bm25_ranks_across_segments_on_one_corpus() {
+        let (_tmp, db) = test_db();
+
+        let mut base: Vec<Hash> = (0..399)
+            .map(|i| doc_manifest(&db, format!("quark filler body number {i}").as_bytes()))
+            .collect();
+        base.push(doc_manifest(&db, b"quark quark quark quark quark"));
+        db.create_commit_at_head("main", "agent", "base", base)
+            .unwrap();
+
+        let delta = vec![
+            doc_manifest(&db, b"quark solo"),
+            doc_manifest(&db, b"unrelated alpha"),
+            doc_manifest(&db, b"unrelated beta"),
+        ];
+        let c2 = db
+            .create_commit_at_head("main", "agent", "delta", delta)
+            .unwrap();
+
+        let engine = Engine::new(db);
+        let hits = engine
+            .search_semantic(c2, "quark", 5, &SearchFilter::default())
+            .unwrap();
+        assert!(!hits.is_empty());
+        assert!(
+            hits[0].text_preview.starts_with("quark quark"),
+            "the term-dominated document must rank first; got {:?} at {:.5} \
+             (per-segment idf would put the delta's lone mention on top)",
+            hits[0].text_preview,
+            hits[0].score
+        );
     }
 
     fn commit_doc(db: &Database, head: &str, text: &[u8], meta: Option<ChunkMetadata>) -> Hash {

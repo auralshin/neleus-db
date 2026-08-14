@@ -24,6 +24,7 @@ fn boot(tmp: &TempDir) -> (ServerHandle, String, String) {
             no_auth: false,
             cors_origin: None,
             bootstrap: false,
+            audit_signing_key: None,
         },
     )
     .unwrap();
@@ -165,6 +166,8 @@ fn monitor_surfaces_evaluation_and_event_cursor() {
         None,
     )
     .unwrap();
+    // No `chain_verified`: the poll did not ask for one, and a verdict the
+    // caller never requested must not appear.
     assert_eq!(
         String::from_utf8_lossy(&caught_up).trim(),
         r#"{"events":[]}"#
