@@ -54,16 +54,19 @@ impl Neleus {
 
     /// Chunk a document, store it, commit it, and index it.
     /// Returns `(manifest_hash, commit_hash)`.
-    #[pyo3(signature = (head, source, text, chunk_size=512, overlap=64, author="agent"))]
+    #[pyo3(signature = (head, source, text, chunk_size=512, overlap=None, author="agent"))]
     fn put_document(
         &self,
         head: &str,
         source: &str,
         text: &str,
         chunk_size: usize,
-        overlap: usize,
+        overlap: Option<usize>,
         author: &str,
     ) -> PyResult<(String, String)> {
+        // Derived from chunk_size, matching the HTTP route: a near-equal pair
+        // advances a byte at a time and yields one chunk per byte.
+        let overlap = overlap.unwrap_or(64.min(chunk_size / 2));
         let engine = self.engine.lock().map_err(err)?;
         let (manifest, commit) = engine
             .put_document(

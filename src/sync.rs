@@ -55,7 +55,13 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
         let local_root = db.root.join(store);
         let remote_store = remote_root.join(store);
 
-        // Loose objects: copy verbatim bytes for hashes we don't hold.
+        // Loose objects: copy verbatim bytes for hashes we don't hold. The
+        // address is taken from the filename and not re-derived: these bytes
+        // are below the crypto boundary, so re-hashing would need the master
+        // key and the object's type tag. A hostile peer can therefore land
+        // bytes under an address they do not hash to; reads are what reject
+        // them (typed object reads always re-derive, and `verify_on_read`
+        // covers blobs), so never treat a merge as attestation.
         let local_cas = crate::cas::CasStore::new(&local_root);
         for (hash, path) in crate::packstore::loose_objects(&remote_store)? {
             if local_cas.exists(hash) {
@@ -150,9 +156,11 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
 
 /// Merge a pack file (the `db pack` format) into `db` via a staging unpack.
 pub fn merge_pack_file(db: &Database, pack_file: &Path) -> Result<MergeReport> {
-    let staging = db
-        .root
-        .with_extension(format!("merge-staging-{}", std::process::id()));
+    // Inside the root: a sibling puts an incoming peer's whole unpacked tree
+    // outside the encryption boundary. `pack` skips temp-named dirs.
+    let dir = db.root.join("meta");
+    fs::create_dir_all(&dir)?;
+    let staging = dir.join(crate::atomic::build_temp_name("merge-staging")?);
     if staging.exists() {
         fs::remove_dir_all(&staging)?;
     }
@@ -209,9 +217,9 @@ fn checkpoint_chain_contains(
 /// Fetch the remote's pack and merge locally.
 pub fn pull(db: &Database, remote_url: &str, token: Option<&str>) -> Result<MergeReport> {
     let body = http_request(remote_url, "GET", "/v1/pack", token, &[], None)?;
-    let tmp = db
-        .root
-        .with_extension(format!("pull-{}.pack", std::process::id()));
+    let dir = db.root.join("meta");
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(crate::atomic::build_temp_name("pull")?);
     fs::write(&tmp, &body)?;
     let result = merge_pack_file(db, &tmp);
     let _ = fs::remove_file(&tmp);
@@ -220,9 +228,11 @@ pub fn pull(db: &Database, remote_url: &str, token: Option<&str>) -> Result<Merg
 
 /// Pack the local DB and POST it; remote merges fast-forward-only.
 pub fn push(db: &Database, remote_url: &str, token: Option<&str>) -> Result<String> {
-    let tmp = db
-        .root
-        .with_extension(format!("push-{}.pack", std::process::id()));
+    // Inside the root so `cleanup_orphan_temps` reclaims it; `pack` skips
+    // temp-named files, so it cannot capture itself.
+    let dir = db.root.join("meta");
+    fs::create_dir_all(&dir)?;
+    let tmp = dir.join(crate::atomic::build_temp_name("push")?);
     crate::pack::pack(&db.root, &tmp, true)?;
     let body = fs::read(&tmp);
     let _ = fs::remove_file(&tmp);

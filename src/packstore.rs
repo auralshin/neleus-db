@@ -19,6 +19,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
@@ -115,6 +116,15 @@ impl PackSet {
     /// `(hash, data_len)` for every packed object.
     pub fn entry_lens(&self) -> Vec<(Hash, u64)> {
         self.entries.iter().map(|(h, l)| (*h, l.len)).collect()
+    }
+
+    /// As [`Self::entry_lens`], plus the pack each entry lives in, so callers
+    /// can apply per-pack policy (freshness) without a second index load.
+    pub fn entry_lens_with_pack(&self) -> Vec<(Hash, u64, PathBuf)> {
+        self.entries
+            .iter()
+            .map(|(h, l)| (*h, l.len, l.pack_path.as_ref().clone()))
+            .collect()
     }
 
     /// Verbatim on-disk bytes of a packed object, or `None` if not packed.
@@ -260,7 +270,16 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
             fs::read(&path).with_context(|| format!("reading {}", path.display()))
         })
     });
+    // Age of the newest object going in, captured before the loose files are
+    // unlinked. GC's freshness test asks "could this pack hold something too new
+    // to sweep", so a pack rebuilt from old content must keep the old content's
+    // age. Without it, `repack` stamps everything now and the next
+    // `gc --prune` reclaims nothing for a whole grace window.
+    let newest = newest_mtime(loose.iter().map(|(_, p)| p.as_path()));
     let info = write_pack(&pack_dir, loose.len(), sources)?;
+    if let Some(mtime) = newest {
+        stamp_pack_age(&pack_dir, &info.id, mtime)?;
+    }
 
     // Pack is durable; deleting loose copies now cannot lose data.
     let mut reclaimed = 0usize;
@@ -283,11 +302,38 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
 /// Drop packed objects not in `live` (GC's prune of already-packed garbage). A
 /// fully-live pack is left as-is; a partially-dead one is rewritten to keep only
 /// the live entries; a fully-dead one is removed. Returns `(removed, bytes)`.
-pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(usize, u64)> {
+///
+/// `cutoff` protects packs written too recently to be sure they are garbage: a
+/// peer can write a pack whose objects are not yet reachable from any ref, and
+/// deleting those would lose committed content.
+pub fn rewrite_packs_keeping(
+    cas_root: &Path,
+    live: &HashSet<Hash>,
+    cutoff: SystemTime,
+) -> Result<(usize, u64, usize)> {
+    rewrite_packs(cas_root, Some(cutoff), |h| !live.contains(h))
+}
+
+/// Drop exactly `targets` from whichever packs hold them (authorized erasure).
+///
+/// Unlike [`rewrite_packs_keeping`], the survivor set is derived per pack from
+/// that pack's own index, so a pack written concurrently, or one this handle's
+/// cached index has never seen, keeps all of its objects instead of being
+/// classified wholly dead and unlinked.
+pub fn rewrite_packs_dropping(cas_root: &Path, targets: &HashSet<Hash>) -> Result<(usize, u64)> {
+    let (removed, bytes, _) = rewrite_packs(cas_root, None, |h| targets.contains(h))?;
+    Ok((removed, bytes))
+}
+
+fn rewrite_packs(
+    cas_root: &Path,
+    cutoff: Option<SystemTime>,
+    is_dead: impl Fn(&Hash) -> bool,
+) -> Result<(usize, u64, usize)> {
     let pack_dir = cas_root.join(PACK_DIR);
     let read_dir = match fs::read_dir(&pack_dir) {
         Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0, 0)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", pack_dir.display())),
     };
 
@@ -302,19 +348,32 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
 
     let mut removed_objects = 0usize;
     let mut removed_bytes = 0u64;
+    let mut skipped_objects = 0usize;
     for idx_path in idx_paths {
         let pack_path = idx_path.with_extension("pack");
+        if let Some(cutoff) = cutoff
+            && pack_is_fresh(&pack_path, cutoff)
+        {
+            // Report what the grace held back, or the caller reports "no
+            // garbage" when there is garbage it merely declined to touch.
+            let mut held = std::collections::HashMap::new();
+            let arc = Arc::new(pack_path.clone());
+            if load_idx_into(&idx_path, &arc, &mut held).is_ok() {
+                skipped_objects += held.keys().filter(|h| is_dead(h)).count();
+            }
+            continue;
+        }
         let mut map = std::collections::HashMap::new();
         let pack_arc = Arc::new(pack_path.clone());
         load_idx_into(&idx_path, &pack_arc, &mut map)?;
 
         let dead: Vec<(Hash, PackLoc)> = map
             .iter()
-            .filter(|(h, _)| !live.contains(*h))
+            .filter(|(h, _)| is_dead(h))
             .map(|(h, l)| (*h, l.clone()))
             .collect();
         if dead.is_empty() {
-            continue; // fully live; keep pack untouched
+            continue; // nothing to drop; keep pack untouched
         }
         for (_, loc) in &dead {
             removed_objects += 1;
@@ -322,7 +381,7 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
         }
 
         let live_locs: Vec<(Hash, PackLoc)> =
-            map.into_iter().filter(|(h, _)| live.contains(h)).collect();
+            map.into_iter().filter(|(h, _)| !is_dead(h)).collect();
 
         if !live_locs.is_empty() {
             let mut ordered = live_locs;
@@ -337,29 +396,76 @@ pub fn rewrite_packs_keeping(cas_root: &Path, live: &HashSet<Hash>) -> Result<(u
                     read_slice(&mut f, loc.offset, loc.len)
                 })
             });
-            write_pack(&pack_dir, count, sources)?;
+            // Survivors are exactly as old as they were; carry the age across so
+            // rewriting a pack does not reset its contents' grace clock.
+            let inherited = fs::metadata(&pack_path).and_then(|m| m.modified()).ok();
+            let info = write_pack(&pack_dir, count, sources)?;
+            if let Some(mtime) = inherited {
+                stamp_pack_age(&pack_dir, &info.id, mtime)?;
+            }
         }
 
         // New pack (if any) is durable; drop the old pair.
         fs::remove_file(&idx_path).ok();
         fs::remove_file(&pack_path).ok();
     }
-    Ok((removed_objects, removed_bytes))
+    Ok((removed_objects, removed_bytes, skipped_objects))
+}
+
+/// A pack too young to be sure its contents are garbage: its objects may be
+/// committed but not yet reachable from any ref.
+fn pack_is_fresh(pack_path: &Path, cutoff: SystemTime) -> bool {
+    match fs::metadata(pack_path).and_then(|m| m.modified()) {
+        Ok(modified) => modified >= cutoff,
+        Err(_) => true, // unknown age: protect
+    }
+}
+
+/// Newest modification time across `paths`, ignoring any that cannot be stat'd.
+fn newest_mtime<'a>(paths: impl IntoIterator<Item = &'a Path>) -> Option<SystemTime> {
+    paths
+        .into_iter()
+        .filter_map(|p| fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max()
+}
+
+/// Give a freshly written pack the age of the content it holds, so consolidating
+/// old objects does not make them look new to [`pack_is_fresh`].
+fn stamp_pack_age(pack_dir: &Path, id: &str, mtime: SystemTime) -> Result<()> {
+    let path = pack_dir.join(format!("pack-{id}.pack"));
+    let f = OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {} to stamp its age", path.display()))?;
+    f.set_times(fs::FileTimes::new().set_modified(mtime))
+        .with_context(|| format!("stamping {}", path.display()))?;
+    Ok(())
 }
 
 /// Dry-run counterpart to [`rewrite_packs_keeping`]: count packed objects not in
-/// `live` without modifying any pack.
-pub fn packed_garbage(cas_root: &Path, live: &HashSet<Hash>) -> Result<(usize, u64)> {
+/// `live` without modifying any pack. Applies the same freshness protection, so
+/// the dry run reports what a real prune would actually remove.
+pub fn packed_garbage(
+    cas_root: &Path,
+    live: &HashSet<Hash>,
+    cutoff: SystemTime,
+) -> Result<(usize, u64, usize)> {
     let packs = PackSet::load(cas_root)?;
     let mut count = 0usize;
     let mut bytes = 0u64;
-    for (hash, len) in packs.entry_lens() {
-        if !live.contains(&hash) {
-            count += 1;
-            bytes += len;
+    let mut skipped = 0usize;
+    for (hash, len, pack_path) in packs.entry_lens_with_pack() {
+        if live.contains(&hash) {
+            continue;
         }
+        if pack_is_fresh(&pack_path, cutoff) {
+            skipped += 1;
+            continue;
+        }
+        count += 1;
+        bytes += len;
     }
-    Ok((count, bytes))
+    Ok((count, bytes, skipped))
 }
 
 fn read_slice(f: &mut File, offset: u64, len: u64) -> Result<Vec<u8>> {
@@ -571,6 +677,91 @@ mod tests {
         loose_objects(cas_root).unwrap().len()
     }
 
+    /// Cutoff far enough ahead that no pack counts as fresh.
+    fn no_grace() -> SystemTime {
+        SystemTime::now() + std::time::Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn fresh_packs_are_protected_from_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let cas = CasStore::new(tmp.path());
+        cas.ensure_dir().unwrap();
+        cas.put_and_hash(b"young", hash_blob).unwrap();
+        pack_loose(tmp.path()).unwrap();
+
+        // Cutoff in the past: the pack was written after it, so it is too young
+        // to sweep even though nothing references its contents.
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let (removed, _, _) = rewrite_packs_keeping(tmp.path(), &HashSet::new(), cutoff).unwrap();
+        assert_eq!(removed, 0);
+        assert!(!PackSet::load(tmp.path()).unwrap().is_empty());
+        assert_eq!(
+            packed_garbage(tmp.path(), &HashSet::new(), cutoff)
+                .unwrap()
+                .0,
+            0,
+            "dry run must agree with the prune it predicts"
+        );
+    }
+
+    #[test]
+    fn repacking_preserves_content_age() {
+        let tmp = TempDir::new().unwrap();
+        let cas = CasStore::new(tmp.path());
+        cas.ensure_dir().unwrap();
+        let h = cas.put_and_hash(b"old", hash_blob).unwrap();
+
+        // Age the loose object well past any grace window.
+        let old = SystemTime::now() - std::time::Duration::from_secs(7200);
+        let f = OpenOptions::new()
+            .write(true)
+            .open(cas.path_for(h))
+            .unwrap();
+        f.set_times(fs::FileTimes::new().set_modified(old)).unwrap();
+        drop(f);
+
+        pack_loose(tmp.path()).unwrap();
+
+        // Consolidation must not reset the clock. A cutoff between the content's
+        // age and now has to still see this pack as sweepable, or `db repack`
+        // makes `db gc --prune` a no-op for a whole grace window.
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(3600);
+        let (removed, _, skipped) =
+            rewrite_packs_keeping(tmp.path(), &HashSet::new(), cutoff).unwrap();
+        assert_eq!(skipped, 0, "a repacked old object must not look fresh");
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn dropping_leaves_packs_it_was_not_asked_about() {
+        let tmp = TempDir::new().unwrap();
+        let cas = CasStore::new(tmp.path());
+        cas.ensure_dir().unwrap();
+        let doomed = cas.put_and_hash(b"doomed", hash_blob).unwrap();
+        let bystander = cas.put_and_hash(b"bystander", hash_blob).unwrap();
+        pack_loose(tmp.path()).unwrap();
+
+        // A second pack this caller knows nothing about.
+        let other = crate::hash::hash_blob(b"other");
+        fs::create_dir_all(tmp.path().join(PACK_DIR)).unwrap();
+        write_pack(
+            &tmp.path().join(PACK_DIR),
+            1,
+            std::iter::once((other, || Ok(b"other".to_vec()))),
+        )
+        .unwrap();
+
+        let targets: HashSet<Hash> = std::iter::once(doomed).collect();
+        let (removed, _) = rewrite_packs_dropping(tmp.path(), &targets).unwrap();
+        assert_eq!(removed, 1);
+
+        let packs = PackSet::load(tmp.path()).unwrap();
+        assert!(!packs.contains(doomed));
+        assert!(packs.contains(bystander));
+        assert!(packs.contains(other), "unrelated pack must survive");
+    }
+
     #[test]
     fn pack_then_read_back_through_packset() {
         let tmp = TempDir::new().unwrap();
@@ -658,7 +849,7 @@ mod tests {
 
         let mut live = HashSet::new();
         live.insert(keep);
-        let (removed, _) = rewrite_packs_keeping(tmp.path(), &live).unwrap();
+        let (removed, _, _) = rewrite_packs_keeping(tmp.path(), &live, no_grace()).unwrap();
         assert_eq!(removed, 1);
 
         let packs = PackSet::load(tmp.path()).unwrap();
@@ -675,7 +866,8 @@ mod tests {
         cas.put_and_hash(b"gone", hash_blob).unwrap();
         pack_loose(tmp.path()).unwrap();
 
-        let (removed, _) = rewrite_packs_keeping(tmp.path(), &HashSet::new()).unwrap();
+        let (removed, _, _) =
+            rewrite_packs_keeping(tmp.path(), &HashSet::new(), no_grace()).unwrap();
         assert_eq!(removed, 1);
         assert!(PackSet::load(tmp.path()).unwrap().is_empty());
         // No .pack/.idx left behind.

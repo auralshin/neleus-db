@@ -41,7 +41,8 @@ impl RefsStore {
         self.ensure_dirs()?;
 
         let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
-        let entry = Wal::make_ref_entry(WalOp::RefHeadSet, name, hash);
+        let previous = read_hash(self.head_path(name))?;
+        let entry = Wal::make_ref_entry(WalOp::RefHeadSet, name, previous, hash);
         let wal_path = self.wal.begin_entry(&entry)?;
 
         write_atomic(&self.head_path(name), format!("{hash}\n").as_bytes())?;
@@ -107,7 +108,8 @@ impl RefsStore {
         self.ensure_dirs()?;
 
         let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
-        let entry = Wal::make_ref_entry(WalOp::RefCheckpointSet, name, hash);
+        let previous = read_hash(self.checkpoint_path(name))?;
+        let entry = Wal::make_ref_entry(WalOp::RefCheckpointSet, name, previous, hash);
         let wal_path = self.wal.begin_entry(&entry)?;
 
         write_atomic(&self.checkpoint_path(name), format!("{hash}\n").as_bytes())?;
@@ -204,7 +206,7 @@ impl RefsStore {
         // and retryable; skipping their WAL removes 3 metadata ops from the
         // per-write hot path.
         if matches!(wal_op, WalOp::RefHeadSet | WalOp::RefCheckpointSet) {
-            let entry = Wal::make_ref_entry(wal_op, name, new_hash);
+            let entry = Wal::make_ref_entry(wal_op, name, expected, new_hash);
             let wal_path = self.wal.begin_entry(&entry)?;
             write_atomic(&path, format!("{new_hash}\n").as_bytes())?;
             self.wal.end(&wal_path)?;
@@ -259,7 +261,7 @@ fn list_refs(dir: &PathBuf) -> Result<Vec<(String, Hash)>> {
     Ok(out)
 }
 
-fn read_hash(path: PathBuf) -> Result<Option<Hash>> {
+pub(crate) fn read_hash(path: PathBuf) -> Result<Option<Hash>> {
     if !path.exists() {
         return Ok(None);
     }

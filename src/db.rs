@@ -13,14 +13,14 @@ use crate::clock::now_unix;
 use crate::commit::CommitStore;
 use crate::encryption::{EncryptionConfig, EncryptionRuntime};
 use crate::hash::Hash;
-use crate::lock::acquire_lock;
+use crate::lock::flock_exclusive;
 use crate::manifest::ManifestStore;
 use crate::object_store::ObjectStore;
 use crate::refs::RefsStore;
 use crate::state::StateStore;
 use crate::wal::{Wal, WalRecoveryReport};
 
-const DB_CONFIG_SCHEMA_VERSION: u32 = 3;
+const DB_CONFIG_SCHEMA_VERSION: u32 = 4;
 /// A loser re-runs `op` (a copy-on-write path rebuild) per attempt, so 16 was
 /// reachable with two competing writers.
 const DEFAULT_CAS_RETRIES: usize = 64;
@@ -102,6 +102,8 @@ pub struct Config {
 }
 
 impl Database {
+    /// Create an empty database at `path`: directories, config, and the empty
+    /// state root.
     pub fn init(path: impl AsRef<Path>) -> Result<()> {
         let root = path.as_ref();
         fs::create_dir_all(root).with_context(|| format!("failed creating {}", root.display()))?;
@@ -119,7 +121,7 @@ impl Database {
                 schema_version: DB_CONFIG_SCHEMA_VERSION,
                 hashing: "blake3".into(),
                 created_at: now_unix()?,
-                verify_on_read: false,
+                verify_on_read: true,
                 compression: None,
                 encryption: None,
                 durability: None,
@@ -134,6 +136,8 @@ impl Database {
         Ok(())
     }
 
+    /// Open an existing database: acquire the recovery lock, load and validate
+    /// config, replay the ref WAL, and sweep orphan atomic-write temp files.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let root = path.as_ref().to_path_buf();
         let cfg_path = root.join("meta").join("config.json");
@@ -144,7 +148,7 @@ impl Database {
             ));
         }
 
-        let _recovery_lock = acquire_lock(
+        let _recovery_lock = flock_exclusive(
             root.join("meta").join("recovery.lock"),
             Duration::from_secs(10),
         )?;
@@ -183,12 +187,8 @@ impl Database {
             compress,
             encryption.clone(),
         );
-        let object_store = ObjectStore::with_runtime_options(
-            root.join("objects"),
-            config.verify_on_read,
-            compress,
-            encryption.clone(),
-        );
+        let object_store =
+            ObjectStore::with_runtime_options(root.join("objects"), compress, encryption.clone());
         let wal = Wal::new(root.join("wal"));
         let refs = RefsStore::new(root.join("refs"), wal.clone());
         let state_store = StateStore::new(object_store.clone(), blob_store.clone());
@@ -239,6 +239,8 @@ impl Database {
         self.state_store.empty_root()
     }
 
+    /// Set `key` to `value` in the head's staged state, returning the new state
+    /// root. Retries under concurrent contention.
     pub fn state_set_at_head(&self, head: &str, key: &[u8], value: &[u8]) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.set(base_root, key, value)
@@ -276,6 +278,8 @@ impl Database {
         })
     }
 
+    /// Commit `manifests` onto `head`, advancing the head ref. Fails loudly
+    /// rather than silently rolling back a concurrent staged write.
     pub fn create_commit_at_head(
         &self,
         head: &str,
@@ -431,7 +435,7 @@ impl Database {
         // Serialize concurrent rotations and block any reader that takes the
         // same lock. (Regular reads do not take this lock today, so this
         // primarily protects against two rotations racing.)
-        let _rotation_lock = acquire_lock(
+        let _rotation_lock = flock_exclusive(
             self.root.join("meta").join("rotation.lock"),
             Duration::from_secs(30),
         )?;
@@ -458,7 +462,7 @@ impl Database {
     /// Reopen the `Database` afterwards to observe the new packs — this handle
     /// may have cached an older index ([`Self::rotate_encryption_key`] contract).
     pub fn repack(&self) -> Result<RepackSummary> {
-        let _lock = acquire_lock(
+        let _lock = flock_exclusive(
             self.root.join("meta").join("maintenance.lock"),
             Duration::from_secs(30),
         )?;
@@ -637,6 +641,27 @@ mod tests {
     }
 
     #[test]
+    fn a_database_written_by_an_older_format_is_rejected_at_open() {
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        Database::init(&db_root).unwrap();
+
+        // Older objects carry no storage frame tag; without this gate the DB
+        // opens clean and dies on the first read with an unactionable error.
+        let cfg_path = db_root.join("meta").join("config.json");
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cfg_path).unwrap()).unwrap();
+        v["schema_version"] = serde_json::json!(DB_CONFIG_SCHEMA_VERSION - 1);
+        fs::write(&cfg_path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+        let err = Database::open(&db_root).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported config schema_version"),
+            "expected a version error naming the mismatch, got: {err}"
+        );
+    }
+
+    #[test]
     fn interrupted_temp_write_does_not_corrupt_refs() {
         let tmp = TempDir::new().unwrap();
         let db_root = tmp.path().join("neleus_db");
@@ -671,6 +696,7 @@ mod tests {
             payload: WalPayload::RefUpdate {
                 name: "main".into(),
                 hash,
+                expected: None,
             },
         };
         let _p = wal.begin_entry(&entry).unwrap();

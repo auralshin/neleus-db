@@ -67,6 +67,10 @@ are unix seconds.
 | POST | `/v1/commits` | writer | `{ head, message, manifests? }` → `{ commit }` |
 | POST | `/v1/runs` | writer | `{ head, model, prompt?, system_prompt?, model_parameters?, inputs?, outputs?, retrieved_chunks?, provider?, agent_id?, trace_id?, parent_span?, delegated_from?, commit? }` → `{ manifest, commit }` |
 
+`chunk_size` is at least 64 and `overlap` at most half of it, so one request
+cannot advance a byte at a time and turn an 8 MiB body into millions of chunks.
+`overlap` defaults to `min(64, chunk_size / 2)`.
+
 `trace_id` groups runs of one task across agent handoffs and model switches;
 `parent_span` is the parent run's manifest hash (a verifiable span edge, 64-hex
 or 400); `delegated_from` is the agent that handed off. Each run also records its
@@ -93,7 +97,7 @@ the remote model.
 
 | Method | Path | Role | Body |
 |---|---|---|---|
-| POST | `/v1/search` | reader | `{ at, mode, query?, embedding?, top_k?, filter?, audit? }` → `{ commit, hits[], audit_manifest? }` |
+| POST | `/v1/search` | reader (**writer** with `audit: true`) | `{ at, mode, query?, embedding?, top_k?, filter?, audit? }` → `{ commit, hits[], audit_manifest? }` |
 | POST | `/v1/proofs/chunk` | reader | `{ commit, chunk, include_content? }` → `{ proof_cbor }` |
 | POST | `/v1/proofs/verify` | reader | `{ proof_cbor }` → `{ valid, anchor? \| error }` |
 
@@ -116,10 +120,16 @@ the remote model.
 | POST | `/v1/audit/queries` | reader | `{ head, from?, to? }` → `{ records[] }` |
 | POST | `/v1/audit/export` | reader | `{ head, from?, to? }` → bundle bytes (octet-stream) |
 
-Server-side export carries the integrity footer (tamper-evident,
-offline-verifiable). Origin **signing** is a CLI/KMS operation —
-`neleus-db audit export --sign-key` — so a signing key never has to live in
-the server.
+Bundles are **signed** when the server was started with
+`serve --sign-key <seed>`; `neleus-verify --public-key <hex> --require-signature`
+then rejects anything altered after export.
+
+Without that flag the bundle carries only the integrity footer, which is an
+unkeyed BLAKE3 hash over the file. That detects corruption and a careless edit,
+but anyone who modifies the bundle recomputes it, so an **unsigned bundle is
+not evidence against whoever exported it**. Use `--sign-key` for any bundle that
+leaves the machine, or export from the CLI (`neleus-db audit export --sign-key`)
+if you would rather no signing key lived in the server process.
 
 ### Replication (untenanted, admin)
 
@@ -128,18 +138,35 @@ the server.
 | GET | `/v1/pack` | download the whole DB as a pack |
 | POST | `/v1/pack` | upload a pack; server merges fast-forward only |
 
+### Erasure (untenanted, GDPR right-to-be-forgotten)
+
+| Method | Path | Role | Body / notes |
+|---|---|---|---|
+| POST | `/v1/erasure` | admin | `{ subject, reason? }` → the erasure record (shredded blobs, chunks) |
+| GET | `/v1/erasure` | reader | every recorded erasure record |
+
+`reason` is `request` (default), `ttl`, or `account-closure`. The subject's
+content is shredded while the commit graph and its hashes stay intact, so
+history still verifies and the removal is itself a hash-chained event. Bundles
+signed by the CLI (`neleus-db erasure request --sign-key`) let a third party
+confirm who authorized it; the HTTP route does not sign.
+
 ### Policy and events (untenanted)
 
 | Method | Path | Role | Body / notes |
 |---|---|---|---|
-| GET | `/v1/policy` | reader | → `{ policy: PolicySet }` |
+| GET | `/v1/policy` | reader | → `{ policy: PolicySet }`; `webhook` is redacted for non-admins |
 | POST | `/v1/policy` | admin | a `PolicySet` body; replaces the whole set → `{ policy }` |
 | POST | `/v1/policy/evaluate` | reader | `{ head? }` → `{ generated_at, pass, warn, fail, statuses[] }` |
-| GET | `/v1/events` | reader | `?since=<seq>` newer-than cursor; `?wait=<secs≤30>` long-polls → `{ events[] }` |
+| GET | `/v1/events` | reader | `?since=<seq>` newer-than cursor; `?wait=<secs≤30>` long-polls; `?verify=1` re-walks the hash chain → `{ events[], chain_verified? }` |
 
-`enforce`-mode policies also gate `POST /v1/documents`, `/v1/runs`, and
-`/v1/commits` inline — a violating write returns **403** and is recorded.
+`enforce`-mode policies gate every write route inline: `/v1/documents`,
+`/v1/runs`, `/v1/commits`, `/v1/blobs`, `/v1/state/set`, `/v1/state/delete`,
+`/v1/sessions/append`, `/v1/checkpoints`, `/v1/pack`, and audited `/v1/search`.
+A violating write returns **403** and is recorded.
 Violations append to a tamper-evident event log; see [policy.md](policy.md).
+`chain_verified` is present only under `?verify=1` — absent means unchecked, not
+intact. Verification walks the whole log, so ask on a compliance read, not a poll.
 
 ## Errors
 
@@ -149,11 +176,13 @@ Errors are `{ "error": "<message>", "code": "<stable>", "hint": "<how to fix>" }
 | HTTP | `code` | Cause |
 |---|---|---|
 | 400 | `bad_request` | malformed body or invalid value |
+| 408 | `request_timeout` | headers not complete within 30s |
 | 401 | `unauthorized` | missing or invalid token |
 | 403 | `forbidden` | key role/tenant not permitted |
 | 403 | `policy_violation` | an `enforce`-mode policy blocked the write |
 | 404 | `not_found` | no such head/commit/route |
 | 413 | `payload_too_large` | body over the limit |
+| 431 | `headers_too_large` | headers over 64 KiB |
 | 503 | `overloaded` | connection cap reached |
 | 5xx | `internal` | server error |
 

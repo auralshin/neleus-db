@@ -201,6 +201,75 @@ fn withheld_retrieval_is_detected() {
     let _ = std::io::stderr().flush();
 }
 
+/// Rewrite fields the verifier once ignored (`mode`, `top_k`,
+/// `queried_commit`, and a returned chunk hash), leaving the sequence chain
+/// contiguous and the footer recomputed. Only comparing every field against the
+/// hash-bound QueryManifest catches this; the gap check never fires.
+#[test]
+fn rewritten_record_fields_are_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("db");
+    Database::init(&root).unwrap();
+    let engine = Engine::open(&root).unwrap();
+    let (_doc, commit) = engine
+        .put_document("main", "kb", b"alpha beta gamma corpus", spec(), None, "t")
+        .unwrap();
+
+    let filter = SearchFilter::default();
+    for i in 0..3 {
+        let hits = engine
+            .search_semantic(commit, "corpus", 5, &filter)
+            .unwrap();
+        engine
+            .record_query_at_head(
+                "main",
+                commit,
+                "semantic",
+                Some("corpus"),
+                None,
+                5,
+                &filter,
+                Some(&format!("agent-{i}")),
+                &hits,
+            )
+            .unwrap();
+    }
+
+    let out = tmp.path().join("full.nelaudit");
+    audit::export(engine.db(), "main", 0, u64::MAX, &out, None).unwrap();
+    audit::verify_bundle(&out, None, false).expect("honest bundle verifies");
+
+    let raw = std::fs::read(&out).unwrap();
+    let (records, _) = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+    let forged: Vec<String> = records
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap();
+            if r.seq == 1 {
+                v["mode"] = serde_json::json!("vector");
+                v["top_k"] = serde_json::json!(999);
+                v["queried_commit"] = serde_json::json!("00".repeat(32));
+                if !r.hits.is_empty() {
+                    v["hits"][0]["chunk"] = serde_json::json!("11".repeat(32));
+                }
+            }
+            serde_json::to_string(&v).unwrap()
+        })
+        .collect();
+
+    let mut jsonl = forged.join("\n");
+    jsonl.push('\n');
+    let tampered = tmp.path().join("rewritten.nelaudit");
+    rebuild_bundle(&raw, &jsonl, records.len(), &tampered);
+
+    let err = audit::verify_bundle(&tampered, None, false)
+        .expect_err("rewritten record fields must be rejected");
+    assert!(
+        err.to_string().contains("disagrees with its manifest"),
+        "expected a manifest-disagreement diagnosis, got: {err}"
+    );
+}
+
 /// Re-emit a bundle with `retrievals.jsonl` replaced and `meta.json`'s count
 /// adjusted, recomputing the integrity footer so only the sequence gap is wrong.
 fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) {

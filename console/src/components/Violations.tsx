@@ -1,7 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import type { Conn, NeleusEvent, ViolationData } from "../lib/api";
 import { fmtTime } from "../lib/api";
-import { EnforcedBadge } from "./ui";
+import { EnforcedBadge, Pill } from "./ui";
 
 // Surface 7 — the violation log. Past policy.violation events, newest first,
 // each row expandable to its raw tamper-evident record.
@@ -10,14 +10,18 @@ export function Violations({ conn, onStatus }: { conn: Conn; onStatus: (m: strin
   const [err, setErr] = useState<string | null>(null);
   const [enforcedOnly, setEnforcedOnly] = useState(false);
   const [open, setOpen] = useState<string | null>(null);
+  // undefined = not checked. Never collapse that into false.
+  const [chainOk, setChainOk] = useState<boolean | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const { events: evs } = await conn.events();
+        // Compliance read: worth a chain walk. Monitor's poll must not ask.
+        const { events: evs, chain_verified } = await conn.events(undefined, undefined, undefined, true);
         if (cancelled) return;
         setEvents(evs);
+        setChainOk(chain_verified);
         const n = evs.filter((e) => e.kind === "policy.violation").length;
         onStatus(`Loaded ${n} violation event(s).`);
       } catch (e) {
@@ -52,6 +56,9 @@ export function Violations({ conn, onStatus }: { conn: Conn; onStatus: (m: strin
     <section className="panel glass">
       <div className="policy-toolbar">
         <h3 className="panel-title" style={{ margin: 0 }}>Violations</h3>
+        <Pill status={chainOk === undefined ? "none" : chainOk ? "pass" : "fail"}>
+          {chainOk === undefined ? "chain unchecked" : chainOk ? "chain intact" : "CHAIN BROKEN"}
+        </Pill>
         <div className="spacer" />
         <div className="filter-toggle">
           <button className={enforcedOnly ? "" : "active"} onClick={() => setEnforcedOnly(false)}>all</button>
@@ -60,8 +67,8 @@ export function Violations({ conn, onStatus }: { conn: Conn; onStatus: (m: strin
       </div>
       <p className="hint">
         Each row is a <code>policy.violation</code> event. The <code>hash</code>/<code>prev</code> fields chain
-        every event together — verify the chain locally with <code>neleus-verify</code>; tampering with any link
-        breaks it.
+        every event together; the badge above is the server’s re-check. Confirm it independently with
+        <code>neleus-verify</code>.
       </p>
 
       <div className="table-scroll">

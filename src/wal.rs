@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::atomic::write_atomic;
 use crate::canonical::{from_cbor, to_cbor};
 use crate::hash::Hash;
-use crate::refs::validate_ref_name;
+use crate::lock::flock_exclusive;
+use crate::refs::{read_hash, validate_ref_name};
 
 const WAL_SCHEMA_VERSION: u32 = 1;
 
@@ -42,8 +43,17 @@ pub enum WalOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WalPayload {
-    RefUpdate { name: String, hash: Hash },
-    StateMutation { root: Hash, key_len: usize },
+    /// `expected` is the value the ref held when the intent was recorded, so
+    /// replay can be a compare-and-set rather than a blind overwrite.
+    RefUpdate {
+        name: String,
+        hash: Hash,
+        expected: Option<Hash>,
+    },
+    StateMutation {
+        root: Hash,
+        key_len: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +130,10 @@ impl Wal {
         fs::create_dir_all(refs_root.join("heads"))?;
         fs::create_dir_all(refs_root.join("states"))?;
 
+        // Exclude live ref writers: replay reads the current value then writes,
+        // and a peer's update landing in between would be lost.
+        let _lock = flock_exclusive(refs_root.join(".refs.lock"), Duration::from_secs(10))?;
+
         let mut report = WalRecoveryReport::default();
         for path in self.pending()? {
             let raw = fs::read(&path)
@@ -143,55 +157,13 @@ impl Wal {
 
             match entry.op {
                 WalOp::RefHeadSet => {
-                    if let WalPayload::RefUpdate { name, hash } = entry.payload {
-                        // A stricter validator may now reject names that an
-                        // older writer accepted. Treat such entries as
-                        // malformed-on-replay and roll back rather than
-                        // failing `Database::open` outright.
-                        if validate_ref_name(&name).is_err() {
-                            self.end(&path)?;
-                            report.rolled_back += 1;
-                            continue;
-                        }
-                        write_atomic(
-                            &refs_root.join("heads").join(name),
-                            format!("{hash}\n").as_bytes(),
-                        )?;
-                        report.replayed += 1;
-                    } else {
-                        report.rolled_back += 1;
-                    }
+                    Self::replay_ref("heads", refs_root, entry.payload, &mut report)?
                 }
                 WalOp::RefStateSet => {
-                    if let WalPayload::RefUpdate { name, hash } = entry.payload {
-                        if validate_ref_name(&name).is_err() {
-                            self.end(&path)?;
-                            report.rolled_back += 1;
-                            continue;
-                        }
-                        write_atomic(
-                            &refs_root.join("states").join(name),
-                            format!("{hash}\n").as_bytes(),
-                        )?;
-                        report.replayed += 1;
-                    } else {
-                        report.rolled_back += 1;
-                    }
+                    Self::replay_ref("states", refs_root, entry.payload, &mut report)?
                 }
                 WalOp::RefCheckpointSet => {
-                    if let WalPayload::RefUpdate { name, hash } = entry.payload {
-                        if validate_ref_name(&name).is_err() {
-                            self.end(&path)?;
-                            report.rolled_back += 1;
-                            continue;
-                        }
-                        let dir = refs_root.join("checkpoints");
-                        fs::create_dir_all(&dir)?;
-                        write_atomic(&dir.join(name), format!("{hash}\n").as_bytes())?;
-                        report.replayed += 1;
-                    } else {
-                        report.rolled_back += 1;
-                    }
+                    Self::replay_ref("checkpoints", refs_root, entry.payload, &mut report)?
                 }
                 WalOp::StateSet | WalOp::StateDel | WalOp::StateCompact => {
                     // State WAL entries are forensic only and are NEVER replayed.
@@ -217,13 +189,58 @@ impl Wal {
         Ok(report)
     }
 
-    pub fn make_ref_entry(op: WalOp, name: &str, hash: Hash) -> WalEntry {
+    /// Apply one recorded ref intent. Replay is a compare-and-set: if the ref
+    /// has moved since the intent was written, the entry is stale, and a blind
+    /// write would rewind an acknowledged commit and orphan everything after it.
+    fn replay_ref(
+        subdir: &str,
+        refs_root: &Path,
+        payload: WalPayload,
+        report: &mut WalRecoveryReport,
+    ) -> Result<()> {
+        let WalPayload::RefUpdate {
+            name,
+            hash,
+            expected,
+        } = payload
+        else {
+            report.rolled_back += 1;
+            return Ok(());
+        };
+        // A stricter validator may now reject names an older writer accepted.
+        // Roll those back rather than failing `Database::open` outright.
+        if validate_ref_name(&name).is_err() {
+            report.rolled_back += 1;
+            return Ok(());
+        }
+        let dir = refs_root.join(subdir);
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(&name);
+        // A ref we cannot read (torn or empty file, or a directory in its place)
+        // is rolled back like any other non-match. Propagating the error would
+        // leave the entry pending and make every future `Database::open` fail
+        // the same way. That is the wedge the name check above avoids.
+        let Ok(current) = read_hash(path.clone()) else {
+            report.rolled_back += 1;
+            return Ok(());
+        };
+        if current != expected {
+            report.rolled_back += 1;
+            return Ok(());
+        }
+        write_atomic(&path, format!("{hash}\n").as_bytes())?;
+        report.replayed += 1;
+        Ok(())
+    }
+
+    pub fn make_ref_entry(op: WalOp, name: &str, expected: Option<Hash>, hash: Hash) -> WalEntry {
         WalEntry {
             schema_version: WAL_SCHEMA_VERSION,
             op,
             payload: WalPayload::RefUpdate {
                 name: name.to_string(),
                 hash,
+                expected,
             },
         }
     }
@@ -270,13 +287,39 @@ mod tests {
         wal.ensure_dir().unwrap();
 
         let h = hash_blob(b"commit");
-        let entry = Wal::make_ref_entry(WalOp::RefHeadSet, "main", h);
+        let entry = Wal::make_ref_entry(WalOp::RefHeadSet, "main", None, h);
         let _p = wal.begin_entry(&entry).unwrap();
 
         let report = wal.recover_refs(&dir.path().join("refs")).unwrap();
         assert_eq!(report.replayed, 1);
         let s = fs::read_to_string(dir.path().join("refs/heads/main")).unwrap();
         assert_eq!(s.trim(), h.to_string());
+        assert!(wal.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn wal_does_not_rewind_a_ref_that_moved() {
+        let dir = TempDir::new().unwrap();
+        let wal = Wal::new(dir.path().join("wal"));
+        wal.ensure_dir().unwrap();
+        let refs_root = dir.path().join("refs");
+        fs::create_dir_all(refs_root.join("heads")).unwrap();
+
+        let old = hash_blob(b"old");
+        let stale = hash_blob(b"stale-intent");
+        let newer = hash_blob(b"peer-commit");
+
+        // Intent recorded while the ref held `old`, then orphaned by a crash.
+        // A peer has since advanced the head; replaying would lose its commits.
+        let entry = Wal::make_ref_entry(WalOp::RefHeadSet, "main", Some(old), stale);
+        let _p = wal.begin_entry(&entry).unwrap();
+        fs::write(refs_root.join("heads/main"), format!("{newer}\n")).unwrap();
+
+        let report = wal.recover_refs(&refs_root).unwrap();
+        assert_eq!(report.replayed, 0);
+        assert_eq!(report.rolled_back, 1);
+        let s = fs::read_to_string(refs_root.join("heads/main")).unwrap();
+        assert_eq!(s.trim(), newer.to_string(), "peer's commit must survive");
         assert!(wal.pending().unwrap().is_empty());
     }
 
@@ -334,6 +377,7 @@ mod tests {
             payload: WalPayload::RefUpdate {
                 name: "-flag-like".into(),
                 hash: hash_blob(b"h"),
+                expected: None,
             },
         };
         let raw = to_cbor(&entry).unwrap();

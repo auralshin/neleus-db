@@ -586,8 +586,7 @@ impl StateStore {
     }
 
     /// Remove `key` from the subtree at `node_hash`, returning the replacement
-    /// routing entries (empty if the subtree became empty). Merges fall out of
-    /// re-running the cut rule after the key (and any boundary it was) is gone.
+    /// routing entries (empty if the subtree became empty).
     fn delete_from(&self, node_hash: Hash, key: &[u8]) -> Result<Vec<(Vec<u8>, Hash)>> {
         let node = self.load_node(node_hash)?;
         match &node.items {
@@ -604,13 +603,66 @@ impl StateStore {
             NodeItems::Branch(entries) => {
                 let idx = route(entries, key);
                 let new_children = self.delete_from(entries[idx].1, key)?;
+                let replaced = new_children.len();
                 let mut items = entries.clone();
                 items.splice(idx..idx + 1, new_children);
                 if items.is_empty() {
                     return Ok(Vec::new());
                 }
+                // Re-running the cut rule inside one node is not enough: if the
+                // deleted key *was* the boundary that terminated this child, the
+                // survivors belong to the next sibling. Without the merge the
+                // tree keeps a short node no fresh build would produce, and the
+                // root stops being a pure function of the key set.
+                let child_level = node.level.saturating_sub(1);
+                if replaced > 0 {
+                    let last = idx + replaced - 1;
+                    if last + 1 < items.len() && key_level(&items[last].0) <= child_level {
+                        let merged =
+                            self.merge_siblings(child_level, items[last].1, items[last + 1].1)?;
+                        items.splice(last..last + 2, merged);
+                    }
+                }
                 self.chunk_branch(node.level, &items)
             }
+        }
+    }
+
+    /// Concatenate two adjacent same-level nodes and re-cut them, restoring the
+    /// canonical shape after a delete removed the boundary between them.
+    ///
+    /// Recurses into the seam. A key that was a boundary at level `m` terminated
+    /// a node at *every* level below `m`, so fusing only the top pair leaves the
+    /// under-full nodes beneath it split, and the root still differs from a fresh
+    /// build. Only the two nodes touching the seam can be affected.
+    fn merge_siblings(&self, level: u32, left: Hash, right: Hash) -> Result<Vec<(Vec<u8>, Hash)>> {
+        let l = self.load_node(left)?;
+        let r = self.load_node(right)?;
+        match (&l.items, &r.items) {
+            (NodeItems::Leaf(a), NodeItems::Leaf(b)) => {
+                let mut items = a.clone();
+                items.extend(b.iter().cloned());
+                self.chunk_leaf(&items)
+            }
+            (NodeItems::Branch(a), NodeItems::Branch(b)) => {
+                let child_level = level.saturating_sub(1);
+                let mut items = a.clone();
+                match (a.last(), b.first()) {
+                    // Left's own last child is still un-terminated: it has to
+                    // absorb right's first child before this level is re-cut.
+                    (Some((lk, lh)), Some((_, rh))) if key_level(lk) <= child_level => {
+                        let fused = self.merge_siblings(child_level, *lh, *rh)?;
+                        items.pop();
+                        items.extend(fused);
+                        items.extend(b.iter().skip(1).cloned());
+                    }
+                    _ => items.extend(b.iter().cloned()),
+                }
+                self.chunk_branch(level, &items)
+            }
+            _ => Err(anyhow!(
+                "state tree corrupt: sibling nodes at level {level} have different kinds"
+            )),
         }
     }
 
@@ -661,10 +713,9 @@ impl StateStore {
     }
 
     fn load_manifest(&self, hash: StateRoot) -> Result<Arc<StateManifest>> {
+        // `get_typed_bytes` re-derives the address; re-checking it here is a
+        // second BLAKE3 over the same bytes that can never fire.
         let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
-        if hash_typed(STATE_TAG, &bytes) != hash {
-            return Err(anyhow!("manifest hash mismatch for {}", hash));
-        }
         let manifest: Arc<StateManifest> = Arc::new(from_cbor(&bytes)?);
         self.cache_manifest(hash, Arc::clone(&manifest));
         Ok(manifest)
@@ -686,10 +737,18 @@ impl StateStore {
             return Ok(Arc::clone(n));
         }
         let bytes = self.objects.get_typed_bytes(STATE_TAG, hash)?;
-        if hash_typed(STATE_TAG, &bytes) != hash {
-            return Err(anyhow!("node hash mismatch for {}", hash));
+        let node: StateNode = from_cbor(&bytes)?;
+        // No writer produces an empty node, and every read path routes straight
+        // into `entries[..]`. Reject the corrupt object here so it fails closed
+        // instead of panicking somewhere downstream.
+        let empty = match &node.items {
+            NodeItems::Leaf(entries) => entries.is_empty(),
+            NodeItems::Branch(entries) => entries.is_empty(),
+        };
+        if empty {
+            return Err(anyhow!("state node {hash} is empty"));
         }
-        let node: Arc<StateNode> = Arc::new(from_cbor(&bytes)?);
+        let node = Arc::new(node);
         self.cache_node(hash, Arc::clone(&node));
         Ok(node)
     }
@@ -739,8 +798,9 @@ fn key_level(key: &[u8]) -> u32 {
     (zeros / BITS_PER_LEVEL).min(MAX_LEVEL)
 }
 
-/// Route to the child whose subtree covers `key`: the first entry whose
-/// `last_key >= key`, or the last child when `key` exceeds every `last_key`.
+/// Index of the child that would hold `key`. Callers index `entries` with the
+/// result, so `entries` must be non-empty: `load_node` rejects empty nodes and
+/// `verify_path` checks explicitly before calling.
 fn route(entries: &[(Vec<u8>, Hash)], key: &[u8]) -> usize {
     let idx = entries.partition_point(|(lk, _)| lk.as_slice() < key);
     idx.min(entries.len() - 1)
@@ -1121,6 +1181,93 @@ mod tests {
                 let p = s.proof(root, probe).unwrap();
                 assert!(s.verify_proof(root, probe, &p));
             }
+        }
+    }
+
+    /// `random_property`'s 40-key set chunks into a single leaf, so it can never
+    /// exercise a delete that removes the boundary *between* two leaves. This
+    /// uses a key set large enough to span several.
+    #[test]
+    fn deletes_stay_canonical_across_leaf_boundaries() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut root = s.empty_root().unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let keys: Vec<Vec<u8>> = (0..500).map(|i| format!("k{i:05}").into_bytes()).collect();
+
+        for k in &keys {
+            root = s.set(root, k, b"v").unwrap();
+            model.insert(k.clone(), b"v".to_vec());
+        }
+        let top = s
+            .load_manifest_or_empty(root)
+            .unwrap()
+            .root
+            .expect("populated tree has a root node");
+        assert!(
+            matches!(s.load_node(top).unwrap().items, NodeItems::Branch(_)),
+            "test needs a multi-node tree to exercise sibling merges"
+        );
+
+        for _ in 0..50 {
+            let k = keys[rng.gen_range(0..keys.len())].clone();
+            root = s.del(root, &k).unwrap();
+            model.remove(&k);
+            assert_eq!(
+                s.load_manifest_or_empty(root).unwrap().root,
+                oracle_root(&s, &model),
+                "delete left a tree a fresh build would not produce"
+            );
+        }
+        for k in &keys {
+            assert_eq!(s.get(root, k).unwrap(), model.get(k).cloned());
+            let p = s.proof(root, k).unwrap();
+            assert!(s.verify_proof(root, k, &p));
+        }
+    }
+
+    /// A key whose `key_level` is 2 or more terminated a node at *every* level
+    /// below it, so deleting it needs a merge at each of those levels, not just
+    /// the leaf. These keys occur at a rate of about 2^-10, so a small corpus
+    /// contains none and a random-delete test almost never picks one.
+    #[test]
+    fn deletes_of_high_level_boundary_keys_stay_canonical() {
+        // Level assignment is a hash, so scan for qualifying keys rather than
+        // assuming a corpus contains any, then build a window around them.
+        let name = |i: usize| format!("k{i:06}").into_bytes();
+        let deep_idx: Vec<usize> = (0..200_000).filter(|&i| key_level(&name(i)) >= 2).collect();
+        let pivot = *deep_idx.first().expect("some key must land at level 2+");
+        let lo = pivot.saturating_sub(1500);
+        let hi = pivot + 1500;
+
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let mut root = s.empty_root().unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let keys: Vec<Vec<u8>> = (lo..hi).map(name).collect();
+        for k in &keys {
+            root = s.set(root, k, b"v").unwrap();
+            model.insert(k.clone(), b"v".to_vec());
+        }
+
+        let deep: Vec<Vec<u8>> = keys.iter().filter(|k| key_level(k) >= 2).cloned().collect();
+        assert!(
+            !deep.is_empty(),
+            "corpus must contain a level-2+ boundary to exercise the nested merge"
+        );
+        for k in &deep {
+            let level = key_level(k);
+            root = s.del(root, k).unwrap();
+            model.remove(k);
+            assert_eq!(
+                s.load_manifest_or_empty(root).unwrap().root,
+                oracle_root(&s, &model),
+                "deleting a level-{level} boundary left a non-canonical tree"
+            );
+        }
+        for k in &keys {
+            assert_eq!(s.get(root, k).unwrap(), model.get(k).cloned());
         }
     }
 

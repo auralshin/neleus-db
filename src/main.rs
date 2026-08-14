@@ -95,6 +95,11 @@ enum Commands {
         /// admin token).
         #[arg(long)]
         no_bootstrap: bool,
+        /// ed25519 seed file (see `key generate`) used to sign audit bundles
+        /// exported over HTTP. Without it those bundles carry only the unkeyed
+        /// integrity footer, which anyone editing the file can recompute.
+        #[arg(long)]
+        sign_key: Option<PathBuf>,
     },
     /// API-key management for server mode (CLI-only by design).
     Auth {
@@ -1443,6 +1448,7 @@ fn main() -> Result<()> {
             cors_origin,
             open,
             no_bootstrap,
+            sign_key,
         } => {
             let engine = neleus_db::Engine::open(&db_path)?;
             let handle = neleus_db::server::start(
@@ -1453,6 +1459,7 @@ fn main() -> Result<()> {
                     no_auth,
                     cors_origin,
                     bootstrap: !no_bootstrap,
+                    audit_signing_key: sign_key,
                 },
             )?;
             let url = format!("http://{}/", handle.addr);
@@ -1480,6 +1487,19 @@ fn main() -> Result<()> {
                         "  Mint a key first:   neleus-db auth add-key --id app --role writer"
                     );
                 }
+            }
+            eprintln!();
+            if let Some(pk) = &handle.audit_public_key {
+                eprintln!("  Audit exports       signed (ed25519)");
+                eprintln!("  Verify them with    neleus-verify <bundle> --public-key {pk} \\");
+                eprintln!("                        --require-signature");
+            } else {
+                eprintln!(
+                    "  Audit exports       UNSIGNED: integrity footer only, which anyone editing"
+                );
+                eprintln!(
+                    "                      the bundle can recompute. Pass --sign-key <seed> to sign."
+                );
             }
             if open && let Err(e) = open_browser(&url) {
                 eprintln!("  could not open browser: {e}");
@@ -1834,14 +1854,22 @@ fn main() -> Result<()> {
                                 "checkpoints": r.checkpoints,
                                 "checkpoints_signed": r.checkpoints_signed,
                                 "bundle_key_id": r.bundle_key_id,
+                                "chain_complete": r.chain_complete,
                             }),
                             &format!(
-                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, {} checkpoints ({} signed)",
+                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, {} checkpoints ({} signed){}",
                                 r.retrievals,
                                 r.head,
                                 r.commits,
                                 r.checkpoints,
-                                r.checkpoints_signed
+                                r.checkpoints_signed,
+                                if r.chain_complete {
+                                    ""
+                                } else {
+                                    "\nNOTE: retrieval chain does not start at sequence 0, so this \
+                                     bundle covers part of the head's history. Confirm the period \
+                                     is the one you asked for."
+                                }
                             ),
                         )?,
                         Err(e) => {
@@ -2051,7 +2079,6 @@ fn decode_key(key: &str, enc: &KeyEncoding) -> Result<Vec<u8>> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 /// Apply enforce-mode policies to a local write, mirroring the server routes so
 /// filesystem access cannot bypass compliance rules. The local operator is the
 /// principal; provenance is not asserted (CLI has no run-capture endpoint).
@@ -2067,6 +2094,7 @@ fn enforce_cli_write(db: &Database, op: &str, head: &str) -> Result<()> {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn maybe_audit(
     engine: &neleus_db::Engine,
     audit: bool,

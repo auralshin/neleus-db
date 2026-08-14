@@ -13,7 +13,6 @@ use crate::hash::{Hash, hash_typed};
 #[derive(Clone, Debug)]
 pub struct ObjectStore {
     cas: CasStore,
-    verify_on_read: bool,
     compress: bool,
     encryption: Option<Arc<EncryptionRuntime>>,
 }
@@ -22,32 +21,21 @@ impl ObjectStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             cas: CasStore::new(root),
-            verify_on_read: false,
             compress: false,
             encryption: None,
         }
     }
 
-    pub fn with_options(root: impl Into<PathBuf>, verify_on_read: bool) -> Self {
-        Self::with_runtime_options(root, verify_on_read, false, None)
-    }
-
     pub fn with_runtime_options(
         root: impl Into<PathBuf>,
-        verify_on_read: bool,
         compress: bool,
         encryption: Option<Arc<EncryptionRuntime>>,
     ) -> Self {
         Self {
             cas: CasStore::new(root),
-            verify_on_read,
             compress,
             encryption,
         }
-    }
-
-    pub fn verify_on_read(&self) -> bool {
-        self.verify_on_read
     }
 
     pub fn compress(&self) -> bool {
@@ -61,14 +49,10 @@ impl ObjectStore {
     pub fn put_typed_bytes(&self, tag: &[u8], bytes: &[u8]) -> Result<Hash> {
         // Hash is always over the canonical (uncompressed, unencrypted) bytes.
         let hash = hash_typed(tag, bytes);
-        let after_compress: Vec<u8> = if self.compress {
-            compression::compress(bytes)?
-        } else {
-            bytes.to_vec()
-        };
+        let framed = compression::frame(bytes, self.compress)?;
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(&after_compress)?,
-            None => after_compress,
+            Some(runtime) => runtime.encrypt(&framed)?,
+            None => framed,
         };
         self.cas.put_existing_hash(hash, &stored)?;
         Ok(hash)
@@ -80,25 +64,26 @@ impl ObjectStore {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
-        Ok(compression::decompress_if_compressed(&after_decrypt)?.into_owned())
+        Ok(compression::unframe(&after_decrypt)?.into_owned())
     }
 
+    /// Typed read. Always re-derives the address from the bytes: commits,
+    /// manifests and checkpoints are small, and trusting the filename here
+    /// would let a swapped CAS file be returned under another object's hash.
     pub fn get_typed_bytes(&self, tag: &[u8], hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
         let after_decrypt = match &self.encryption {
             Some(runtime) => runtime.decrypt(&raw)?,
             None => raw,
         };
-        let bytes = compression::decompress_if_compressed(&after_decrypt)?;
-        if self.verify_on_read {
-            let computed = hash_typed(tag, &bytes);
-            if computed != hash {
-                return Err(anyhow!(
-                    "object hash mismatch for {} (computed {})",
-                    hash,
-                    computed
-                ));
-            }
+        let bytes = compression::unframe(&after_decrypt)?;
+        let computed = hash_typed(tag, &bytes);
+        if computed != hash {
+            return Err(anyhow!(
+                "object hash mismatch for {} (computed {})",
+                hash,
+                computed
+            ));
         }
         Ok(bytes.into_owned())
     }
@@ -175,7 +160,7 @@ mod tests {
     #[test]
     fn typed_read_verification_detects_corruption() {
         let dir = TempDir::new().unwrap();
-        let store = ObjectStore::with_options(dir.path(), true);
+        let store = ObjectStore::new(dir.path());
         store.ensure_dir().unwrap();
 
         let hash = store.put_serialized(b"manifest:", &Obj { x: 7 }).unwrap();

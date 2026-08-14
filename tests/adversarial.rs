@@ -25,13 +25,12 @@ use neleus_db::retrieval_proof::{prove_chunk, verify_chunk_proof};
 use neleus_db::{Database, Hash, audit};
 use tempfile::TempDir;
 
-/// One attack outcome. `detected` is what verification did; `expected` is what
-/// we claim in the paper.
+/// One recorded attack outcome for the printed report. Correctness is asserted
+/// in `record` against the expectation; only the display fields are kept here.
 #[derive(Clone)]
 struct Outcome {
     attack: &'static str,
     detected: bool,
-    expected: bool,
     by: &'static str,
 }
 
@@ -46,7 +45,6 @@ fn record(attack: &'static str, detected: bool, expected: bool, by: &'static str
     RESULTS.lock().unwrap().push(Outcome {
         attack,
         detected,
-        expected,
         by,
     });
 }

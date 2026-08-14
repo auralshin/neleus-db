@@ -4,18 +4,22 @@ use std::str::FromStr;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// A 32-byte BLAKE3 content hash. Displays and parses as 64-char lowercase hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Hash(pub [u8; 32]);
 
 impl Hash {
+    /// The all-zero hash (sentinel for "absent").
     pub fn zero() -> Self {
         Self([0u8; 32])
     }
 
+    /// The raw 32 bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
+    /// Wrap raw 32 bytes as a hash.
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
@@ -44,13 +48,27 @@ impl FromStr for Hash {
             return Err(anyhow!("expected 64-char hex hash, got {}", s.len()));
         }
 
+        // Lowercase hex only. `from_str_radix` would also accept `+`-prefixed
+        // and uppercase digits, so many distinct strings would parse to one
+        // hash while `Display` reproduced none of them, so one logical object
+        // could then be addressed under several spellings.
         let mut out = [0u8; 32];
         for (idx, chunk) in s.as_bytes().chunks(2).enumerate() {
-            let chunk_str = std::str::from_utf8(chunk)?;
-            out[idx] = u8::from_str_radix(chunk_str, 16)
-                .map_err(|e| anyhow!("invalid hex at byte {idx}: {e}"))?;
+            let hi = hex_digit(chunk[0], idx)?;
+            let lo = hex_digit(chunk[1], idx)?;
+            out[idx] = (hi << 4) | lo;
         }
         Ok(Self(out))
+    }
+}
+
+fn hex_digit(b: u8, idx: usize) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => Err(anyhow!(
+            "invalid hex at byte {idx}: expected lowercase [0-9a-f]"
+        )),
     }
 }
 
@@ -73,6 +91,8 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
+/// Domain-separated content hash: BLAKE3 over `tag || bytes`. Every object
+/// family uses a distinct `tag` so different types cannot collide.
 pub fn hash_typed(tag: &[u8], bytes: &[u8]) -> Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(tag);
@@ -81,6 +101,7 @@ pub fn hash_typed(tag: &[u8], bytes: &[u8]) -> Hash {
     Hash(*out.as_bytes())
 }
 
+/// Content hash of a raw blob (BLAKE3, `blob:` domain).
 pub fn hash_blob(bytes: &[u8]) -> Hash {
     hash_typed(b"blob:", bytes)
 }

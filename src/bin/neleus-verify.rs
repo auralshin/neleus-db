@@ -54,6 +54,7 @@ fn main() -> ExitCode {
                         "checkpoints": report.checkpoints,
                         "checkpoints_signed": report.checkpoints_signed,
                         "bundle_key_id": report.bundle_key_id,
+                        "chain_complete": report.chain_complete,
                     })
                 );
             } else {
@@ -72,6 +73,14 @@ fn main() -> ExitCode {
                     report.from,
                     report.to,
                 );
+                // Internally consistent but not anchored at seq 0: expected for
+                // a windowed export, evidence of a withheld prefix otherwise.
+                if !report.chain_complete {
+                    println!(
+                        "NOTE: retrieval chain does not start at sequence 0, so this bundle covers \
+                         part of the head's history. Confirm the period is the one you asked for."
+                    );
+                }
             }
             ExitCode::SUCCESS
         }

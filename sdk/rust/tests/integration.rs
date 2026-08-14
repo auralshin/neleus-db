@@ -38,6 +38,7 @@ fn serve() -> Fixture {
             no_auth: false,
             cors_origin: None,
             bootstrap: false,
+            ..Default::default()
         },
     )
     .unwrap();

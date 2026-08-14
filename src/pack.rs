@@ -35,6 +35,20 @@ const FORMAT_VERSION: u32 = 1;
 /// Compressed pack: each entry's `data` is the zstd frame of the file bytes,
 /// and `data_len` is the compressed length. Restore decompresses per entry.
 const FORMAT_VERSION_COMPRESSED: u32 = 2;
+/// Ceiling on a length field read before the footer has been checked. The
+/// integrity hash only covers the whole stream, so these are attacker-chosen
+/// until the very end: allocating from them unbounded is an OOM on a hostile or
+/// truncated pack, including inside `verify`, whose job is safe inspection.
+const MAX_PATH_LEN: usize = 8 * 1024;
+const MAX_ENTRY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Allocate a path buffer only for a plausible length.
+fn path_buf_for(path_len: usize) -> Result<Vec<u8>> {
+    if path_len > MAX_PATH_LEN {
+        bail!("pack declares a {path_len}-byte path (max {MAX_PATH_LEN}): refusing to allocate");
+    }
+    Ok(vec![0u8; path_len])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PackStats {
@@ -236,7 +250,7 @@ pub fn verify(pack_file: &Path) -> Result<PackStats> {
     let mut total = 0u64;
     for _ in 0..count {
         let path_len = read_u32_hashed(&mut r, &mut h)? as usize;
-        let mut path_buf = vec![0u8; path_len];
+        let mut path_buf = path_buf_for(path_len)?;
         read_hashed(&mut r, &mut h, &mut path_buf)?;
         let rel = String::from_utf8(path_buf).map_err(|_| anyhow!("invalid utf-8 path in pack"))?;
         // Flag a malicious pack before any real restore runs.
@@ -283,7 +297,7 @@ fn restore_into<R: Read>(
     let mut total_bytes = 0u64;
     for _ in 0..count {
         let path_len = read_u32_hashed(r, h)? as usize;
-        let mut path_buf = vec![0u8; path_len];
+        let mut path_buf = path_buf_for(path_len)?;
         read_hashed(r, h, &mut path_buf)?;
         let rel = String::from_utf8(path_buf).map_err(|_| anyhow!("invalid utf-8 path in pack"))?;
         let mode = read_u32_hashed(r, h)?;
@@ -320,7 +334,11 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<WalkEntry>) -> Result<()> {
         let path = entry.path();
         let ft = entry.file_type()?;
         if ft.is_dir() {
-            walk(root, &path, out)?;
+            // Temp-named dirs are staging areas (an in-flight merge unpack).
+            // Recursing would pack a second copy of the database into itself.
+            if !is_excluded(&path) {
+                walk(root, &path, out)?;
+            }
             continue;
         }
         if !ft.is_file() {
@@ -356,8 +374,9 @@ fn relative_slash(root: &Path, path: &Path) -> Result<String> {
     Ok(parts.join("/"))
 }
 
-/// Transient files that must not enter a pack: lock files and atomic-write temp
-/// leftovers. WAL files are intentionally kept — `open` replays or discards them.
+/// Transient paths that must not enter a pack: lock files, atomic-write temp
+/// leftovers, and temp-named staging dirs. WAL files are intentionally kept —
+/// `open` replays or discards them.
 fn is_excluded(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return true;
@@ -410,6 +429,13 @@ fn write_file_streamed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64
 /// Read a `len`-byte zstd frame (feeding the integrity hasher), inflate it, and
 /// write the original bytes to `dest`. Returns the inflated size.
 fn write_file_compressed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64) -> Result<u64> {
+    if len > MAX_ENTRY_BYTES {
+        bail!(
+            "pack declares a {len}-byte compressed entry for {} (max {MAX_ENTRY_BYTES}): \
+             refusing to allocate",
+            dest.display()
+        );
+    }
     let mut framed = vec![0u8; len as usize];
     r.read_exact(&mut framed).map_err(|e| {
         anyhow!(
@@ -418,7 +444,7 @@ fn write_file_compressed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u
         )
     })?;
     h.update(&framed);
-    let raw = compression::decompress_if_compressed(&framed)?;
+    let raw = compression::decompress(&framed)?;
     let file = File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
     let mut w = BufWriter::new(file);
     w.write_all(&raw)?;
@@ -577,6 +603,52 @@ mod tests {
             put(&mut out, data);
         }
         out.extend_from_slice(h.finalize().as_bytes());
+        out
+    }
+
+    /// A merge stages an unpacked peer tree inside the root. Packing must not
+    /// descend into it, or the pack carries a second copy of the database.
+    #[test]
+    fn packing_skips_a_temp_named_staging_directory() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src_db");
+        make_db(&src);
+
+        let staging = src
+            .join("meta")
+            .join(crate::atomic::build_temp_name("merge-staging").unwrap());
+        fs::create_dir_all(staging.join("objects")).unwrap();
+        fs::write(staging.join("objects").join("stowaway"), b"peer tree").unwrap();
+
+        let pack_file = tmp.path().join("out.neleus");
+        pack(&src, &pack_file, false).unwrap();
+        let dst = tmp.path().join("dst_db");
+        unpack(&pack_file, &dst, false).unwrap();
+
+        let leaked: Vec<_> = walkdir(&dst)
+            .into_iter()
+            .filter(|p| p.contains("stowaway"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "staging tree entered the pack: {leaked:?}"
+        );
+    }
+
+    fn walkdir(root: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    out.push(p.to_string_lossy().into_owned());
+                }
+            }
+        }
         out
     }
 

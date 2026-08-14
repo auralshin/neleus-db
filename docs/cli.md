@@ -115,11 +115,29 @@ durable.
 `enforce`-mode policies also gate the server's write endpoints. See
 [policy.md](policy.md).
 
+## erasure: GDPR right-to-be-forgotten
+
+| Command | What it does |
+|---|---|
+| `erasure request --subject <id> [--reason <r>] [--sign-key <seed>]` | Shred the subject's content, keeping the signed commitment chain. |
+| `erasure list` | List recorded erasure records. |
+| `erasure verify --public-key <hex>` | Check every signed erasure record against a public key. |
+
+`--reason` is `request` (default), `ttl`, or `account-closure`. Erasure removes
+the subject's *content* while leaving the commit graph and its hashes intact, so
+history still verifies and the removal is itself an auditable, hash-chained
+event. With `--sign-key` the record is ed25519-signed, which is what lets a third
+party confirm who authorized it.
+
+Encryption at rest makes this a crypto-shred and is the robust guarantee;
+without it the physical overwrite is best-effort on copy-on-write filesystems
+and SSDs. Over HTTP the same operations are `POST`/`GET /v1/erasure` (admin).
+
 ## serve / auth — hosted mode
 
 | Command | What it does |
 |---|---|
-| `serve --addr <a> [--open] [--no-bootstrap] [--allow-remote] [--no-auth] [--cors-origin <origin>]` | Start the HTTP server + bundled console. |
+| `serve --addr <a> [--open] [--no-bootstrap] [--allow-remote] [--no-auth] [--cors-origin <origin>] [--sign-key <seed>]` | Start the HTTP server + bundled console. |
 | `auth add-key --id <id> --role <reader\|writer\|admin> [--tenant <t>]` | Mint an API token (printed once). |
 | `auth remove-key --id <id>` | Revoke a key. |
 | `auth list-keys` | List key metadata (never secrets). |
@@ -128,6 +146,10 @@ durable.
 string on startup. `--open` launches a browser; on loopback a bootstrap admin
 token is minted (disable with `--no-bootstrap`). See [http-api.md](http-api.md)
 for the routes.
+
+`--sign-key <seed>` (from `key generate`) signs audit bundles exported over
+HTTP. Startup says which mode you are in; without it those bundles carry only
+the unkeyed integrity footer, which anyone editing the file can recompute.
 
 ## neleus-verify — standalone auditor binary
 
@@ -139,3 +161,8 @@ neleus-verify <bundle.nelaudit> [--public-key <hex>] [--require-signature] [--js
 
 Prints `VERIFIED: …` and exits 0, or `INVALID: …` and exits 1. Every claim is
 re-derived from bytes carried in the bundle.
+
+A verified bundle also reports `chain_complete` (`--json`) with a `NOTE:` in the
+text output when it is false. False means the retrieval chain does not start at
+sequence 0: expected for a windowed `--from`/`--to` export, and evidence of a
+withheld prefix otherwise. Check the period is the one you asked for.

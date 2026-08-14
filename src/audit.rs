@@ -311,7 +311,7 @@ pub fn export(
     })
 }
 
-/// In-memory bundle build; the server exports without touching disk.
+/// Bundle as bytes, staged through a temp file under `meta/` and unlinked.
 pub fn export_bytes(
     db: &Database,
     head: &str,
@@ -319,11 +319,21 @@ pub fn export_bytes(
     to: u64,
     signer: Option<&Ed25519Signer>,
 ) -> Result<(Vec<u8>, ExportSummary)> {
-    let dir = std::env::temp_dir().join(format!("nel-export-{}.nelaudit", std::process::id()));
-    let summary = export(db, head, from, to, &dir, signer)?;
-    let bytes = std::fs::read(&dir)?;
-    let _ = std::fs::remove_file(&dir);
-    Ok((bytes, summary))
+    // Stage inside the database, not the shared temp dir: a PID-derived name in
+    // /tmp is guessable, so a local attacker could pre-create it as a symlink
+    // and redirect the bundle (or read it) on a multi-user host. Keep the exact
+    // atomic-write temp name, nothing appended, so `pack` excludes it from
+    // backups and `cleanup_orphan_temps` reclaims it if we die mid-export.
+    let dir = db.root.join("meta");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(crate::atomic::build_temp_name("export")?);
+    let outcome = export(db, head, from, to, &path, signer).and_then(|summary| {
+        let bytes = std::fs::read(&path)?;
+        Ok((bytes, summary))
+    });
+    // Unlink on the error path too, or a failed export leaks a full bundle.
+    let _ = std::fs::remove_file(&path);
+    outcome
 }
 
 fn build_bundle(entries: &[(String, Vec<u8>)], signer: Option<&Ed25519Signer>) -> Vec<u8> {
@@ -455,6 +465,7 @@ pub fn verify_bundle(
 
     // Re-derive every object hash from carried bytes.
     let mut commits: HashMap<String, Commit> = HashMap::new();
+    let mut manifest_objects: HashSet<String> = HashSet::new();
     for (name, bytes) in &entries {
         let Some(hex) = name.strip_prefix("objects/") else {
             continue;
@@ -463,7 +474,7 @@ pub fn verify_bundle(
         if hash_typed(COMMIT_TAG, bytes) == claimed {
             commits.insert(hex.to_string(), from_cbor(bytes)?);
         } else if hash_typed(MANIFEST_TAG, bytes) == claimed {
-            // manifest; checked per record below
+            manifest_objects.insert(hex.to_string());
         } else {
             bail!("object {hex} matches neither commit nor manifest hash domain");
         }
@@ -494,9 +505,23 @@ pub fn verify_bundle(
         }
         let qm = decode_query_manifest(manifest_bytes)
             .ok_or_else(|| anyhow!("object {} is not a QueryManifest", r.manifest))?;
+        // Compare every field the record claims. The jsonl is a rendering of
+        // the manifest, which is the only hash-bound copy; anything left
+        // uncompared here is a field an exporter can rewrite freely.
         if qm.executed_at != r.executed_at
             || qm.principal.as_deref() != r.principal.as_deref()
+            || qm.mode != r.mode
+            || qm.top_k != r.top_k
+            || qm.filters.as_deref() != r.filters.as_deref()
+            || qm.commit.to_string() != r.queried_commit
+            || qm.seq != r.seq
+            || qm.prev.map(|p| p.to_string()) != r.prev
             || qm.hits.len() != r.hits.len()
+            || qm
+                .hits
+                .iter()
+                .zip(&r.hits)
+                .any(|(h, a)| h.chunk.to_string() != a.chunk || h.score_micro != a.score_micro)
         {
             bail!("jsonl record {} disagrees with its manifest", r.manifest);
         }
@@ -516,6 +541,23 @@ pub fn verify_bundle(
         }
         if !reachable.contains(&r.commit) {
             bail!("commit {} not reachable from declared tip", r.commit);
+        }
+    }
+
+    // Export writes manifest bytes only for records inside the window, so a
+    // carried QueryManifest with no matching line means the line was removed.
+    let recorded: HashSet<&str> = records.iter().map(|r| r.manifest.as_str()).collect();
+    for hex in &manifest_objects {
+        if recorded.contains(hex.as_str()) {
+            continue;
+        }
+        if let Some(bytes) = entries.get(&format!("objects/{hex}"))
+            && decode_query_manifest(bytes).is_some()
+        {
+            bail!(
+                "QueryManifest {hex} is carried by the bundle but has no line in \
+                 retrievals.jsonl: the record was withheld from the index"
+            );
         }
     }
 
@@ -579,6 +621,15 @@ pub fn verify_bundle(
                 && cp.sequence != exp
             {
                 bail!("checkpoint chain sequence break at {h}");
+            }
+            // Genesis is exactly "sequence 0 and no predecessor"; without both
+            // directions a forged `sequence: 0` carrying a `prev` resets the
+            // chain, because `checked_sub` then skips every check below it.
+            if cp.prev.is_none() != (cp.sequence == 0) {
+                bail!(
+                    "checkpoint {h} has sequence {} but a mismatched predecessor",
+                    cp.sequence
+                );
             }
             expected_seq = cp.sequence.checked_sub(1);
             match (&cp.signature, &verifier) {
