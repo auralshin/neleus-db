@@ -27,7 +27,7 @@ Run capture:
 Retrieval (HTTP only):
 
     client = neleus.connect("neleus://nlk_...@127.0.0.1:7117")
-    hits = client.search("main", query="reset policy", top_k=5, audit=True)
+    hits = client.search("main", query="reset policy", top_k=5)
     proof = client.prove(hits["commit"], hits["hits"][0]["chunk"])
     assert client.verify(proof)["valid"]
 """
@@ -269,11 +269,11 @@ class Client:
     def search(
         self, at: str, *, query: Optional[str] = None,
         embedding: Optional[list[float]] = None, mode: str = "hybrid",
-        top_k: int = 10, filter: Optional[dict] = None, audit: bool = False,
+        top_k: int = 10, filter: Optional[dict] = None, commit: Optional[str] = None,
     ) -> dict:
         return self._t.request("POST", "/v1/search", {
-            "at": at, "mode": mode, "query": query, "embedding": embedding,
-            "top_k": top_k, "filter": filter, "audit": audit,
+            "at": at, "commit": commit, "mode": mode, "query": query, "embedding": embedding,
+            "top_k": top_k, "filter": filter,
         })
 
     def prove(self, commit: str, chunk: str, *, include_content: bool = True) -> str:

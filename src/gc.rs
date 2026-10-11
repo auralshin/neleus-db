@@ -92,6 +92,7 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
     // outlives its head, and a chain pointing at a swept commit fails to verify.
     let checkpoints = crate::checkpoint::CheckpointStore::new(db);
     let mut stack = collect_refs(&db.root.join("refs").join("heads"))?;
+    let mut query_tips = Vec::new();
     for tip in collect_refs(&db.root.join("refs").join("checkpoints"))? {
         let mut cursor = Some(tip);
         while let Some(hash) = cursor {
@@ -102,13 +103,14 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
                 .get(hash)
                 .with_context(|| format!("gc: reading checkpoint {hash}"))?;
             stack.push(cp.commit);
+            query_tips.extend(cp.query_tip);
             cursor = cp.prev;
         }
     }
 
-    // Audit-chain tips. Records are normally reachable through the commit that
-    // carries them; the ref keeps the chain intact if that commit is orphaned.
-    for tip in collect_refs(&db.root.join("refs").join("queries"))? {
+    // Anchored retrieval records. Normally reachable through the commits that
+    // carry them; the pin keeps an anchored chain intact if those are orphaned.
+    for tip in query_tips {
         let mut cursor = Some(tip);
         while let Some(hash) = cursor {
             if reach.contains(&hash) {

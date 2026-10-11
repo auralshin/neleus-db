@@ -47,7 +47,7 @@ Cognee) offers cryptographic tamper-evidence. See
 **Retrieval**
 - Hybrid search: BM25 and HNSW vectors fused with reciprocal rank fusion
 - Metadata filters: tenant, doc type, language, ACL tags, validity windows
-- Time-travel: query any historical commit (`search --head <commit-hash>`)
+- Time-travel: query any historical commit (`search --head <h> --at <commit-hash>`)
 - TTL and temporal validity (`valid_from`/`valid_to`/`expires_at`) as engine
   primitives
 - Hierarchical retrieval via `SummaryManifest` (summaries indexed beside
@@ -65,7 +65,7 @@ Cognee) offers cryptographic tamper-evidence. See
 - Checkpoint chains: an append-only transparency log over each head
   (`checkpoint new/verify`). Publish the latest hash anywhere to externally
   anchor the whole history.
-- Content-addressed query audit records (`search --audit`), sequence-chained
+- Every search recorded as a content-addressed query audit record, sequence-chained
   per head so a record dropped from an export is detectable
 - Offline chunk proofs spanning commit ancestry
 
@@ -92,9 +92,9 @@ ndb manifest put-doc --source policy.md --file policy.md \
     --chunk-size 512 --overlap 64 --doc-type policy --acl group:hr
 ndb commit new --head main --author ingest --message "policy v1" --manifest <hash>
 
-# hybrid search with filters + audit record
+# hybrid search with filters (recorded on main)
 ndb search hybrid --head main --query "password reset policy" \
-    --acl group:hr --audit
+    --acl group:hr
 
 # prove a hit, verify offline
 ndb proof chunk --head main --chunk <chunk-hash> --include-content --out hit.proof
@@ -158,9 +158,13 @@ Monitor, and can fire a webhook. See [docs/policy.md](docs/policy.md).
 ### Replication
 
 ```bash
-NELEUS_DB_TOKEN=nlk_... ndb db pull --remote http://primary:7117
+NELEUS_DB_TOKEN=nlk_... ndb db init ./replica --replica-of http://primary:7117
+NELEUS_DB_TOKEN=nlk_... ndb --db ./replica db pull --remote http://primary:7117
 NELEUS_DB_TOKEN=nlk_... ndb db push --remote http://replica:7117
 ```
+
+Replicas must share the primary's database secret, so create them with
+`--replica-of`; a merge between databases with different secrets is refused.
 
 Fast-forward only; checkpoint chains merge under the same rule.
 
@@ -207,7 +211,7 @@ assert db.verify_proof(db.prove(commit, hits[0]["chunk"]))["valid"]
 // TypeScript, over HTTP
 import { connect } from "@neleus/client";
 const c = connect("neleus://nlk_...@127.0.0.1:7117");
-const res = await c.search("main", { query: "reset policy", audit: true });
+const res = await c.search("main", { query: "reset policy" });
 const proof = await c.prove(res.commit, res.hits[0].chunk);
 console.assert((await c.verify(proof)).valid);
 ```

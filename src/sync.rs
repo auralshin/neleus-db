@@ -3,7 +3,7 @@
 //! only (no force-push — divergence is reported, never overwritten).
 //! Transport: std-only HTTP/1.1 to a `serve` peer; TLS terminates in front.
 //! Encrypted DBs replicate ciphertext verbatim, so both sides need the same
-//! encryption config (checked before any copy).
+//! encryption config and boundary key (checked before any copy).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -42,6 +42,13 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
             format!("remote tree has no config at {}", remote_cfg_path.display())
         })?)?;
     let local_cfg = serde_json::to_value(&db.config)?;
+    // Trees cut under different keys share no nodes and break canonical roots.
+    if remote_cfg.get("secret") != local_cfg.get("secret") {
+        bail!(
+            "refusing to merge: database secrets differ (create the replica with \
+             `db init --replica-of <url>`)"
+        );
+    }
     if remote_cfg.get("encryption") != local_cfg.get("encryption") {
         bail!(
             "refusing to merge: encryption configs differ (replication requires \
@@ -226,6 +233,31 @@ pub fn pull(db: &Database, remote_url: &str, token: Option<&str>) -> Result<Merg
     result
 }
 
+/// Create a database at `path` as a replica of a remote peer: adopt its
+/// boundary key, then merge its pack.
+pub fn clone(path: &Path, remote_url: &str, token: Option<&str>) -> Result<MergeReport> {
+    let body = http_request(remote_url, "GET", "/v1/pack", token, &[], None)?;
+    let meta = path.join("meta");
+    fs::create_dir_all(&meta)?;
+    let tmp = meta.join(crate::atomic::build_temp_name("clone")?);
+    let staging = meta.join(crate::atomic::build_temp_name("clone-staging")?);
+    fs::write(&tmp, &body)?;
+    let result = (|| {
+        crate::pack::unpack(&tmp, &staging, true)?;
+        let remote_cfg: serde_json::Value =
+            serde_json::from_slice(&fs::read(staging.join("meta").join("config.json"))?)?;
+        let key = remote_cfg
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("remote config has no secret"))?;
+        Database::init_with_secret(path, key)?;
+        merge_tree(&Database::open(path)?, &staging)
+    })();
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_dir_all(&staging);
+    result
+}
+
 /// Pack the local DB and POST it; remote merges fast-forward-only.
 pub fn push(db: &Database, remote_url: &str, token: Option<&str>) -> Result<String> {
     // Inside the root so `cleanup_orphan_temps` reclaims it; `pack` skips
@@ -327,8 +359,18 @@ mod tests {
 
     fn test_db(tmp: &TempDir, name: &str) -> Database {
         let root = tmp.path().join(name);
-        Database::init(&root).unwrap();
+        Database::init_with_secret(&root, &"07".repeat(32)).unwrap();
         Database::open(&root).unwrap()
+    }
+
+    #[test]
+    fn merge_refuses_a_different_secret() {
+        let tmp = TempDir::new().unwrap();
+        let a = test_db(&tmp, "a");
+        let other = tmp.path().join("other");
+        Database::init(&other).unwrap();
+        let err = merge_tree(&a, &other).unwrap_err().to_string();
+        assert!(err.contains("secrets differ"), "{err}");
     }
 
     #[test]

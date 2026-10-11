@@ -415,7 +415,7 @@ mod tests {
 
         // Before erasure: alice's chunk is indexed and retrievable.
         let hits = engine
-            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("diabetes"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(
             hits.iter().any(|h| h.chunk_hash == alice_chunk),
@@ -441,14 +441,14 @@ mod tests {
 
         // Index purged: alice's term is gone; bob's content still searchable.
         let after = engine
-            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("diabetes"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(
             after.iter().all(|h| h.chunk_hash != alice_chunk),
             "alice purged from index"
         );
         let bob = engine
-            .search_hybrid(commit, Some("hiking"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("hiking"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(!bob.is_empty(), "bob's content survives erasure");
     }
@@ -497,7 +497,7 @@ mod tests {
             .chunks[0];
         let commit = engine.resolve_commit("main").unwrap();
         engine
-            .search_hybrid(commit, Some("record"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("record"), None, 5, &SearchFilter::default())
             .unwrap();
 
         // Readers hammer search while one thread erases a subject (deleting +
@@ -520,7 +520,7 @@ mod tests {
                 s.spawn(|| {
                     for _ in 0..150 {
                         engine
-                            .search_hybrid(
+                            .search_hybrid_unrecorded(
                                 commit,
                                 Some("record"),
                                 None,
@@ -535,7 +535,7 @@ mod tests {
 
         // u3's content is gone; the surviving subjects still serve.
         let after = engine
-            .search_hybrid(commit, Some("record"), None, 20, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("record"), None, 20, &SearchFilter::default())
             .unwrap();
         assert!(!after.is_empty(), "surviving subjects still searchable");
         assert!(after.iter().all(|h| h.chunk_hash != u3_chunk), "u3 purged");

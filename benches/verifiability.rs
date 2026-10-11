@@ -5,13 +5,15 @@
 //! Measurements print to stderr with a `[q<N>]` tag; criterion timings cover
 //! the paths that sit on an auditor's critical path.
 
+mod common;
+
 use std::process::Command;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use neleus_db::audit;
 use neleus_db::canonical::to_cbor;
-use neleus_db::checkpoint::CheckpointStore;
+use neleus_db::checkpoint::{self, CheckpointStore};
 use neleus_db::db::Database;
 use neleus_db::engine::segment::{ChunkInput, IndexSegment};
 use neleus_db::engine::{Engine, SearchFilter};
@@ -26,7 +28,7 @@ use tempfile::TempDir;
 fn q2_checkpoint_chain(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("db");
-    Database::init(&root).unwrap();
+    common::init_db(&root);
     let db = Database::open(&root).unwrap();
     db.create_commit_at_head("main", "bench", "base", vec![])
         .unwrap();
@@ -61,6 +63,28 @@ fn q2_checkpoint_chain(c: &mut Criterion) {
         });
     }
     group.finish();
+
+    // The Merkle root answers the same questions in O(log J), without the walk.
+    let (root, incl) = store.prove_commit_logged("main", 0).unwrap();
+    let logged = store.logged_commits("main").unwrap()[0];
+    let (old, new, cons) = store.prove_append_only("main", built / 2).unwrap();
+    let reps = 10_000u32;
+    let start = Instant::now();
+    for _ in 0..reps {
+        assert!(checkpoint::verify_commit_logged(root, logged, &incl));
+    }
+    let incl_t = start.elapsed() / reps;
+    let start = Instant::now();
+    for _ in 0..reps {
+        assert!(checkpoint::verify_append_only(old, new, &cons));
+    }
+    let cons_t = start.elapsed() / reps;
+    eprintln!(
+        "[q2] J={built}: inclusion proof {} B verify {incl_t:?}; consistency proof ({} -> {built}) {} B verify {cons_t:?}",
+        to_cbor(&incl).unwrap().len(),
+        built / 2,
+        to_cbor(&cons).unwrap().len(),
+    );
 }
 
 // ---------------------------------------------------------------- Q3/Q4
@@ -70,7 +94,7 @@ fn q2_checkpoint_chain(c: &mut Criterion) {
 
 fn build_bundle(dir: &std::path::Path, retrievals: usize) -> (std::path::PathBuf, u64) {
     let root = dir.join(format!("db{retrievals}"));
-    Database::init(&root).unwrap();
+    common::init_db(&root);
     let engine = Engine::open(&root).unwrap();
     let text = "agent context retrieval memory vector index commit proof merkle search ".repeat(64);
     let (_doc, commit) = engine
@@ -90,7 +114,7 @@ fn build_bundle(dir: &std::path::Path, retrievals: usize) -> (std::path::PathBuf
     let filter = SearchFilter::default();
     for _ in 0..retrievals {
         let hits = engine
-            .search_semantic(commit, "vector retrieval proof", 10, &filter)
+            .search_semantic_unrecorded(commit, "vector retrieval proof", 10, &filter)
             .unwrap();
         // Sequence-chained: identical retrievals would otherwise be one
         // content-addressed object, collapsing the R-scaling measurement.
@@ -167,7 +191,7 @@ fn q3_q4_auditor(c: &mut Criterion) {
     // versus the warm path the paper previously reported.
     {
         let root = dir.path().join("state");
-        Database::init(&root).unwrap();
+        common::init_db(&root);
         let db = Database::open(&root).unwrap();
         let mut sroot = db.state_store.empty_root().unwrap();
         for i in 0..1000u32 {
@@ -195,9 +219,18 @@ fn q3_q4_auditor(c: &mut Criterion) {
             assert!(fresh.state_store.verify_proof(sroot, b"key_00042", &proof));
         }
         let cold = start.elapsed() / reps;
+
+        // Store-free: decode the proof bytes and verify; no database is opened.
+        let bytes = to_cbor(&proof).unwrap();
+        let start = Instant::now();
+        for _ in 0..reps {
+            let p: neleus_db::state::StateProof = neleus_db::canonical::from_cbor(&bytes).unwrap();
+            assert!(p.verify(sroot, b"key_00042"));
+        }
+        let offline = start.elapsed() / reps;
         eprintln!(
             "[q3] state proof ({proof_bytes} B, 1000 keys): warm verify {warm:?}, \
-             cold verify (reopened db) {cold:?}"
+             cold verify (reopened db) {cold:?}, store-free decode+verify {offline:?}"
         );
     }
 

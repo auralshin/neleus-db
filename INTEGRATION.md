@@ -179,7 +179,8 @@ let (_doc, commit) = engine.put_document(
 )?;
 
 // Retrieve (build context from full chunk text, not the preview)
-let hits = engine.search_hybrid(commit, Some("indemnification terms"), None, 3, &SearchFilter::default())?;
+let q = neleus_db::SearchQuery::Hybrid { text: Some("indemnification terms"), embedding: None };
+let hits = engine.search("main", None, q, 3, &SearchFilter::default(), None)?.hits; // recorded on main
 let context: String = hits.iter()
     .map(|h| String::from_utf8_lossy(&engine.db().blob_store.get(h.chunk_hash).unwrap()).into_owned())
     .collect::<Vec<_>>().join("\n\n");
@@ -210,7 +211,7 @@ import neleus  # sdk/python/neleus.py
 c = neleus.connect("neleus://nlk_…@127.0.0.1:7117")
 c.put_document("main", "nda.txt", open("nda.txt").read(), metadata={"doc_type": "policy"})
 
-res = c.search("main", query="indemnification terms", mode="hybrid", audit=True)
+res = c.search("main", query="indemnification terms", mode="hybrid")
 proof = c.prove(res["commit"], res["hits"][0]["chunk"])
 assert c.verify(proof)["valid"]
 ```
@@ -248,7 +249,7 @@ const llm = new Anthropic();
 
 async function agentTurn(question: string) {
   // Retrieve, then build context from full chunk text.
-  const res = await db.search("main", { query: question, mode: "hybrid", topK: 3, audit: true });
+  const res = await db.search("main", { query: question, mode: "hybrid", topK: 3 });
   const context = (await Promise.all(res.hits.map((h) => db.chunkText(h.chunk)))).join("\n\n");
 
   // Model call with the retrieved context.
@@ -258,8 +259,7 @@ async function agentTurn(question: string) {
   });
   const answer = reply.content[0].type === "text" ? reply.content[0].text : "";
 
-  // Commit the audit record, anchor it, prove the top hit.
-  await db.commit("main", `answer: ${question.slice(0, 40)}`, [res.audit_manifest!]);
+  // The search was recorded on main; anchor it and prove the top hit.
   await db.checkpoint("main");
   const proof = await db.prove(res.commit, res.hits[0].chunk);
   console.assert((await db.verify(proof)).valid);
@@ -290,7 +290,7 @@ For a Rust process talking to a remote `serve`. See
 ```rust
 use neleus_client::{Client, SearchOpts};
 let c = Client::connect("neleus://nlk_…@127.0.0.1:7117")?;
-let res = c.search("main", SearchOpts { query: Some("policy".into()), audit: true, ..Default::default() })?;
+let res = c.search("main", SearchOpts { query: Some("policy".into()), ..Default::default() })?;
 let text = String::from_utf8(c.blob_get(&res.hits[0].chunk)?)?;     // full chunk text
 let proof = c.prove(&res.commit, &res.hits[0].chunk, true)?;
 assert!(c.verify(&proof)?.valid);

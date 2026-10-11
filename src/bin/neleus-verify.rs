@@ -3,7 +3,7 @@
 //! auditor with the bundle; nothing else is needed.
 //!
 //! ```text
-//! neleus-verify bundle.nelaudit [--public-key <hex>] [--require-signature] [--json]
+//! neleus-verify bundle.nelaudit [--public-key <hex>] [--require-signature] [--anchor <checkpoint>] [--json]
 //! ```
 
 use std::path::PathBuf;
@@ -14,16 +14,18 @@ fn main() -> ExitCode {
     let mut bundle: Option<PathBuf> = None;
     let mut public_key: Option<String> = None;
     let mut require_signature = false;
+    let mut anchor: Option<String> = None;
     let mut json = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--public-key" => public_key = args.next(),
             "--require-signature" => require_signature = true,
+            "--anchor" => anchor = args.next(),
             "--json" => json = true,
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: neleus-verify <bundle> [--public-key <hex>] [--require-signature] [--json]"
+                    "usage: neleus-verify <bundle> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>] [--json]"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -39,7 +41,20 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
 
-    match neleus_db::audit::verify_bundle(&bundle, public_key.as_deref(), require_signature) {
+    let verified = match anchor.as_deref().map(str::parse::<neleus_db::Hash>) {
+        None => neleus_db::audit::verify_bundle(&bundle, public_key.as_deref(), require_signature),
+        Some(Ok(a)) => neleus_db::audit::verify_bundle_anchored(
+            &bundle,
+            public_key.as_deref(),
+            require_signature,
+            a,
+        ),
+        Some(Err(e)) => {
+            eprintln!("invalid --anchor: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match verified {
         Ok(report) => {
             if json {
                 println!(
@@ -53,6 +68,9 @@ fn main() -> ExitCode {
                         "commits": report.commits,
                         "checkpoints": report.checkpoints,
                         "checkpoints_signed": report.checkpoints_signed,
+                        "checkpoint_tip": report.checkpoint_tip,
+                        "log_size": report.log_size,
+                        "anchored": report.anchored,
                         "bundle_key_id": report.bundle_key_id,
                         "chain_complete": report.chain_complete,
                     })
@@ -63,13 +81,18 @@ fn main() -> ExitCode {
                     None => "unsigned".to_string(),
                 };
                 println!(
-                    "VERIFIED: {} retrievals on head '{}', {} — chain intact across {} commits, {} checkpoints ({} signed), period {}..{}",
+                    "VERIFIED: {} retrievals on head '{}', {} — chain intact across {} commits, checkpoint log of {} ({}){}, period {}..{}",
                     report.retrievals,
                     report.head,
                     signed,
                     report.commits,
-                    report.checkpoints,
-                    report.checkpoints_signed,
+                    report.log_size,
+                    report.checkpoint_tip.as_deref().unwrap_or("none"),
+                    if report.anchored {
+                        ", extends the given anchor"
+                    } else {
+                        ""
+                    },
                     report.from,
                     report.to,
                 );

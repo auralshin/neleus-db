@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use neleus_db::engine::SearchFilter;
-use neleus_db::{Engine, Hash};
+use neleus_db::{Engine, Hash, SearchQuery};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
@@ -85,39 +85,26 @@ impl Neleus {
         Ok((manifest.to_string(), commit.to_string()))
     }
 
-    /// Search. `at` is a head name or a commit hash (time-travel). `mode` is
+    /// Search `head` and record the retrieval on it. `commit` searches a past
+    /// commit instead (time-travel), still recorded on `head`. `mode` is
     /// "semantic", "vector", or "hybrid". Returns a list of
     /// `{chunk, score, preview}` dicts.
-    #[pyo3(signature = (at, query=None, embedding=None, mode="hybrid", top_k=10))]
+    #[pyo3(signature = (head, query=None, embedding=None, mode="hybrid", top_k=10, commit=None, principal=None))]
+    #[allow(clippy::too_many_arguments)]
     fn search<'py>(
         &self,
         py: Python<'py>,
-        at: &str,
+        head: &str,
         query: Option<&str>,
         embedding: Option<Vec<f32>>,
         mode: &str,
         top_k: usize,
+        commit: Option<&str>,
+        principal: Option<&str>,
     ) -> PyResult<Bound<'py, PyList>> {
-        let engine = self.engine.lock().map_err(err)?;
-        let commit = engine.resolve_commit(at).map_err(err)?;
-        let filter = SearchFilter::default();
-        let hits = match mode {
-            "semantic" => engine
-                .search_semantic(commit, query.unwrap_or(""), top_k, &filter)
-                .map_err(err)?,
-            "vector" => {
-                let e = embedding
-                    .ok_or_else(|| PyValueError::new_err("vector mode requires embedding"))?;
-                engine.search_vector(commit, &e, top_k, &filter).map_err(err)?
-            }
-            "hybrid" => engine
-                .search_hybrid(commit, query, embedding.as_deref(), top_k, &filter)
-                .map_err(err)?,
-            other => return Err(PyValueError::new_err(format!("unknown mode {other:?}"))),
-        };
-
+        let found = self.run_search(head, query, embedding, mode, top_k, commit, principal)?;
         let out = PyList::empty_bound(py);
-        for h in hits {
+        for h in found.hits {
             let d = PyDict::new_bound(py);
             d.set_item("chunk", h.chunk_hash.to_string())?;
             d.set_item("score", h.score)?;
@@ -207,16 +194,9 @@ impl Neleus {
         top_k: usize,
         principal: Option<&str>,
     ) -> PyResult<String> {
-        let engine = self.engine.lock().map_err(err)?;
-        let commit = engine.resolve_commit(head).map_err(err)?;
-        let filter = SearchFilter::default();
-        let hits = engine
-            .search_semantic(commit, query, top_k, &filter)
-            .map_err(err)?;
-        let qm = engine
-            .record_query_at_head(head, commit, "semantic", Some(query), None, top_k, &filter, principal, &hits)
-            .map_err(err)?;
-        Ok(qm.to_string())
+        let found =
+            self.run_search(head, Some(query), None, "semantic", top_k, None, principal)?;
+        Ok(found.record.to_string())
     }
 
     /// Append a checkpoint to the head's transparency-log chain.
@@ -251,6 +231,39 @@ impl Neleus {
             .append(head, session_id, role, content.as_bytes(), ttl_secs)
             .map_err(err)?;
         Ok(seq)
+    }
+}
+
+impl Neleus {
+    #[allow(clippy::too_many_arguments)]
+    fn run_search(
+        &self,
+        head: &str,
+        query: Option<&str>,
+        embedding: Option<Vec<f32>>,
+        mode: &str,
+        top_k: usize,
+        commit: Option<&str>,
+        principal: Option<&str>,
+    ) -> PyResult<neleus_db::Searched> {
+        let engine = self.engine.lock().map_err(err)?;
+        let at = commit.map(parse_hash).transpose()?;
+        let q = match mode {
+            "semantic" => SearchQuery::Semantic(query.unwrap_or("")),
+            "vector" => SearchQuery::Vector(
+                embedding
+                    .as_deref()
+                    .ok_or_else(|| PyValueError::new_err("vector mode requires embedding"))?,
+            ),
+            "hybrid" => SearchQuery::Hybrid {
+                text: query,
+                embedding: embedding.as_deref(),
+            },
+            other => return Err(PyValueError::new_err(format!("unknown mode {other:?}"))),
+        };
+        engine
+            .search(head, at, q, top_k, &SearchFilter::default(), principal)
+            .map_err(err)
     }
 }
 

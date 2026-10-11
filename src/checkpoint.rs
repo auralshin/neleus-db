@@ -17,10 +17,10 @@ use crate::merkle::{
 };
 use crate::signing::{Ed25519Signer, Ed25519Verifier, sign_raw};
 
-const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
+pub const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
 const CHECKPOINT_PAYLOAD_TAG: &[u8] = b"checkpoint_payload:";
 const CHECKPOINT_LEAF_TAG: &[u8] = b"checkpoint_leaf:";
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// Leaf for the append-only log over checkpointed commits.
 pub fn checkpoint_leaf(commit: CommitHash) -> MerkleLeaf {
@@ -73,6 +73,11 @@ pub struct Checkpoint {
     /// rebuild; its width is the popcount of the entry count.
     #[serde(default)]
     pub log_spine: Vec<Hash>,
+    /// Latest retrieval record as of `commit`. Pinning it lets a verifier
+    /// holding this checkpoint detect records dropped from the end of the
+    /// chain, not only gaps between records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_tip: Option<Hash>,
 }
 
 impl Checkpoint {
@@ -159,6 +164,7 @@ impl<'a> CheckpointStore<'a> {
             key_id: None,
             log_root: root_from_spine(&log_spine, count),
             log_spine,
+            query_tip: crate::audit::query_tip(self.db, Some(commit))?.map(|(h, _)| h),
         };
         if let Some(signer) = signer {
             let payload = checkpoint.payload_hash()?;

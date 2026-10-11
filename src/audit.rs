@@ -14,7 +14,9 @@
 //!
 //! Entries: `meta.json`, `summary.txt`, `retrievals.jsonl`,
 //! `objects/<hash>` (canonical commit + manifest bytes),
-//! `checkpoints/<hash>` (canonical checkpoint bytes).
+//! `checkpoints/<hash>` (the latest checkpoint; its Merkle root covers the
+//! rest), `pinned/<hash>` (the retrieval record it pins), and for an anchored
+//! export `anchor/<hash>` + `anchor_proof` (consistency from the anchor).
 //!
 //! The verifier needs no database and makes no network calls: every claim in
 //! the bundle is re-derived from the carried bytes by hash equations.
@@ -28,15 +30,16 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::canonical::{from_cbor, to_cbor};
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, CheckpointStore, verify_append_only};
 use crate::commit::{COMMIT_TAG, Commit, CommitHash};
 use crate::db::Database;
 use crate::hash::{Hash, hash_typed};
 use crate::manifest::{MANIFEST_TAG, QueryManifest};
+use crate::merkle::ConsistencyProof;
 use crate::signing::{Ed25519Signer, Ed25519Verifier, sign_raw};
 
 const BUNDLE_MAGIC: &[u8; 8] = b"NELAUDIT";
-const BUNDLE_VERSION: u32 = 1;
+const BUNDLE_VERSION: u32 = 2;
 const SIG_MAGIC: &[u8; 4] = b"SIG1";
 const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
 const MAX_WALK: usize = 1_000_000;
@@ -107,8 +110,15 @@ pub struct VerifyReport {
     pub to: u64,
     pub head: String,
     pub commits: usize,
+    /// Checkpoints carried: the latest one, or none.
     pub checkpoints: usize,
     pub checkpoints_signed: usize,
+    /// Commits in the checkpoint log the latest checkpoint's root covers.
+    pub log_size: u64,
+    /// Latest checkpoint digest; compare it with any anchor held out of band.
+    pub checkpoint_tip: Option<String>,
+    /// An anchor was given and its log is a prefix of the bundle's.
+    pub anchored: bool,
     pub bundle_key_id: Option<String>,
     /// Retrieval sequence numbers form a contiguous run: nothing was withheld
     /// between the first and last record in the window.
@@ -120,6 +130,51 @@ pub struct VerifyReport {
 fn decode_query_manifest(bytes: &[u8]) -> Option<QueryManifest> {
     let qm: QueryManifest = from_cbor(bytes).ok()?;
     (to_cbor(&qm).ok()? == bytes).then_some(qm)
+}
+
+/// Cache entry cap; overflow clears (perf reset, never a correctness event).
+const QUERY_TIP_CACHE_CAP: usize = 65_536;
+
+/// Latest retrieval record as of `commit`: the highest-sequence QueryManifest
+/// in the nearest first-parent commit that carries one. Derived from the
+/// commit graph rather than a ref, so a crash between committing a record and
+/// updating a ref cannot hand the next record a reused sequence number.
+pub fn query_tip(db: &Database, commit: Option<CommitHash>) -> Result<Option<(Hash, u64)>> {
+    let mut walked = Vec::new();
+    let mut cursor = commit;
+    let mut found = None;
+    while let Some(c) = cursor {
+        if let Some(hit) = db.query_tips.lock().expect("query tip cache").get(&c) {
+            found = *hit;
+            break;
+        }
+        if walked.len() >= MAX_WALK {
+            bail!("query tip walk exceeded {MAX_WALK} commits");
+        }
+        walked.push(c);
+        let commit = db.commit_store.get_commit(c)?;
+        let tip = commit
+            .manifests
+            .iter()
+            .filter_map(|&m| {
+                let bytes = db.manifest_store.raw_manifest_bytes(m).ok()?;
+                decode_query_manifest(&bytes).map(|qm| (m, qm.seq))
+            })
+            .max_by_key(|&(_, seq)| seq);
+        if tip.is_some() {
+            found = tip;
+            break;
+        }
+        cursor = commit.parents.first().copied();
+    }
+    let mut cache = db.query_tips.lock().expect("query tip cache");
+    if cache.len() + walked.len() > QUERY_TIP_CACHE_CAP {
+        cache.clear();
+    }
+    for c in walked {
+        cache.insert(c, found);
+    }
+    Ok(found)
 }
 
 /// Walk `head`'s first-parent chain and collect retrieval audit records in
@@ -201,6 +256,32 @@ pub fn export(
     out: &Path,
     signer: Option<&Ed25519Signer>,
 ) -> Result<ExportSummary> {
+    export_inner(db, head, from, to, out, signer, None)
+}
+
+/// [`export`] plus a consistency proof from the checkpoint `anchor`, which an
+/// auditor retained earlier, to the head's current checkpoint.
+pub fn export_anchored(
+    db: &Database,
+    head: &str,
+    from: u64,
+    to: u64,
+    out: &Path,
+    signer: Option<&Ed25519Signer>,
+    anchor: Hash,
+) -> Result<ExportSummary> {
+    export_inner(db, head, from, to, out, signer, Some(anchor))
+}
+
+fn export_inner(
+    db: &Database,
+    head: &str,
+    from: u64,
+    to: u64,
+    out: &Path,
+    signer: Option<&Ed25519Signer>,
+    anchor: Option<Hash>,
+) -> Result<ExportSummary> {
     let tip = db
         .refs
         .head_get(head)?
@@ -230,15 +311,38 @@ pub fn export(
         );
     }
 
-    // Checkpoint chain bytes, newest to genesis.
+    // Only the latest checkpoint: its Merkle root commits to every earlier
+    // one, and an anchor is tied to it by a consistency proof, not a walk.
     let mut checkpoints: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut pinned: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let checkpoint_tip = db.refs.checkpoint_get(head)?;
-    let mut cp_cursor = checkpoint_tip;
-    while let Some(h) = cp_cursor {
+    let mut tip_cp = None;
+    if let Some(h) = checkpoint_tip {
         let bytes = db.object_store.get_typed_bytes(CHECKPOINT_TAG, h)?;
         let cp: Checkpoint = from_cbor(&bytes)?;
+        if let Some(t) = cp.query_tip {
+            pinned.insert(t.to_string(), db.manifest_store.raw_manifest_bytes(t)?);
+        }
         checkpoints.push((h.to_string(), bytes));
-        cp_cursor = cp.prev;
+        tip_cp = Some(cp);
+    }
+    let mut anchor_entries: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(a) = anchor {
+        let tip_cp = tip_cp
+            .as_ref()
+            .ok_or_else(|| anyhow!("head '{head}' has no checkpoint to anchor against"))?;
+        let bytes = db.object_store.get_typed_bytes(CHECKPOINT_TAG, a)?;
+        let acp: Checkpoint = from_cbor(&bytes)?;
+        let old_count = usize::try_from(acp.sequence)?
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("anchor {a}: sequence out of range"))?;
+        let (old_root, new_root, proof) =
+            CheckpointStore::new(db).prove_append_only(head, old_count)?;
+        if acp.head != head || old_root != acp.log_root || new_root != tip_cp.log_root {
+            bail!("anchor {a} is not in head '{head}''s checkpoint log");
+        }
+        anchor_entries.push((format!("anchor/{a}"), bytes));
+        anchor_entries.push(("anchor_proof".into(), to_cbor(&proof)?));
     }
 
     let meta = BundleMeta {
@@ -297,6 +401,10 @@ pub fn export(
     for (name, bytes) in &checkpoints {
         entries.push((format!("checkpoints/{name}"), bytes.clone()));
     }
+    for (name, bytes) in pinned {
+        entries.push((format!("pinned/{name}"), bytes));
+    }
+    entries.extend(anchor_entries);
 
     let bundle = build_bundle(&entries, signer);
     File::create(out)
@@ -318,6 +426,7 @@ pub fn export_bytes(
     from: u64,
     to: u64,
     signer: Option<&Ed25519Signer>,
+    anchor: Option<Hash>,
 ) -> Result<(Vec<u8>, ExportSummary)> {
     // Stage inside the database, not the shared temp dir: a PID-derived name in
     // /tmp is guessable, so a local attacker could pre-create it as a symlink
@@ -327,7 +436,7 @@ pub fn export_bytes(
     let dir = db.root.join("meta");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(crate::atomic::build_temp_name("export")?);
-    let outcome = export(db, head, from, to, &path, signer).and_then(|summary| {
+    let outcome = export_inner(db, head, from, to, &path, signer, anchor).and_then(|summary| {
         let bytes = std::fs::read(&path)?;
         Ok((bytes, summary))
     });
@@ -426,6 +535,26 @@ pub fn verify_bundle(
     path: &Path,
     public_key: Option<&str>,
     require_signature: bool,
+) -> Result<VerifyReport> {
+    verify_inner(path, public_key, require_signature, None)
+}
+
+/// [`verify_bundle`], and check that the checkpoint `anchor` the auditor
+/// retained is a prefix of the bundle's checkpoint log.
+pub fn verify_bundle_anchored(
+    path: &Path,
+    public_key: Option<&str>,
+    require_signature: bool,
+    anchor: Hash,
+) -> Result<VerifyReport> {
+    verify_inner(path, public_key, require_signature, Some(anchor))
+}
+
+fn verify_inner(
+    path: &Path,
+    public_key: Option<&str>,
+    require_signature: bool,
+    anchor: Option<Hash>,
 ) -> Result<VerifyReport> {
     let (entries, footer, trailer) = read_bundle(path)?;
 
@@ -602,48 +731,85 @@ pub fn verify_bundle(
         );
     }
 
-    // Checkpoint chain: hashes, prev-links, sequences, signatures.
-    let mut checkpoints_count = 0usize;
+    // Latest checkpoint: hash, pinned record, signature, and that it pins a
+    // commit inside the exported history.
     let mut checkpoints_signed = 0usize;
-    if let Some(cp_tip) = &meta.checkpoint_tip {
-        let mut cursor = Some(cp_tip.clone());
-        let mut expected_seq: Option<u64> = None;
-        while let Some(h) = cursor {
-            let bytes = entries
-                .get(&format!("checkpoints/{h}"))
-                .ok_or_else(|| anyhow!("checkpoint {h} bytes missing"))?;
-            let claimed: Hash = h.parse()?;
-            if hash_typed(CHECKPOINT_TAG, bytes) != claimed {
-                bail!("checkpoint {h} bytes do not match its hash");
+    let mut tip_cp: Option<Checkpoint> = None;
+    if let Some(h) = &meta.checkpoint_tip {
+        let bytes = entries
+            .get(&format!("checkpoints/{h}"))
+            .ok_or_else(|| anyhow!("checkpoint {h} bytes missing"))?;
+        let claimed: Hash = h.parse()?;
+        if hash_typed(CHECKPOINT_TAG, bytes) != claimed {
+            bail!("checkpoint {h} bytes do not match its hash");
+        }
+        let cp: Checkpoint = from_cbor(bytes)?;
+        if cp.head != meta.head || !reachable.contains(&cp.commit.to_string()) {
+            bail!(
+                "checkpoint {h} pins commit {} outside the exported history",
+                cp.commit
+            );
+        }
+        // Gaps only show between records; the pin shows a missing tail.
+        if let Some(t) = cp.query_tip {
+            let bytes = entries.get(&format!("pinned/{t}")).ok_or_else(|| {
+                anyhow!("checkpoint {h} pins record {t}, whose bytes are missing")
+            })?;
+            if hash_typed(MANIFEST_TAG, bytes) != t {
+                bail!("pinned record {t} bytes do not match its hash");
             }
-            let cp: Checkpoint = from_cbor(bytes)?;
-            if let Some(exp) = expected_seq
-                && cp.sequence != exp
+            let qm = decode_query_manifest(bytes)
+                .ok_or_else(|| anyhow!("pinned object {t} is not a QueryManifest"))?;
+            if qm.executed_at >= meta.from
+                && qm.executed_at <= meta.to
+                && !recorded.contains(t.to_string().as_str())
             {
-                bail!("checkpoint chain sequence break at {h}");
-            }
-            // Genesis is exactly "sequence 0 and no predecessor"; without both
-            // directions a forged `sequence: 0` carrying a `prev` resets the
-            // chain, because `checked_sub` then skips every check below it.
-            if cp.prev.is_none() != (cp.sequence == 0) {
                 bail!(
-                    "checkpoint {h} has sequence {} but a mismatched predecessor",
-                    cp.sequence
+                    "checkpoint {h} pins retrieval record {t} (sequence {}), which the \
+                     bundle omits: the record chain was truncated",
+                    qm.seq
                 );
             }
-            expected_seq = cp.sequence.checked_sub(1);
-            match (&cp.signature, &verifier) {
-                (Some(sig), Some(v)) => {
-                    let payload = cp.payload_hash()?;
-                    v.verify_raw(payload.as_bytes(), sig)
-                        .map_err(|e| anyhow!("checkpoint {h}: {e}"))?;
-                    checkpoints_signed += 1;
-                }
-                (Some(_), None) => checkpoints_signed += 1,
-                (None, _) => {}
+        }
+        match (&cp.signature, &verifier) {
+            (Some(sig), Some(v)) => {
+                let payload = cp.payload_hash()?;
+                v.verify_raw(payload.as_bytes(), sig)
+                    .map_err(|e| anyhow!("checkpoint {h}: {e}"))?;
+                checkpoints_signed += 1;
             }
-            checkpoints_count += 1;
-            cursor = cp.prev.map(|p| p.to_string());
+            (Some(_), None) => checkpoints_signed += 1,
+            (None, _) => {}
+        }
+        tip_cp = Some(cp);
+    }
+
+    // Anchor: the auditor's retained checkpoint must be a prefix of this log.
+    if let Some(a) = anchor {
+        let tip = tip_cp
+            .as_ref()
+            .ok_or_else(|| anyhow!("bundle carries no checkpoint to check anchor {a} against"))?;
+        let bytes = entries
+            .get(&format!("anchor/{a}"))
+            .ok_or_else(|| anyhow!("bundle was not exported against anchor {a}"))?;
+        if hash_typed(CHECKPOINT_TAG, bytes) != a {
+            bail!("anchor {a} bytes do not match its hash");
+        }
+        let acp: Checkpoint = from_cbor(bytes)?;
+        let proof: ConsistencyProof = from_cbor(
+            entries
+                .get("anchor_proof")
+                .ok_or_else(|| anyhow!("anchor proof missing"))?,
+        )?;
+        let counts_match = u64::try_from(proof.old_count).ok() == acp.sequence.checked_add(1)
+            && u64::try_from(proof.new_count).ok() == tip.sequence.checked_add(1);
+        if acp.head != tip.head
+            || !counts_match
+            || !verify_append_only(acp.log_root, tip.log_root, &proof)
+        {
+            bail!(
+                "anchor {a} is not a prefix of the bundle's checkpoint log: history was rewritten"
+            );
         }
     }
 
@@ -653,8 +819,11 @@ pub fn verify_bundle(
         to: meta.to,
         head: meta.head,
         commits: reachable.len(),
-        checkpoints: checkpoints_count,
+        checkpoints: usize::from(tip_cp.is_some()),
         checkpoints_signed,
+        log_size: tip_cp.as_ref().map_or(0, |c| c.sequence + 1),
+        checkpoint_tip: meta.checkpoint_tip.clone(),
+        anchored: anchor.is_some(),
         bundle_key_id,
         chain_complete: complete,
     })
@@ -691,7 +860,7 @@ mod tests {
             .unwrap();
         for i in 0..3 {
             let hits = engine
-                .search_semantic(commit, "retrieval corpus", 5, &SearchFilter::default())
+                .search_semantic_unrecorded(commit, "retrieval corpus", 5, &SearchFilter::default())
                 .unwrap();
             engine
                 .record_query_at_head(
@@ -709,6 +878,131 @@ mod tests {
         }
         let db = Database::open(&root).unwrap();
         (tmp, db, "main".to_string())
+    }
+
+    #[test]
+    fn record_chain_continues_across_handles_and_unrelated_commits() {
+        let (tmp, db, head) = db_with_audited_queries();
+        let root = tmp.path().join("db");
+        let a = Engine::open(&root).unwrap();
+        let b = Engine::open(&root).unwrap();
+        let commit = db.refs.head_get(&head).unwrap().unwrap();
+        let record = |e: &Engine| {
+            e.record_query_at_head(
+                &head,
+                commit,
+                "semantic",
+                Some("q"),
+                None,
+                5,
+                &SearchFilter::default(),
+                None,
+                &[],
+            )
+            .unwrap()
+        };
+        // Each handle has its own tip cache; the chain must not fork.
+        record(&a);
+        record(&b);
+        db.create_commit_at_head(&head, "t", "unrelated", vec![])
+            .unwrap();
+        record(&a);
+        let (mut records, _) = collect(&db, &head, 0, u64::MAX).unwrap();
+        records.sort_by_key(|r| r.seq);
+        let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4, 5]);
+        for w in records.windows(2) {
+            assert_eq!(w[1].prev.as_deref(), Some(w[0].manifest.as_str()));
+        }
+    }
+
+    #[test]
+    fn concurrent_records_share_commits_and_stay_gapless() {
+        let (tmp, db, head) = db_with_audited_queries();
+        let engine = std::sync::Arc::new(Engine::open(tmp.path().join("db")).unwrap());
+        let commit = db.refs.head_get(&head).unwrap().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for t in 0..8 {
+                let (engine, barrier, head) = (engine.clone(), barrier.clone(), head.clone());
+                s.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..5 {
+                        let p = format!("t{t}");
+                        let f = SearchFilter::default();
+                        engine
+                            .record_query_at_head(
+                                &head,
+                                commit,
+                                "semantic",
+                                Some("q"),
+                                None,
+                                5,
+                                &f,
+                                Some(&p),
+                                &[],
+                            )
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let (mut records, carrying) = collect(&db, &head, 0, u64::MAX).unwrap();
+        records.sort_by_key(|r| r.seq);
+        assert_eq!(records.len(), 43);
+        assert!(records.iter().enumerate().all(|(i, r)| r.seq == i as u64));
+        for w in records.windows(2) {
+            assert_eq!(w[1].prev.as_deref(), Some(w[0].manifest.as_str()));
+        }
+        assert!(
+            carrying.len() < records.len(),
+            "concurrent records never batched"
+        );
+    }
+
+    #[test]
+    fn anchored_export_proves_the_log_only_grew() {
+        let (tmp, db, head) = db_with_audited_queries();
+        let store = CheckpointStore::new(&db);
+        let anchor = store.create(&head, None).unwrap();
+        db.create_commit_at_head(&head, "t", "later", vec![])
+            .unwrap();
+        let later = store.create(&head, None).unwrap();
+
+        let out = tmp.path().join("anchored.nelaudit");
+        export_anchored(&db, &head, 0, u64::MAX, &out, None, anchor).unwrap();
+        let report = verify_bundle_anchored(&out, None, false, anchor).unwrap();
+        assert!(report.anchored);
+        assert_eq!(report.log_size, 2);
+        assert_eq!(report.checkpoint_tip, Some(later.to_string()));
+
+        // Wrong anchor, or a bundle exported without one, does not verify.
+        assert!(verify_bundle_anchored(&out, None, false, later).is_err());
+        let plain = tmp.path().join("plain.nelaudit");
+        export(&db, &head, 0, u64::MAX, &plain, None).unwrap();
+        verify_bundle(&plain, None, false).unwrap();
+        assert!(verify_bundle_anchored(&plain, None, false, anchor).is_err());
+
+        // A tampered consistency proof is caught even with a repaired footer.
+        let (mut entries, _, _) = read_bundle(&out).unwrap();
+        let mut proof: ConsistencyProof = from_cbor(&entries["anchor_proof"]).unwrap();
+        proof.nodes.push(Hash::zero());
+        entries.insert("anchor_proof".into(), to_cbor(&proof).unwrap());
+        let forged = tmp.path().join("forged.nelaudit");
+        let entries: Vec<(String, Vec<u8>)> = entries.into_iter().collect();
+        fs::write(&forged, build_bundle(&entries, None)).unwrap();
+        assert!(verify_bundle_anchored(&forged, None, false, anchor).is_err());
+
+        // The exporter refuses an anchor from another log.
+        let other_tmp = TempDir::new().unwrap();
+        let other = other_tmp.path().join("db");
+        Database::init(&other).unwrap();
+        let other = Database::open(&other).unwrap();
+        other
+            .create_commit_at_head(&head, "t", "x", vec![])
+            .unwrap();
+        let foreign = CheckpointStore::new(&other).create(&head, None).unwrap();
+        assert!(export_anchored(&db, &head, 0, u64::MAX, &out, None, foreign).is_err());
     }
 
     #[test]

@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use crate::auth::{AuthRegistry, Principal, Role};
-use crate::engine::{Engine, SearchFilter};
+use crate::engine::{Engine, SearchFilter, SearchQuery};
 use crate::hash::Hash;
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -1113,14 +1113,15 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                     has_provenance,
                 },
             )?;
-            let prompt = db.blob_store.put(
+            let blobs = db.blob_store.for_head(head);
+            let prompt = blobs.put(
                 v.get("prompt")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .as_bytes(),
             )?;
             let system_prompt = match v.get("system_prompt").and_then(Value::as_str) {
-                Some(sp) => Some(db.blob_store.put(sp.as_bytes())?),
+                Some(sp) => Some(blobs.put(sp.as_bytes())?),
                 None => None,
             };
             let model_parameters = match v.get("model_parameters") {
@@ -1130,10 +1131,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                     let canonical: std::collections::BTreeMap<String, Value> =
                         serde_json::from_value(params.clone())
                             .map_err(|e| anyhow!("bad request: model_parameters: {e}"))?;
-                    Some(
-                        db.blob_store
-                            .put(serde_json::to_string(&canonical)?.as_bytes())?,
-                    )
+                    Some(blobs.put(serde_json::to_string(&canonical)?.as_bytes())?)
                 }
             };
 
@@ -1238,11 +1236,17 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             require(req, Role::Reader)?;
             let v = parse_json(&req.body)?;
             let at = str_field(&v, "at")?;
-            // Commit hashes pass: results are tenant-filtered below.
-            if at.len() != 64 {
-                scope_head(req, at)?;
+            // Every search is recorded on a head, so `at` must name one; a past
+            // commit is searched via `commit` and still recorded on `at`.
+            if at.len() == 64 {
+                bail!("bad request: 'at' must name a head; pass a commit hash as 'commit'");
             }
-            let commit = engine.resolve_commit(at)?;
+            scope_head(req, at)?;
+            // Results are tenant-filtered below.
+            let at_commit = match v.get("commit") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(hash_field(&v, "commit")?),
+            };
             let mode = v.get("mode").and_then(Value::as_str).unwrap_or("hybrid");
             let top_k =
                 (v.get("top_k").and_then(Value::as_u64).unwrap_or(10) as usize).min(MAX_TOP_K);
@@ -1255,62 +1259,37 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                         .map_err(|e| anyhow!("bad request: invalid embedding: {e}"))?,
                 ),
             };
-
-            let hits = match mode {
-                "semantic" => engine.search_semantic(
-                    commit,
+            let search_query = match mode {
+                "semantic" => SearchQuery::Semantic(
                     query.ok_or_else(|| anyhow!("bad request: semantic mode needs 'query'"))?,
-                    top_k,
-                    &filter,
-                )?,
-                "vector" => engine.search_vector(
-                    commit,
+                ),
+                "vector" => SearchQuery::Vector(
                     embedding
                         .as_deref()
                         .ok_or_else(|| anyhow!("bad request: vector mode needs 'embedding'"))?,
-                    top_k,
-                    &filter,
-                )?,
-                "hybrid" => {
-                    engine.search_hybrid(commit, query, embedding.as_deref(), top_k, &filter)?
-                }
+                ),
+                "hybrid" => SearchQuery::Hybrid {
+                    text: query,
+                    embedding: embedding.as_deref(),
+                },
                 other => bail!("bad request: unknown mode '{other}'"),
             };
 
-            let audit = v.get("audit").and_then(Value::as_bool).unwrap_or(false);
-            // The record is committed, so it needs a head to append to; a raw
-            // commit hash has none.
-            let audit_manifest = if audit {
-                if at.len() == 64 {
-                    bail!(
-                        "bad request: 'audit' requires 'at' to name a head, not a commit hash \
-                         (the record must be committed to a head to be exportable)"
-                    );
-                }
-                // Recording the query commits a QueryManifest and advances the
-                // head, so it is a write however it is spelled: a reader key
-                // must not be able to grow the DAG or move a ref.
-                require(req, Role::Writer)?;
-                let _w = state.write_lock.lock().expect("write lock poisoned");
-                gate_write(db, req, "search", at)?;
-                Some(
-                    engine
-                        .record_query_at_head(
-                            at,
-                            commit,
-                            mode,
-                            query,
-                            embedding.as_deref(),
-                            top_k,
-                            &filter,
-                            principal_id(req).as_deref(),
-                            &hits,
-                        )?
-                        .to_string(),
-                )
-            } else {
-                None
-            };
+            // Recorded for every principal, readers included: an unrecorded
+            // search is exactly what the gapless sequence cannot reveal. No
+            // write lock: concurrent searches share one record commit, and the
+            // commit itself is CAS-safe.
+            gate_write(db, req, "search", at)?;
+            let found = engine.search(
+                at,
+                at_commit,
+                search_query,
+                top_k,
+                &filter,
+                principal_id(req).as_deref(),
+            )?;
+            let (commit, hits, audit_manifest) =
+                (found.commit, found.hits, found.record.to_string());
 
             let hits_json: Vec<Value> = hits
                 .iter()
@@ -1348,7 +1327,13 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             if include && req.principal.as_ref().is_some_and(|p| p.tenant.is_some()) {
                 bail!("forbidden: include_content proofs are not available to tenant-scoped keys");
             }
-            let proof = engine.prove(commit, chunk, include)?;
+            let proof = match v.get("anchor_head") {
+                None | Some(Value::Null) => engine.prove(commit, chunk, include)?,
+                Some(_) => {
+                    let head = scope_head(req, str_field(&v, "anchor_head")?)?;
+                    engine.prove_anchored(head, commit, chunk, include)?
+                }
+            };
             use base64::Engine as _;
             let bundle = base64::engine::general_purpose::STANDARD
                 .encode(crate::canonical::to_cbor(&proof)?);
@@ -1365,7 +1350,14 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let proof: crate::retrieval_proof::ChunkProof = crate::canonical::from_cbor(&bytes)
                 .map_err(|e| anyhow!("bad request: not a chunk proof: {e}"))?;
             match crate::retrieval_proof::verify_chunk_proof(&proof) {
-                Ok(kind) => Ok(Response::Json(200, json!({"valid": true, "anchor": kind}))),
+                Ok(kind) => Ok(Response::Json(
+                    200,
+                    json!({
+                        "valid": true,
+                        "anchor": kind,
+                        "checkpoint": proof.anchor_checkpoint().map(|h| h.to_string()),
+                    }),
+                )),
                 Err(e) => Ok(Response::Json(
                     200,
                     json!({"valid": false, "error": e.to_string()}),
@@ -1527,12 +1519,22 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
             let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
+            let anchor = match v.get("anchor") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(hash_field(&v, "anchor")?),
+            };
             // Signed when `--sign-key` is configured. Without it the bundle
             // carries only the unkeyed integrity footer: that detects corruption
             // and a careless edit, but anyone modifying the file recomputes it,
             // so an unsigned bundle is NOT evidence against its own exporter.
-            let (bytes, _) =
-                crate::audit::export_bytes(db, head, from, to, state.audit_signer.as_ref())?;
+            let (bytes, _) = crate::audit::export_bytes(
+                db,
+                head,
+                from,
+                to,
+                state.audit_signer.as_ref(),
+                anchor,
+            )?;
             Ok(Response::Bytes("application/octet-stream", bytes))
         }
 
@@ -1831,8 +1833,7 @@ mod tests {
                 "at": "main",
                 "mode": "semantic",
                 "query": "rust systems",
-                "top_k": 5,
-                "audit": true
+                "top_k": 5
             }),
         );
         let hits = search["hits"].as_array().unwrap();
@@ -1919,7 +1920,12 @@ mod tests {
             &url,
             "/v1/search",
             Some(&rival),
-            serde_json::json!({"at": commit, "mode": "semantic", "query": "roadmap secret"}),
+            serde_json::json!({
+                "at": "rival/kb",
+                "commit": commit,
+                "mode": "semantic",
+                "query": "roadmap secret"
+            }),
         );
         assert!(
             cross["hits"].as_array().unwrap().is_empty(),
@@ -1944,6 +1950,60 @@ mod tests {
     }
 
     #[test]
+    fn every_search_is_recorded() {
+        let tmp = TempDir::new().unwrap();
+        let (handle, url, token) = start_server(&tmp, false);
+        let reader = add_key(&tmp.path().join("db"), "reader", Role::Reader, None).unwrap();
+        let doc = post_json(
+            &url,
+            "/v1/documents",
+            token.as_deref(),
+            serde_json::json!({"head": "main", "source": "kb", "text": "recorded policy text"}),
+        );
+        let commit = doc["commit"].as_str().unwrap();
+
+        // A reader cannot opt out: each search lands in the head's chain.
+        for body in [
+            serde_json::json!({"at": "main", "mode": "semantic", "query": "policy"}),
+            serde_json::json!({"at": "main", "commit": commit, "mode": "semantic", "query": "policy"}),
+        ] {
+            let res = post_json(&url, "/v1/search", Some(&reader), body);
+            assert!(res["audit_manifest"].is_string(), "{res}");
+        }
+        let queries = post_json(
+            &url,
+            "/v1/audit/queries",
+            token.as_deref(),
+            serde_json::json!({"head": "main"}),
+        );
+        let mut seqs: Vec<u64> = queries["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["seq"].as_u64().unwrap())
+            .collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![0, 1]);
+
+        // No head to record on, so a bare commit hash is refused.
+        let bare = http_request(
+            &url,
+            "POST",
+            "/v1/search",
+            Some(&reader),
+            &[("content-type", "application/json")],
+            Some(
+                serde_json::json!({"at": commit, "query": "policy"})
+                    .to_string()
+                    .as_bytes(),
+            ),
+        );
+        assert!(bare.is_err());
+
+        handle.shutdown();
+    }
+
+    #[test]
     fn compliance_and_audit_endpoints() {
         let tmp = TempDir::new().unwrap();
         let (handle, url, token) = start_server(&tmp, false);
@@ -1959,7 +2019,7 @@ mod tests {
             &url,
             "/v1/search",
             token,
-            serde_json::json!({"at": "main", "mode": "semantic", "query": "policy", "audit": true}),
+            serde_json::json!({"at": "main", "mode": "semantic", "query": "policy"}),
         );
         // An audited search commits its own record; no follow-up commit needed.
         assert!(search["audit_manifest"].is_string());
@@ -2047,7 +2107,7 @@ mod tests {
             &url,
             "/v1/search",
             token,
-            serde_json::json!({"at": "main", "mode": "semantic", "query": "corpus", "audit": true}),
+            serde_json::json!({"at": "main", "mode": "semantic", "query": "corpus"}),
         );
 
         let bundle = http_request(
@@ -2357,7 +2417,8 @@ mod tests {
         let (handle, url, token) = start_server(&tmp, false);
 
         let source_root = tmp.path().join("source");
-        Database::init(&source_root).unwrap();
+        let key = Database::open(tmp.path().join("db")).unwrap().config.secret;
+        Database::init_with_secret(&source_root, &key).unwrap();
         let source = Database::open(&source_root).unwrap();
         source.blob_store.put(b"pushed payload").unwrap();
         crate::sync::push(&source, &url, token.as_deref()).unwrap();
@@ -2392,19 +2453,28 @@ mod tests {
             }),
         );
 
-        // A second database pulls the first via HTTP.
+        // A second database clones the first via HTTP, then pulls again.
         let replica_root = tmp.path().join("replica");
-        Database::init(&replica_root).unwrap();
-        let replica = Database::open(&replica_root).unwrap();
-        let report = crate::sync::pull(&replica, &url, token).unwrap();
+        let report = crate::sync::clone(&replica_root, &url, token).unwrap();
         assert!(report.objects_added > 0);
         assert_eq!(report.refs_updated, vec!["main".to_string()]);
+        let replica = Database::open(&replica_root).unwrap();
+        assert!(
+            crate::sync::pull(&replica, &url, token)
+                .unwrap()
+                .refs_updated
+                .is_empty()
+        );
+
+        // Same boundary key, so a write lands on the same root on both sides.
+        let primary = Database::open(tmp.path().join("db")).unwrap();
+        assert_eq!(primary.config.secret, replica.config.secret);
 
         // The replica can answer the same query locally.
         let replica_engine = Engine::open(&replica_root).unwrap();
         let commit = replica_engine.resolve_commit("main").unwrap();
         let hits = replica_engine
-            .search_semantic(commit, "replicated knowledge", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(commit, "replicated knowledge", 5, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty());
 

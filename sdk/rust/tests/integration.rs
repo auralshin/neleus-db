@@ -79,13 +79,12 @@ fn health_and_ingest_search_prove_verify() {
             SearchOpts {
                 query: Some("verifiable audit trails".into()),
                 mode: Some("semantic".into()),
-                audit: true,
                 ..Default::default()
             },
         )
         .unwrap();
     assert!(!res.hits.is_empty());
-    assert!(res.audit_manifest.is_some());
+    assert!(!res.audit_manifest.is_empty());
 
     let proof = c.prove(&res.commit, &res.hits[0].chunk, true).unwrap();
     let verdict = c.verify(&proof).unwrap();
@@ -106,12 +105,11 @@ fn audit_surfaces() {
             SearchOpts {
                 query: Some("policy".into()),
                 mode: Some("semantic".into()),
-                audit: true,
                 ..Default::default()
             },
         )
         .unwrap();
-    let qm = res.audit_manifest.unwrap();
+    let qm = res.audit_manifest;
     c.commit("main", "audit", &[qm]).unwrap();
     c.checkpoint("main").unwrap();
 

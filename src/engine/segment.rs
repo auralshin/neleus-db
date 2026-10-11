@@ -154,6 +154,17 @@ pub struct IndexSegment {
     /// which is what old segments and untenanted corpora get.
     #[serde(default)]
     pub tenants: BTreeMap<String, Vec<u32>>,
+    /// Graphs over each large tenant's own vectors, so a tenant query never
+    /// traverses, or takes time proportional to, other tenants' nodes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_graphs: BTreeMap<String, TenantGraph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TenantGraph {
+    /// Local graph node `i` is vector node `nodes[i]`, ascending.
+    pub nodes: Vec<u32>,
+    pub graph: HnswGraph,
 }
 
 /// Retrieval filter over [`ChunkMetadata`]; conditions AND together.
@@ -330,6 +341,30 @@ impl IndexSegment {
                 tenants.entry(t.to_string()).or_default().push(doc as u32);
             }
         }
+        let tenant_graphs = tenants
+            .iter()
+            .filter_map(|(t, docs)| {
+                let nodes: Vec<u32> = docs
+                    .iter()
+                    .filter_map(|d| vec_docs.binary_search(d).ok().map(|n| n as u32))
+                    .collect();
+                if nodes.len() < HNSW_BUILD_THRESHOLD {
+                    return None;
+                }
+                let own: Vec<Vec<f32>> = nodes
+                    .iter()
+                    .map(|&n| vec_data[n as usize].clone())
+                    .collect();
+                let graph = if vector_dim.unwrap_or(0) >= SQ8_MIN_DIM {
+                    let (codes, scales): (Vec<Vec<u8>>, Vec<f32>) =
+                        own.iter().map(|v| quantize(v)).unzip();
+                    HnswGraph::build_quantized(&codes, &scales)
+                } else {
+                    HnswGraph::build(&own)
+                }?;
+                Some((t.clone(), TenantGraph { nodes, graph }))
+            })
+            .collect();
 
         Self {
             schema_version: SEGMENT_SCHEMA_VERSION,
@@ -346,6 +381,7 @@ impl IndexSegment {
             hnsw,
             any_acl,
             tenants,
+            tenant_graphs,
         }
     }
 
@@ -617,6 +653,23 @@ impl IndexSegment {
             return Vec::new();
         }
 
+        // A tenant query stays inside its partition: its own graph or an exact
+        // scan, chosen by the partition's size, never the shared graph.
+        if let (Some(tenant), Some(nodes)) = (&filter.tenant, &allowed_nodes)
+            && !self.tenants.is_empty()
+        {
+            let results = match self.tenant_graphs.get(tenant) {
+                Some(tg)
+                    if nodes.len() > EXACT_SCAN_LIMIT
+                        && nodes.len() * GRAPH_MIN_VISIBLE_FRACTION >= tg.nodes.len() =>
+                {
+                    self.tenant_graph_search(tg, nodes, &q, top_k)
+                }
+                _ => exact_search_over(&self.vec_data, nodes, &q, top_k),
+            };
+            return self.vector_hits(results);
+        }
+
         // Graph only when it can actually prune: a large candidate set *and* a
         // filter that leaves most of the segment visible.
         let graph_pays = candidate_count > EXACT_SCAN_LIMIT
@@ -683,6 +736,60 @@ impl IndexSegment {
             },
         };
 
+        self.vector_hits(results)
+    }
+
+    /// Search `tg` restricted to `allowed` vector nodes (a subset of its
+    /// partition), reranked in f32. Returns `(score, vector node)`.
+    fn tenant_graph_search(
+        &self,
+        tg: &TenantGraph,
+        allowed: &[u32],
+        q: &[f32],
+        top_k: usize,
+    ) -> Vec<(f32, u32)> {
+        let mask: Option<Vec<bool>> = (allowed.len() < tg.nodes.len()).then(|| {
+            let mut ok = vec![false; tg.nodes.len()];
+            for n in allowed {
+                if let Ok(i) = tg.nodes.binary_search(n) {
+                    ok[i] = true;
+                }
+            }
+            ok
+        });
+        let predicate = mask.as_ref().map(|m| move |local: u32| m[local as usize]);
+        let pred_ref: Option<&dyn Fn(u32) -> bool> =
+            predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
+        let q8 = (self.vec_q.len() == self.vec_data.len() && q.len() >= SQ8_MIN_DIM)
+            .then(|| quantize(q));
+        let dist = |local: u32| -> f32 {
+            let i = tg.nodes[local as usize] as usize;
+            match &q8 {
+                Some((codes, scale)) => {
+                    1.0 - dot_q(codes, &self.vec_q[i]) as f32 * scale * self.vec_scale[i]
+                }
+                None => 1.0 - dot(q, &self.vec_data[i]),
+            }
+        };
+        let ef = EF_SEARCH.max(top_k * 4);
+        let mut hits = tg
+            .graph
+            .search_with(&dist, tg.nodes.len(), top_k * 4, ef, pred_ref);
+        for h in hits.iter_mut() {
+            h.1 = tg.nodes[h.1 as usize];
+            h.0 = dot(q, &self.vec_data[h.1 as usize]);
+        }
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        hits.truncate(top_k);
+        // Same completeness guard as the shared graph.
+        if hits.len() >= top_k.min(allowed.len()) {
+            hits
+        } else {
+            exact_search_over(&self.vec_data, allowed, q, top_k)
+        }
+    }
+
+    fn vector_hits(&self, results: Vec<(f32, u32)>) -> Vec<SegmentHit> {
         results
             .into_iter()
             .map(|(score, node)| {
@@ -1129,6 +1236,56 @@ mod tests {
             seg.vector(&[1.0, 0.0, 0.0], 5, &SearchFilter::default())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tenant_vector_search_is_independent_of_other_tenants() {
+        let vec_of = |i: usize| {
+            let mut v: Vec<f32> = (0..16)
+                .map(|j| {
+                    let x = ((i * 16 + j) as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15)
+                        .rotate_left(31);
+                    ((x % 2000) as f32 / 1000.0) - 1.0
+                })
+                .collect();
+            super::super::vector::normalize(&mut v);
+            v
+        };
+        let owned = |i: usize, t: &str| ChunkInput {
+            meta: Some(ChunkMetadata {
+                tenant: Some(t.into()),
+                ..Default::default()
+            }),
+            ..chunk_with_vec(i, "filler", vec_of(i))
+        };
+        let a: Vec<ChunkInput> = (0..1100).map(|i| owned(i, "a")).collect();
+        let filter = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let alone = IndexSegment::build(vec![], a.clone());
+        let mut crowded = a;
+        crowded.extend((5000..6500).map(|i| owned(i, "b")));
+        let crowded = IndexSegment::build(vec![], crowded);
+        assert!(crowded.tenant_graphs.contains_key("a"));
+        assert!(crowded.tenant_graphs.contains_key("b"));
+
+        for i in [0usize, 7, 300, 1099] {
+            let q = vec_of(i);
+            let x: Vec<u32> = alone
+                .vector(&q, 10, &filter)
+                .iter()
+                .map(|h| h.doc)
+                .collect();
+            let y: Vec<u32> = crowded
+                .vector(&q, 10, &filter)
+                .iter()
+                .map(|h| h.doc)
+                .collect();
+            assert_eq!(x, y, "tenant a's answer moved with tenant b's data");
+            assert_eq!(x[0], i as u32, "self-recall failed for {i}");
+        }
     }
 
     #[test]

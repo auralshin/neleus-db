@@ -26,7 +26,13 @@ fn bench_blob_put_get(c: &mut Criterion) {
 fn bench_blob_put_compressed(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     // Enable compression
-    let bs = BlobStore::with_runtime_options(dir.path(), false, true, None);
+    let bs = BlobStore::with_runtime_options(
+        dir.path(),
+        false,
+        true,
+        None,
+        neleus_db::hash::Key([0; 32]),
+    );
     bs.ensure_dir().unwrap();
 
     // Repetitive data compresses well

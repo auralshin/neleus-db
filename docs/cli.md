@@ -15,7 +15,7 @@ map.
 
 | Command | What it does |
 |---|---|
-| `db init <path>` | Create a new database. |
+| `db init <path> [--replica-of <url>] [--token-env <VAR>]` | Create a new database; `--replica-of` clones a `serve` peer and adopts its database secret, which later pulls and pushes require. |
 | `db reencrypt --new-password-env <VAR>` | Rotate the encryption password (re-wraps ciphertext; `master_salt` unchanged). |
 | `db pack <out> [--compress]` | Export the whole DB to one self-contained file. |
 | `db unpack <input> [--force] [--verify-only]` | Restore from a pack; `--verify-only` checks integrity without writing. |
@@ -58,7 +58,7 @@ map.
 | `commit verify <hash> --public-key <hex>` | Verify a signed commit. |
 | `log <head>` | Walk commit history. |
 | `proof state <head> <key> [--key-encoding …]` | Membership/non-membership proof for a key. |
-| `proof chunk --head <h> --chunk <hash> [--include-content] [--out <file>]` | Build an offline chunk-proof bundle. |
+| `proof chunk --head <h> --chunk <hash> [--include-content] [--anchor-head <h>] [--out <file>]` | Build an offline chunk-proof bundle; `--anchor-head` adds an inclusion proof in that head's latest checkpoint. |
 | `proof verify-chunk <input>` | Verify a chunk-proof bundle (exit 1 on invalid). |
 
 ## index / search — retrieval
@@ -67,15 +67,15 @@ map.
 |---|---|
 | `index build --head <h>` | Build the index for a commit (also happens lazily on first query). |
 | `index stats --head <h>` | Segment/chunk/term/vector counts. |
-| `search semantic --head <h> (--query <q> \| --query-file <f>) [--top-k <n>] [filters] [--audit]` | BM25 search. |
-| `search vector --head <h> --embedding-file <f> [--top-k <n>] [filters] [--audit]` | HNSW vector search. |
-| `search hybrid --head <h> [--query <q>] [--embedding-file <f>] [--top-k <n>] [filters] [--audit]` | BM25 + vector, RRF-fused. |
+| `search semantic --head <h> (--query <q> \| --query-file <f>) [--top-k <n>] [filters] [--at <commit>]` | BM25 search. |
+| `search vector --head <h> --embedding-file <f> [--top-k <n>] [filters] [--at <commit>]` | HNSW vector search. |
+| `search hybrid --head <h> [--query <q>] [--embedding-file <f>] [--top-k <n>] [filters] [--at <commit>]` | BM25 + vector, RRF-fused. |
 
-`head` accepts a branch name or a 64-hex commit hash (time-travel). Filter
+`head` must name a head: every search is recorded on it as a chained
+`QueryManifest` and its hash is printed. `--at` searches a past commit
+(time-travel) while still recording on `head`. Filter
 flags shared by all modes: `--tenant`, `--doc-type`, `--language`, `--acl
-<tag>` (repeatable), `--valid-at <unix>`. `--audit` records a `QueryManifest`
-and prints its hash; attach it with `commit new --manifest <hash>` to make it
-durable.
+<tag>` (repeatable), `--valid-at <unix>`.
 
 ## key / checkpoint — signing and transparency log
 
@@ -98,8 +98,8 @@ durable.
 | Command | What it does |
 |---|---|
 | `audit log --head <h> [--from <unix>] [--to <unix>]` | List retrieval audit records. |
-| `audit export --head <h> [--from] [--to] --out <file> [--sign-key <key>]` | Write a self-contained, optionally signed bundle. |
-| `audit verify <input> [--public-key <hex>] [--require-signature]` | Verify a bundle offline (same as `neleus-verify`). |
+| `audit export --head <h> [--from] [--to] --out <file> [--sign-key <key>] [--anchor <checkpoint>]` | Write a self-contained, optionally signed bundle; `--anchor` adds a consistency proof from that retained checkpoint. |
+| `audit verify <input> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>]` | Verify a bundle offline (same as `neleus-verify`); `--anchor` checks the bundle's log extends that checkpoint. |
 
 ## policy / events — monitor and enforce
 
@@ -156,7 +156,7 @@ the unkeyed integrity footer, which anyone editing the file can recompute.
 No database, no network. Hand it the bundle.
 
 ```
-neleus-verify <bundle.nelaudit> [--public-key <hex>] [--require-signature] [--json]
+neleus-verify <bundle.nelaudit> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>] [--json]
 ```
 
 Prints `VERIFIED: …` and exits 0, or `INVALID: …` and exits 1. Every claim is

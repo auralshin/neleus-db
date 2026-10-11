@@ -27,7 +27,6 @@ impl RefsStore {
         fs::create_dir_all(self.heads_dir())?;
         fs::create_dir_all(self.states_dir())?;
         fs::create_dir_all(self.checkpoints_dir())?;
-        fs::create_dir_all(self.queries_dir())?;
         Ok(())
     }
 
@@ -127,27 +126,6 @@ impl RefsStore {
         list_refs(&self.checkpoints_dir())
     }
 
-    /// Latest retrieval-record hash for a head (audit-chain tip).
-    pub fn query_get(&self, name: &str) -> Result<Option<Hash>> {
-        validate_ref_name(name)?;
-        read_hash(self.query_path(name))
-    }
-
-    /// Rename-atomic, no WAL: the record it names is already committed, so an
-    /// interrupted update loses a sequence number, never a record.
-    pub fn query_set(&self, name: &str, hash: Hash) -> Result<()> {
-        validate_ref_name(name)?;
-        self.ensure_dirs()?;
-        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
-        write_atomic(&self.query_path(name), format!("{hash}\n").as_bytes())?;
-        Ok(())
-    }
-
-    /// Every `(name, hash)` under `refs/queries/`, sorted by name.
-    pub fn list_queries(&self) -> Result<Vec<(String, Hash)>> {
-        list_refs(&self.queries_dir())
-    }
-
     pub fn root(&self) -> &PathBuf {
         &self.root
     }
@@ -162,14 +140,6 @@ impl RefsStore {
 
     fn checkpoints_dir(&self) -> PathBuf {
         self.root.join("checkpoints")
-    }
-
-    fn queries_dir(&self) -> PathBuf {
-        self.root.join("queries")
-    }
-
-    fn query_path(&self, name: &str) -> PathBuf {
-        self.queries_dir().join(name)
     }
 
     fn checkpoint_path(&self, name: &str) -> PathBuf {
@@ -200,12 +170,15 @@ impl RefsStore {
         if current != expected {
             return Ok(false);
         }
+        // Already at the target: a rewrite would only add a durable write.
+        if current == Some(new_hash) {
+            return Ok(true);
+        }
 
-        // WAL intent-replay only for refs whose loss would orphan an
-        // acknowledged commit. Staging refs (RefStateSet) are rename-atomic
-        // and retryable; skipping their WAL removes 3 metadata ops from the
-        // per-write hot path.
-        if matches!(wal_op, WalOp::RefHeadSet | WalOp::RefCheckpointSet) {
+        // No WAL for head or staging refs: `write_atomic` is durable before it
+        // returns, so replay could only complete an update nobody was told
+        // succeeded, at two extra fsyncs per commit. Checkpoint refs keep it.
+        if matches!(wal_op, WalOp::RefCheckpointSet) {
             let entry = Wal::make_ref_entry(wal_op, name, expected, new_hash);
             let wal_path = self.wal.begin_entry(&entry)?;
             write_atomic(&path, format!("{new_hash}\n").as_bytes())?;

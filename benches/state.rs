@@ -1,3 +1,5 @@
+mod common;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 use neleus_db::audit;
 use neleus_db::canonical::to_cbor;
@@ -10,7 +12,7 @@ use tempfile::TempDir;
 fn bench_state_set_get(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let db_root = dir.path().join("db");
-    Database::init(&db_root).unwrap();
+    common::init_db(&db_root);
     let db = Database::open(&db_root).unwrap();
 
     let root = db.state_store.empty_root().unwrap();
@@ -40,7 +42,7 @@ fn bench_state_set_get(c: &mut Criterion) {
 fn bench_state_compact(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let db_root = dir.path().join("db");
-    Database::init(&db_root).unwrap();
+    common::init_db(&db_root);
     let db = Database::open(&db_root).unwrap();
 
     // Build a state with many segments to compact
@@ -64,7 +66,7 @@ fn bench_state_compact(c: &mut Criterion) {
 fn bench_state_proof(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let db_root = dir.path().join("db");
-    Database::init(&db_root).unwrap();
+    common::init_db(&db_root);
     let db = Database::open(&db_root).unwrap();
 
     let mut root = db.state_store.empty_root().unwrap();
@@ -95,18 +97,18 @@ fn bench_state_proof(c: &mut Criterion) {
     });
 
     c.bench_function("state_verify_inclusion", |b| {
-        b.iter(|| db.state_store.verify_proof(root, b"key_0042", &incl));
+        b.iter(|| incl.verify(root, b"key_0042"));
     });
 
     c.bench_function("state_verify_non_inclusion", |b| {
-        b.iter(|| db.state_store.verify_proof(root, b"zzz_absent", &excl));
+        b.iter(|| excl.verify(root, b"zzz_absent"));
     });
 }
 
 fn bench_chunk_proof(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let db_root = dir.path().join("db");
-    Database::init(&db_root).unwrap();
+    common::init_db(&db_root);
     let db = Database::open(&db_root).unwrap();
 
     // Ingest a small document, then stack commits so the proof walks ancestry.
@@ -170,7 +172,7 @@ fn bench_chunk_proof(c: &mut Criterion) {
 fn bench_audit_bundle(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let db_root = dir.path().join("db");
-    Database::init(&db_root).unwrap();
+    common::init_db(&db_root);
     let db = Database::open(&db_root).unwrap();
 
     let text =
@@ -201,7 +203,7 @@ fn bench_audit_bundle(c: &mut Criterion) {
     const RETRIEVALS: usize = 64;
     for _ in 0..RETRIEVALS {
         let hits = engine
-            .search_semantic(doc_commit, "vector retrieval proof", 10, &filter)
+            .search_semantic_unrecorded(doc_commit, "vector retrieval proof", 10, &filter)
             .unwrap();
         // Sequence-chained so the 64 records stay 64 distinct objects; the
         // bare recorder would emit byte-identical manifests that collapse to

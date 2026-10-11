@@ -48,8 +48,8 @@ db.audit_export("main", "q1.nelaudit")              # offline-verifiable bundle
 db.session_append("main", "s1", "hello", role="user", ttl_secs=3600)
 ```
 
-`search` and `prove` accept a head name or a commit hash as the first
-argument — pass a commit hash for time-travel retrieval against history.
+`search` records every call on its head; pass `commit=<hash>` to search a
+past commit (time-travel). `prove` accepts a head name or a commit hash.
 
 ## Methods
 

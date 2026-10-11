@@ -4,24 +4,28 @@
 //! commit hash = blake3("commit:" || commit_bytes)
 //!   -> parents[0] chain to the introducing commit
 //!   -> manifests contains manifest_hash = blake3("manifest:" || bytes)
-//!   -> referenced blobs contain chunk_hash = blake3("blob:" || content)
+//!   -> referenced blobs contain chunk_hash = blake3("blob:" || salt || content)
 //! ```
 //!
 //! Manifest type is pinned by canonical round-trip (decode -> re-encode
-//! must reproduce the bytes).
+//! must reproduce the bytes). An optional anchor ties `commit` to a
+//! checkpoint: a logged commit's first-parent chain reaches it, and the
+//! checkpoint's Merkle root includes that logged commit.
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::canonical::{from_cbor, to_cbor};
+use crate::checkpoint::{CHECKPOINT_TAG, Checkpoint, CheckpointStore, verify_commit_logged};
 use crate::commit::{COMMIT_TAG, Commit, CommitHash};
 use crate::db::Database;
 use crate::hash::{Hash, hash_blob, hash_typed};
 use crate::manifest::{
     ChunkManifest, DocManifest, MANIFEST_TAG, ManifestReferences, RunManifest, SummaryManifest,
 };
+use crate::merkle::MerkleProof;
 
-pub const CHUNK_PROOF_SCHEMA_VERSION: u32 = 1;
+pub const CHUNK_PROOF_SCHEMA_VERSION: u32 = 2;
 
 /// Cap on the ancestry walk while locating the introducing commit.
 const MAX_PROOF_WALK: usize = 10_000;
@@ -37,13 +41,46 @@ pub struct ChunkProof {
     pub manifest_hash: Hash,
     pub manifest_bytes: Vec<u8>,
     pub chunk_hash: Hash,
-    /// The chunk content itself, when the prover chose to include it.
+    /// The stored chunk payload (`salt || content`), when the prover chose to
+    /// include it; see [`ChunkProof::chunk_content`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_bytes: Option<Vec<u8>>,
     /// Content was requested but is erased (gone + covered by an erasure
     /// record): the proof degrades to commitment-only, `chunk_bytes` absent.
     #[serde(default, skip_serializing_if = "is_false")]
     pub content_erased: bool,
+    /// Binds `commit` to a checkpoint, so the proof stands against an anchor
+    /// without the audit bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ProofAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofAnchor {
+    /// Canonical bytes of the anchoring checkpoint.
+    pub checkpoint: Vec<u8>,
+    /// Inclusion of the logged commit (head of `path`) in the checkpoint's log.
+    pub inclusion: MerkleProof,
+    /// Canonical commit bytes from the logged commit down to the proof's
+    /// `commit`, each linked to the next via `parents[0]`.
+    pub path: Vec<Vec<u8>>,
+}
+
+impl ChunkProof {
+    /// The chunk content without its salt, when carried.
+    pub fn chunk_content(&self) -> Option<&[u8]> {
+        self.chunk_bytes
+            .as_deref()
+            .and_then(|b| b.get(crate::blob_store::SALT_LEN..))
+    }
+
+    /// Digest of the anchoring checkpoint, to compare with a retained anchor.
+    /// Meaningful only once [`verify_chunk_proof`] has accepted the proof.
+    pub fn anchor_checkpoint(&self) -> Option<Hash> {
+        self.anchor
+            .as_ref()
+            .map(|a| hash_typed(CHECKPOINT_TAG, &a.checkpoint))
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -71,7 +108,7 @@ pub fn prove_chunk(
             if manifest_references_chunk(&manifest_bytes, chunk_hash)?.is_some() {
                 let mut content_erased = false;
                 let chunk_bytes = if include_content {
-                    match db.blob_store.get(chunk_hash) {
+                    match db.blob_store.get_payload(chunk_hash) {
                         Ok(b) => Some(b),
                         // Erased + covered: emit a commitment-only proof.
                         Err(_) if crate::erasure::covers(&db.root, chunk_hash)? => {
@@ -92,6 +129,7 @@ pub fn prove_chunk(
                     chunk_hash,
                     chunk_bytes,
                     content_erased,
+                    anchor: None,
                 });
             }
         }
@@ -107,6 +145,64 @@ pub fn prove_chunk(
         commit,
         chunk_hash
     ))
+}
+
+/// [`prove_chunk`] plus an anchor in `head`'s latest checkpoint, via the
+/// logged commit closest above `commit` so the carried path is shortest.
+pub fn prove_chunk_anchored(
+    db: &Database,
+    head: &str,
+    commit: CommitHash,
+    chunk_hash: Hash,
+    include_content: bool,
+) -> Result<ChunkProof> {
+    let mut proof = prove_chunk(db, commit, chunk_hash, include_content)?;
+    let cp_hash = db
+        .refs
+        .checkpoint_get(head)?
+        .ok_or_else(|| anyhow!("head '{head}' has no checkpoint to anchor to"))?;
+    let store = CheckpointStore::new(db);
+    let cp = store.get(cp_hash)?;
+    let index_of: std::collections::HashMap<CommitHash, usize> = store
+        .logged_commits(head)?
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| (c, i))
+        .collect();
+
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut best: Option<(usize, usize)> = None; // (log index, position in path)
+    let mut cursor = Some(cp.commit);
+    while let Some(c) = cursor {
+        if path.len() >= MAX_PROOF_WALK {
+            return Err(anyhow!("anchor walk exceeded {MAX_PROOF_WALK} commits"));
+        }
+        if let Some(&i) = index_of.get(&c) {
+            best = Some((i, path.len()));
+        }
+        let bytes = db.commit_store.raw_commit_bytes(c)?;
+        cursor = from_cbor::<Commit>(&bytes)?.parents.first().copied();
+        path.push(bytes);
+        if c == commit {
+            break;
+        }
+    }
+    let reached = path
+        .last()
+        .is_some_and(|b| hash_typed(COMMIT_TAG, b) == commit);
+    let (index, start) = best.filter(|_| reached).ok_or_else(|| {
+        anyhow!("commit {commit} is not covered by head '{head}''s checkpoint log")
+    })?;
+    let (root, inclusion) = store.prove_commit_logged(head, index)?;
+    if root != cp.log_root {
+        return Err(anyhow!("checkpoint log moved while proving; retry"));
+    }
+    proof.anchor = Some(ProofAnchor {
+        checkpoint: db.object_store.get_typed_bytes(CHECKPOINT_TAG, cp_hash)?,
+        inclusion,
+        path: path.split_off(start),
+    });
+    Ok(proof)
 }
 
 /// Verify a [`ChunkProof`] offline. Returns the kind of manifest that
@@ -183,7 +279,49 @@ pub fn verify_chunk_proof(proof: &ChunkProof) -> Result<&'static str> {
         return Err(anyhow!("chunk bytes do not hash to {}", proof.chunk_hash));
     }
 
+    // 6. An anchor must reach `commit` from a commit the checkpoint logs.
+    if let Some(anchor) = &proof.anchor {
+        verify_anchor(anchor, proof.commit)?;
+    }
+
     Ok(kind)
+}
+
+fn verify_anchor(anchor: &ProofAnchor, commit: CommitHash) -> Result<()> {
+    let cp: Checkpoint = from_cbor(&anchor.checkpoint)
+        .map_err(|e| anyhow!("anchor checkpoint does not decode: {e}"))?;
+    let first = anchor
+        .path
+        .first()
+        .ok_or_else(|| anyhow!("anchor path is empty"))?;
+    let logged = hash_typed(COMMIT_TAG, first);
+    if u64::try_from(anchor.inclusion.leaf_count).ok() != cp.sequence.checked_add(1)
+        || !verify_commit_logged(cp.log_root, logged, &anchor.inclusion)
+    {
+        return Err(anyhow!(
+            "anchor: commit {logged} is not in the checkpoint's log"
+        ));
+    }
+    let mut expected = logged;
+    for (i, bytes) in anchor.path.iter().enumerate() {
+        if hash_typed(COMMIT_TAG, bytes) != expected {
+            return Err(anyhow!("anchor path link {i} does not hash to {expected}"));
+        }
+        if i + 1 < anchor.path.len() {
+            let c: Commit = from_cbor(bytes)
+                .map_err(|e| anyhow!("anchor path link {i} does not decode: {e}"))?;
+            expected = *c
+                .parents
+                .first()
+                .ok_or_else(|| anyhow!("anchor path link {i} is a root but the path continues"))?;
+        }
+    }
+    if expected != commit {
+        return Err(anyhow!(
+            "anchor path ends at {expected}, not at commit {commit}"
+        ));
+    }
+    Ok(())
 }
 
 /// Round-trip-identified manifest type + chunk reference check.
@@ -259,10 +397,42 @@ mod tests {
 
         let proof = prove_chunk(&db, commit, chunk, true).unwrap();
         assert_eq!(verify_chunk_proof(&proof).unwrap(), "doc");
-        assert_eq!(
-            proof.chunk_bytes.as_deref(),
-            Some(&b"provable chunk content"[..])
-        );
+        assert_eq!(proof.chunk_content(), Some(&b"provable chunk content"[..]));
+    }
+
+    #[test]
+    fn anchored_proof_reaches_a_logged_commit() {
+        let (_tmp, db) = test_db();
+        let (doc_hash, chunk) = ingest(&db, b"anchored knowledge");
+        let c1 = db
+            .create_commit_at_head("main", "agent", "intro", vec![doc_hash])
+            .unwrap();
+        db.create_commit_at_head("main", "agent", "mid", vec![])
+            .unwrap();
+        let store = CheckpointStore::new(&db);
+        store.create("main", None).unwrap();
+        db.create_commit_at_head("main", "agent", "after", vec![])
+            .unwrap();
+        let cp = store.create("main", None).unwrap();
+        let unlogged = db
+            .create_commit_at_head("main", "agent", "unlogged", vec![])
+            .unwrap();
+
+        let proof = prove_chunk_anchored(&db, "main", c1, chunk, false).unwrap();
+        verify_chunk_proof(&proof).unwrap();
+        assert_eq!(proof.anchor_checkpoint(), Some(cp));
+        // Closest logged commit above c1 is the first checkpoint's, two links.
+        assert_eq!(proof.anchor.as_ref().unwrap().path.len(), 2);
+
+        let mut cut = proof.clone();
+        cut.anchor.as_mut().unwrap().path.pop();
+        assert!(verify_chunk_proof(&cut).is_err());
+        let mut moved = proof.clone();
+        moved.anchor.as_mut().unwrap().inclusion.index ^= 1;
+        assert!(verify_chunk_proof(&moved).is_err());
+
+        // Commits after the latest checkpoint have nothing to anchor to yet.
+        assert!(prove_chunk_anchored(&db, "main", unlogged, chunk, false).is_err());
     }
 
     #[test]

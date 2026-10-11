@@ -101,6 +101,26 @@ pub fn hash_typed(tag: &[u8], bytes: &[u8]) -> Hash {
     Hash(*out.as_bytes())
 }
 
+/// 32-byte secret; `Debug` is redacted so it cannot leak through logs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Key(pub [u8; 32]);
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Key(..)")
+    }
+}
+
+impl Key {
+    /// Independent subkey for `context`, optionally narrowed by `scope`.
+    pub fn derive(&self, context: &str, scope: &[u8]) -> Key {
+        let mut h = blake3::Hasher::new_derive_key(context);
+        h.update(&self.0);
+        h.update(scope);
+        Key(*h.finalize().as_bytes())
+    }
+}
+
 /// Content hash of a raw blob (BLAKE3, `blob:` domain).
 pub fn hash_blob(bytes: &[u8]) -> Hash {
     hash_typed(b"blob:", bytes)

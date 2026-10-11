@@ -30,15 +30,9 @@ pub fn set_full_durability(enabled: bool) {
     FSYNC_FULL.store(enabled, Ordering::Relaxed);
 }
 
-/// Test override for durability-sensitive tests.
-#[cfg(test)]
-#[allow(dead_code)]
-pub(crate) fn enable_fsync_for_tests() {
-    set_full_durability(true);
-}
-
 fn fsync_enabled() -> bool {
-    FSYNC_FULL.load(Ordering::Relaxed)
+    // Unit tests cannot observe power loss; fsync would only slow them down.
+    !cfg!(test) && FSYNC_FULL.load(Ordering::Relaxed)
 }
 
 pub(crate) fn maybe_sync_file(f: &File) -> std::io::Result<()> {

@@ -6,7 +6,7 @@
 //! # fn main() -> Result<(), neleus_client::Error> {
 //! let client = Client::new("http://127.0.0.1:7117", Some("nlk_…".into()));
 //! let doc = client.put_document("main", "kb.md", "policy text", Default::default())?;
-//! let res = client.search("main", SearchOpts { query: Some("policy".into()), audit: true, ..Default::default() })?;
+//! let res = client.search("main", SearchOpts { query: Some("policy".into()), ..Default::default() })?;
 //! let proof = client.prove(&res.commit, &res.hits[0].chunk, true)?;
 //! assert!(client.verify(&proof)?.valid);
 //! # Ok(()) }
@@ -73,7 +73,7 @@ pub struct Hit {
 pub struct SearchResult {
     pub commit: String,
     pub hits: Vec<Hit>,
-    pub audit_manifest: Option<String>,
+    pub audit_manifest: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,7 +97,8 @@ pub struct SearchOpts {
     pub embedding: Option<Vec<f32>>,
     pub top_k: Option<usize>,
     pub filter: Option<serde_json::Value>,
-    pub audit: bool,
+    /// Past commit to search; the search is still recorded on `at`.
+    pub commit: Option<String>,
 }
 
 // neleus://[token@]host[:port] -> (http base url, token); default port 7117.
@@ -208,12 +209,12 @@ impl Client {
             "/v1/search",
             &json!({
                 "at": at,
+                "commit": opts.commit,
                 "mode": opts.mode.unwrap_or_else(|| "hybrid".into()),
                 "query": opts.query,
                 "embedding": opts.embedding,
                 "top_k": opts.top_k.unwrap_or(10),
                 "filter": opts.filter,
-                "audit": opts.audit,
             }),
         )
     }

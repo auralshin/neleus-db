@@ -149,7 +149,7 @@ mod tests {
         objects.ensure_dir().unwrap();
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        let state = StateStore::new(objects.clone(), blobs);
+        let state = StateStore::new(objects.clone(), blobs, [7; 32]);
         (CommitStore::new(objects), state)
     }
 

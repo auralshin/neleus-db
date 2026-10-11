@@ -38,7 +38,7 @@ fn audited_search_is_exportable_verifiable_and_survives_gc() {
 
     let filter = SearchFilter::default();
     let hits = engine
-        .search_semantic(commit, "password", 5, &filter)
+        .search_semantic_unrecorded(commit, "password", 5, &filter)
         .unwrap();
     let qm = engine
         .record_query_at_head(
@@ -92,7 +92,7 @@ fn bare_record_query_is_not_exportable() {
         .unwrap();
     let filter = SearchFilter::default();
     let hits = engine
-        .search_semantic(commit, "corpus", 5, &filter)
+        .search_semantic_unrecorded(commit, "corpus", 5, &filter)
         .unwrap();
     engine
         .record_query(
@@ -134,7 +134,7 @@ fn withheld_retrieval_is_detected() {
     let filter = SearchFilter::default();
     for i in 0..4 {
         let hits = engine
-            .search_semantic(commit, "corpus", 5, &filter)
+            .search_semantic_unrecorded(commit, "corpus", 5, &filter)
             .unwrap();
         engine
             .record_query_at_head(
@@ -218,7 +218,7 @@ fn rewritten_record_fields_are_rejected() {
     let filter = SearchFilter::default();
     for i in 0..3 {
         let hits = engine
-            .search_semantic(commit, "corpus", 5, &filter)
+            .search_semantic_unrecorded(commit, "corpus", 5, &filter)
             .unwrap();
         engine
             .record_query_at_head(
@@ -298,7 +298,7 @@ fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) 
     }
     let mut buf = Vec::new();
     buf.extend_from_slice(b"NELAUDIT");
-    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, data) in &entries {
         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());

@@ -220,7 +220,7 @@ fn a6_withhold_a_record_from_a_bundle() {
     let filter = SearchFilter::default();
     for i in 0..5 {
         let hits = engine
-            .search_semantic(commit, "searchable content", 5, &filter)
+            .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
             .unwrap();
         engine
             .record_query_at_head(
@@ -273,7 +273,7 @@ fn a7_never_record_the_retrieval() {
     // Ten retrievals actually served; none recorded.
     for _ in 0..10 {
         engine
-            .search_semantic(commit, "searchable content", 5, &filter)
+            .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
             .unwrap();
     }
     let out = tmp.path().join("silent.nelaudit");
@@ -298,7 +298,7 @@ fn a8_swap_chunk_content() {
     let (_t, engine, _c) = fixture(1);
     let commit = engine.resolve_commit("main").unwrap();
     let hits = engine
-        .search_semantic(commit, "searchable content", 1, &SearchFilter::default())
+        .search_semantic_unrecorded(commit, "searchable content", 1, &SearchFilter::default())
         .unwrap();
     let mut proof = prove_chunk(engine.db(), commit, hits[0].chunk_hash, true).unwrap();
     assert!(verify_chunk_proof(&proof).is_ok());
@@ -318,7 +318,7 @@ fn a9_truncate_chunk_ancestry() {
     let (_t, engine, _c) = fixture(4);
     let commit = engine.resolve_commit("main").unwrap();
     let hits = engine
-        .search_semantic(commit, "record 0", 5, &SearchFilter::default())
+        .search_semantic_unrecorded(commit, "record 0", 5, &SearchFilter::default())
         .unwrap();
     let mut proof = prove_chunk(engine.db(), commit, hits[0].chunk_hash, false).unwrap();
     let detected = if proof.commit_path.len() > 1 {
@@ -470,9 +470,15 @@ fn zz_report() {
 /// `meta.json`, and a recomputed integrity footer, so nothing is inconsistent
 /// except the missing sequence number.
 fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) {
+    let mut entries = parse_bundle(raw);
+    set_records(&mut entries, jsonl, count);
+    write_bundle(&entries, out);
+}
+
+fn parse_bundle(raw: &[u8]) -> Vec<(String, Vec<u8>)> {
     let n = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
     let mut p = 16usize;
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut entries = Vec::new();
     for _ in 0..n {
         let nl = u32::from_le_bytes(raw[p..p + 4].try_into().unwrap()) as usize;
         p += 4;
@@ -480,24 +486,32 @@ fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) 
         p += nl;
         let dl = u64::from_le_bytes(raw[p..p + 8].try_into().unwrap()) as usize;
         p += 8;
-        let data = raw[p..p + dl].to_vec();
+        entries.push((name, raw[p..p + dl].to_vec()));
         p += dl;
-        let data = if name == "retrievals.jsonl" {
-            jsonl.as_bytes().to_vec()
-        } else if name == "meta.json" {
-            let mut v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-            v["retrievals"] = serde_json::json!(count);
-            serde_json::to_vec_pretty(&v).unwrap()
-        } else {
-            data
-        };
-        entries.push((name, data));
     }
+    entries
+}
+
+/// Replace the record index and its declared count, as an exporter would.
+fn set_records(entries: &mut [(String, Vec<u8>)], jsonl: &str, count: usize) {
+    for (name, data) in entries.iter_mut() {
+        if name == "retrievals.jsonl" {
+            *data = jsonl.as_bytes().to_vec();
+        } else if name == "meta.json" {
+            let mut v: serde_json::Value = serde_json::from_slice(data).unwrap();
+            v["retrievals"] = serde_json::json!(count);
+            *data = serde_json::to_vec_pretty(&v).unwrap();
+        }
+    }
+}
+
+/// Serialize with a freshly computed footer: unsigned bundles are repairable.
+fn write_bundle(entries: &[(String, Vec<u8>)], out: &std::path::Path) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"NELAUDIT");
-    buf.extend_from_slice(&1u32.to_le_bytes());
+    buf.extend_from_slice(&2u32.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    for (name, data) in &entries {
+    for (name, data) in entries {
         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
         buf.extend_from_slice(name.as_bytes());
         buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
@@ -506,4 +520,163 @@ fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) 
     let footer = blake3::hash(&buf);
     buf.extend_from_slice(footer.as_bytes());
     std::fs::write(out, &buf).unwrap();
+}
+
+// ---------------------------------------------------------------- injection
+
+/// Seeded random tampering by an exporter that repairs every container-level
+/// check it can (footer, declared count, orphaned manifest objects), against
+/// an untouched control. `--nocapture` prints detection per class.
+#[test]
+fn tamper_injection_trials() {
+    use neleus_db::audit::AuditRecord;
+    use neleus_db::canonical::{from_cbor, to_cbor};
+    use neleus_db::manifest::{MANIFEST_TAG, QueryManifest};
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    const TRIALS: usize = 200;
+    const RECORDS: usize = 20;
+    // Written after the last checkpoint, so no anchor covers them.
+    const UNANCHORED: usize = 5;
+
+    let (tmp, engine, _c) = fixture(1);
+    let commit = engine.resolve_commit("main").unwrap();
+    let filter = SearchFilter::default();
+    for i in 0..RECORDS + UNANCHORED {
+        if i == RECORDS {
+            CheckpointStore::new(engine.db())
+                .create("main", None)
+                .unwrap();
+        }
+        let hits = engine
+            .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
+            .unwrap();
+        engine
+            .record_query_at_head(
+                "main",
+                commit,
+                "semantic",
+                Some("searchable content"),
+                None,
+                5,
+                &filter,
+                Some(&format!("agent-{i}")),
+                &hits,
+            )
+            .unwrap();
+    }
+    let out = tmp.path().join("base.nelaudit");
+    audit::export(engine.db(), "main", 0, u64::MAX, &out, None).unwrap();
+    let base = parse_bundle(&std::fs::read(&out).unwrap());
+    let base_records: Vec<AuditRecord> = base
+        .iter()
+        .find(|(n, _)| n == "retrievals.jsonl")
+        .map(|(_, d)| {
+            String::from_utf8_lossy(d)
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        })
+        .unwrap();
+    assert_eq!(base_records.len(), RECORDS + UNANCHORED);
+    assert!(base_records.iter().all(|r| !r.hits.is_empty()));
+
+    let drop_object = |entries: &mut Vec<(String, Vec<u8>)>, manifest: &str| {
+        let name = format!("objects/{manifest}");
+        entries.retain(|(n, _)| *n != name);
+    };
+
+    // (class, expected detections out of TRIALS)
+    let classes = [
+        ("control (no change)", 0),
+        ("edit a record field", TRIALS),
+        ("re-forge a manifest", TRIALS),
+        ("drop a middle record", TRIALS),
+        ("truncate from an anchored record", TRIALS),
+        // NOT DETECTED: no anchor covers records after the last checkpoint.
+        ("truncate unanchored records only", 0),
+        ("duplicate a record", TRIALS),
+        ("swap two sequence numbers", TRIALS),
+    ];
+    let mut rng = StdRng::seed_from_u64(7);
+    let path = tmp.path().join("trial.nelaudit");
+    println!(
+        "\n  TAMPER INJECTION: {TRIALS} seeded trials per class, {} records \
+         ({UNANCHORED} after the last checkpoint)",
+        RECORDS + UNANCHORED
+    );
+    println!("  {:<34} {:>9}", "class", "detected");
+    for (class, expected) in classes {
+        let mut detected = 0;
+        for _ in 0..TRIALS {
+            let mut entries = base.clone();
+            let mut recs = base_records.clone();
+            let i = rng.gen_range(0..recs.len());
+            match class {
+                "edit a record field" => match rng.gen_range(0..5) {
+                    0 => recs[i].principal = Some("forged".into()),
+                    1 => recs[i].top_k += 1,
+                    2 => recs[i].executed_at -= 1,
+                    3 => recs[i].hits[0].score_micro += 1,
+                    _ => recs[i].mode = "vector".into(),
+                },
+                "re-forge a manifest" => {
+                    let old = recs[i].manifest.clone();
+                    let name = format!("objects/{old}");
+                    let bytes = &entries.iter().find(|(n, _)| *n == name).unwrap().1;
+                    let mut qm: QueryManifest = from_cbor(bytes).unwrap();
+                    qm.principal = Some("forged".into());
+                    let forged = to_cbor(&qm).unwrap();
+                    let hash = hash_typed(MANIFEST_TAG, &forged).to_string();
+                    drop_object(&mut entries, &old);
+                    entries.push((format!("objects/{hash}"), forged));
+                    recs[i].manifest = hash;
+                    recs[i].principal = Some("forged".into());
+                }
+                "drop a middle record" => {
+                    let i = rng.gen_range(1..recs.len() - 1);
+                    let r = recs.remove(i);
+                    drop_object(&mut entries, &r.manifest);
+                }
+                "truncate from an anchored record" | "truncate unanchored records only" => {
+                    let from = if class.starts_with("truncate from") {
+                        rng.gen_range(1..RECORDS as u64)
+                    } else {
+                        rng.gen_range(RECORDS as u64..(RECORDS + UNANCHORED) as u64)
+                    };
+                    for r in recs.iter().filter(|r| r.seq >= from) {
+                        drop_object(&mut entries, &r.manifest);
+                    }
+                    recs.retain(|r| r.seq < from);
+                }
+                "duplicate a record" => recs.push(recs[i].clone()),
+                "swap two sequence numbers" => {
+                    let j = (i + rng.gen_range(1..recs.len())) % recs.len();
+                    let (a, b) = (recs[i].seq, recs[j].seq);
+                    recs[i].seq = b;
+                    recs[j].seq = a;
+                }
+                _ => {}
+            }
+            let mut jsonl: String = recs
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap() + "\n")
+                .collect();
+            if jsonl.is_empty() {
+                jsonl.push('\n');
+            }
+            set_records(&mut entries, &jsonl, recs.len());
+            write_bundle(&entries, &path);
+            let accepted = matches!(
+                audit::verify_bundle(&path, None, false),
+                Ok(r) if r.chain_complete
+            );
+            if !accepted {
+                detected += 1;
+            }
+        }
+        println!("  {class:<34} {detected:>5}/{TRIALS}");
+        assert_eq!(detected, expected, "{class}");
+    }
 }

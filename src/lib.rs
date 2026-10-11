@@ -23,7 +23,7 @@
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! use neleus_db::{Engine, SearchFilter, verify_chunk_proof};
+//! use neleus_db::{Engine, SearchFilter, SearchQuery, verify_chunk_proof};
 //! use neleus_db::manifest::ChunkingSpec;
 //!
 //! let engine = Engine::open("./agent_db")?;
@@ -31,10 +31,13 @@
 //! let (_doc, commit) = engine.put_document(
 //!     "main", "policy.md", b"reset your password in settings", spec, None, "ingest",
 //! )?;
-//! let hits = engine.search_semantic(commit, "password reset", 5, &SearchFilter::default())?;
+//! // Every search is recorded on the head as a chained audit record.
+//! let found = engine.search(
+//!     "main", None, SearchQuery::Semantic("password reset"), 5, &SearchFilter::default(), None,
+//! )?;
 //!
 //! // The proof carries everything a verifier needs. No store, no network.
-//! let proof = engine.prove(commit, hits[0].chunk_hash, true)?;
+//! let proof = engine.prove(commit, found.hits[0].chunk_hash, true)?;
 //! assert!(verify_chunk_proof(&proof).is_ok());
 //! # Ok(())
 //! # }
@@ -93,12 +96,14 @@ pub use checkpoint::{Checkpoint, CheckpointStore};
 pub use commit::{Commit, CommitHash, CommitStore};
 pub use db::Database;
 pub use encryption::{EncryptionConfig, EncryptionRuntime};
-pub use engine::{Engine, EngineHit, SearchFilter};
+pub use engine::{Engine, EngineHit, SearchFilter, SearchQuery, Searched};
 pub use hash::Hash;
 pub use manifest::{DocManifest, ManifestStore, RunManifest};
 pub use provenance::{Evidence, ProvenanceManifest, ProvenanceRecord, ProvenanceStore, SourceType};
 pub use refs::RefsStore;
-pub use retrieval_proof::{ChunkProof, prove_chunk, verify_chunk_proof};
+pub use retrieval_proof::{
+    ChunkProof, ProofAnchor, prove_chunk, prove_chunk_anchored, verify_chunk_proof,
+};
 pub use session::{SessionRecord, SessionStore};
 pub use signing::{Ed25519Signer, Ed25519Verifier};
 pub use state::{StateProof, StateRoot, StateStore};

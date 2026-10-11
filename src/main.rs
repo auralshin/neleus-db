@@ -169,6 +169,9 @@ enum AuditCommands {
         /// ed25519 seed file; signs the bundle footer.
         #[arg(long)]
         sign_key: Option<PathBuf>,
+        /// Checkpoint hash an auditor retained; adds a consistency proof to it.
+        #[arg(long)]
+        anchor: Option<String>,
     },
     /// Verify a bundle offline (same checks as the neleus-verify binary).
     Verify {
@@ -177,6 +180,9 @@ enum AuditCommands {
         public_key: Option<String>,
         #[arg(long)]
         require_signature: bool,
+        /// Retained checkpoint hash the bundle's log must extend.
+        #[arg(long)]
+        anchor: Option<String>,
     },
 }
 
@@ -325,6 +331,12 @@ enum SessionCommands {
 enum DbCommands {
     Init {
         path: PathBuf,
+        /// Create a replica of this `serve` peer (adopts its boundary key).
+        #[arg(long)]
+        replica_of: Option<String>,
+        /// Env var holding the bearer token for `--replica-of`.
+        #[arg(long, default_value = "NELEUS_DB_TOKEN")]
+        token_env: String,
     },
     /// Re-encrypt all blobs and objects with a new password.
     /// The new password is read from the environment variable given by --new-password-env.
@@ -587,9 +599,12 @@ impl FilterArgs {
 #[derive(Debug, Subcommand)]
 enum SearchCommands {
     Semantic {
-        /// Head name or 64-hex commit hash (time-travel queries).
+        /// Head the search is recorded on.
         #[arg(long)]
         head: String,
+        /// Commit to search instead of the head tip (time-travel queries).
+        #[arg(long)]
+        at: Option<String>,
         #[arg(long)]
         query: Option<String>,
         #[arg(long)]
@@ -598,28 +613,29 @@ enum SearchCommands {
         top_k: usize,
         #[command(flatten)]
         filter: FilterArgs,
-        /// Record a content-addressed QueryManifest audit record.
-        #[arg(long)]
-        audit: bool,
     },
     Vector {
-        /// Head name or 64-hex commit hash (time-travel queries).
+        /// Head the search is recorded on.
         #[arg(long)]
         head: String,
+        /// Commit to search instead of the head tip (time-travel queries).
+        #[arg(long)]
+        at: Option<String>,
         #[arg(long)]
         embedding_file: PathBuf,
         #[arg(long, default_value_t = 10)]
         top_k: usize,
         #[command(flatten)]
         filter: FilterArgs,
-        #[arg(long)]
-        audit: bool,
     },
     /// BM25 + vector fused with Reciprocal Rank Fusion.
     Hybrid {
-        /// Head name or 64-hex commit hash (time-travel queries).
+        /// Head the search is recorded on.
         #[arg(long)]
         head: String,
+        /// Commit to search instead of the head tip (time-travel queries).
+        #[arg(long)]
+        at: Option<String>,
         #[arg(long)]
         query: Option<String>,
         #[arg(long)]
@@ -630,8 +646,6 @@ enum SearchCommands {
         top_k: usize,
         #[command(flatten)]
         filter: FilterArgs,
-        #[arg(long)]
-        audit: bool,
     },
 }
 
@@ -654,6 +668,9 @@ enum ProofCommands {
         /// Embed the chunk content in the bundle.
         #[arg(long)]
         include_content: bool,
+        /// Anchor the proof in this head's latest checkpoint.
+        #[arg(long)]
+        anchor_head: Option<String>,
         /// Write the CBOR proof bundle here (default: stdout as base64 JSON).
         #[arg(long)]
         out: Option<PathBuf>,
@@ -675,8 +692,18 @@ fn main() -> Result<()> {
 
     match command {
         Commands::Db { command } => match command {
-            DbCommands::Init { path } => {
-                Database::init(path.clone())?;
+            DbCommands::Init {
+                path,
+                replica_of,
+                token_env,
+            } => {
+                match replica_of {
+                    Some(remote) => {
+                        let token = std::env::var(&token_env).ok();
+                        neleus_db::sync::clone(&path, &remote, token.as_deref())?;
+                    }
+                    None => Database::init(path.clone())?,
+                }
                 emit(
                     json_output,
                     serde_json::json!({"status": "ok", "path": path}),
@@ -1221,64 +1248,50 @@ fn main() -> Result<()> {
             match command {
                 SearchCommands::Semantic {
                     head,
+                    at,
                     query,
                     query_file,
                     top_k,
                     filter,
-                    audit,
                 } => {
                     let q = resolve_query_text(query, query_file)?;
-                    let commit = engine.resolve_commit(&head)?;
-                    let filter = filter.into_filter();
-                    let hits = engine.search_semantic(commit, &q, top_k, &filter)?;
-                    let audit_hash = maybe_audit(
-                        &engine,
-                        audit,
+                    let found = engine.search(
                         &head,
-                        commit,
-                        "semantic",
-                        Some(&q),
-                        None,
+                        parse_at(&head, at.as_deref())?,
+                        neleus_db::SearchQuery::Semantic(&q),
                         top_k,
-                        &filter,
-                        &hits,
+                        &filter.into_filter(),
+                        Some("cli"),
                     )?;
-                    emit_hits(json_output, "semantic", &head, commit, &hits, audit_hash)?;
+                    emit_hits(json_output, "semantic", &head, &found)?;
                 }
                 SearchCommands::Vector {
                     head,
+                    at,
                     embedding_file,
                     top_k,
                     filter,
-                    audit,
                 } => {
-                    let commit = engine.resolve_commit(&head)?;
                     let bytes = fs::read(embedding_file)?;
                     let query_vec = neleus_db::engine::parse_embedding(&bytes)?;
-                    let filter = filter.into_filter();
-                    let hits = engine.search_vector(commit, &query_vec, top_k, &filter)?;
-                    let audit_hash = maybe_audit(
-                        &engine,
-                        audit,
+                    let found = engine.search(
                         &head,
-                        commit,
-                        "vector",
-                        None,
-                        Some(&query_vec),
+                        parse_at(&head, at.as_deref())?,
+                        neleus_db::SearchQuery::Vector(&query_vec),
                         top_k,
-                        &filter,
-                        &hits,
+                        &filter.into_filter(),
+                        Some("cli"),
                     )?;
-                    emit_hits(json_output, "vector", &head, commit, &hits, audit_hash)?;
+                    emit_hits(json_output, "vector", &head, &found)?;
                 }
                 SearchCommands::Hybrid {
                     head,
+                    at,
                     query,
                     query_file,
                     embedding_file,
                     top_k,
                     filter,
-                    audit,
                 } => {
                     let q = match (&query, &query_file) {
                         (None, None) => None,
@@ -1289,28 +1302,18 @@ fn main() -> Result<()> {
                             neleus_db::engine::parse_embedding(&fs::read(p)?)
                         })
                         .transpose()?;
-                    let commit = engine.resolve_commit(&head)?;
-                    let filter = filter.into_filter();
-                    let hits = engine.search_hybrid(
-                        commit,
-                        q.as_deref(),
-                        embedding.as_deref(),
-                        top_k,
-                        &filter,
-                    )?;
-                    let audit_hash = maybe_audit(
-                        &engine,
-                        audit,
+                    let found = engine.search(
                         &head,
-                        commit,
-                        "hybrid",
-                        q.as_deref(),
-                        embedding.as_deref(),
+                        parse_at(&head, at.as_deref())?,
+                        neleus_db::SearchQuery::Hybrid {
+                            text: q.as_deref(),
+                            embedding: embedding.as_deref(),
+                        },
                         top_k,
-                        &filter,
-                        &hits,
+                        &filter.into_filter(),
+                        Some("cli"),
                     )?;
-                    emit_hits(json_output, "hybrid", &head, commit, &hits, audit_hash)?;
+                    emit_hits(json_output, "hybrid", &head, &found)?;
                 }
             }
         }
@@ -1379,12 +1382,18 @@ fn main() -> Result<()> {
                     head,
                     chunk,
                     include_content,
+                    anchor_head,
                     out,
                 } => {
                     let engine = neleus_db::Engine::new(db);
                     let commit = engine.resolve_commit(&head)?;
                     let chunk_hash: Hash = chunk.parse()?;
-                    let proof = engine.prove(commit, chunk_hash, include_content)?;
+                    let proof = match anchor_head {
+                        Some(h) => {
+                            engine.prove_anchored(&h, commit, chunk_hash, include_content)?
+                        }
+                        None => engine.prove(commit, chunk_hash, include_content)?,
+                    };
                     let bytes = neleus_db::canonical::to_cbor(&proof)?;
                     match out {
                         Some(path) => {
@@ -1421,12 +1430,19 @@ fn main() -> Result<()> {
                             serde_json::json!({
                                 "valid": true,
                                 "anchor": kind,
+                                "checkpoint": proof.anchor_checkpoint().map(|h| h.to_string()),
                                 "commit": proof.commit.to_string(),
                                 "chunk": proof.chunk_hash.to_string(),
                             }),
                             &format!(
-                                "VALID: chunk {} was retrievable at commit {} (anchored by a {} manifest)",
-                                proof.chunk_hash, proof.commit, kind
+                                "VALID: chunk {} was reachable from commit {} (via a {} manifest){}",
+                                proof.chunk_hash,
+                                proof.commit,
+                                kind,
+                                match proof.anchor_checkpoint() {
+                                    Some(c) => format!("; commit is in checkpoint {c}'s log"),
+                                    None => String::new(),
+                                }
                             ),
                         )?,
                         Err(e) => {
@@ -1810,11 +1826,26 @@ fn main() -> Result<()> {
                     to,
                     out,
                     sign_key,
+                    anchor,
                 } => {
                     let signer = sign_key
                         .map(|p| neleus_db::signing::Ed25519Signer::from_seed_file(&p))
                         .transpose()?;
-                    let s = neleus_db::audit::export(&db, &head, from, to, &out, signer.as_ref())?;
+                    let s = match anchor {
+                        Some(a) => neleus_db::audit::export_anchored(
+                            &db,
+                            &head,
+                            from,
+                            to,
+                            &out,
+                            signer.as_ref(),
+                            a.parse::<Hash>()
+                                .map_err(|e| anyhow!("invalid --anchor: {e}"))?,
+                        )?,
+                        None => {
+                            neleus_db::audit::export(&db, &head, from, to, &out, signer.as_ref())?
+                        }
+                    };
                     emit(
                         json_output,
                         serde_json::json!({
@@ -1838,12 +1869,28 @@ fn main() -> Result<()> {
                     input,
                     public_key,
                     require_signature,
+                    anchor,
                 } => {
-                    match neleus_db::audit::verify_bundle(
-                        &input,
-                        public_key.as_deref(),
-                        require_signature,
-                    ) {
+                    let anchor = anchor
+                        .map(|a| {
+                            a.parse::<Hash>()
+                                .map_err(|e| anyhow!("invalid --anchor: {e}"))
+                        })
+                        .transpose()?;
+                    let verified = match anchor {
+                        Some(a) => neleus_db::audit::verify_bundle_anchored(
+                            &input,
+                            public_key.as_deref(),
+                            require_signature,
+                            a,
+                        ),
+                        None => neleus_db::audit::verify_bundle(
+                            &input,
+                            public_key.as_deref(),
+                            require_signature,
+                        ),
+                    };
+                    match verified {
                         Ok(r) => emit(
                             json_output,
                             serde_json::json!({
@@ -1853,16 +1900,24 @@ fn main() -> Result<()> {
                                 "commits": r.commits,
                                 "checkpoints": r.checkpoints,
                                 "checkpoints_signed": r.checkpoints_signed,
+                                "checkpoint_tip": r.checkpoint_tip,
+                                "log_size": r.log_size,
+                                "anchored": r.anchored,
                                 "bundle_key_id": r.bundle_key_id,
                                 "chain_complete": r.chain_complete,
                             }),
                             &format!(
-                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, {} checkpoints ({} signed){}",
+                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, checkpoint log of {} ({}){}{}",
                                 r.retrievals,
                                 r.head,
                                 r.commits,
-                                r.checkpoints,
-                                r.checkpoints_signed,
+                                r.log_size,
+                                r.checkpoint_tip.as_deref().unwrap_or("none"),
+                                if r.anchored {
+                                    ", extends the given anchor"
+                                } else {
+                                    ""
+                                },
                                 if r.chain_complete {
                                     ""
                                 } else {
@@ -2094,60 +2149,29 @@ fn enforce_cli_write(db: &Database, op: &str, head: &str) -> Result<()> {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn maybe_audit(
-    engine: &neleus_db::Engine,
-    audit: bool,
-    head: &str,
-    commit: Hash,
-    mode: &str,
-    query: Option<&str>,
-    embedding: Option<&[f32]>,
-    top_k: usize,
-    filter: &neleus_db::SearchFilter,
-    hits: &[neleus_db::EngineHit],
-) -> Result<Option<Hash>> {
-    if !audit {
-        return Ok(None);
-    }
-    // The record is committed onto a head to be exportable; a raw commit hash
-    // (time-travel query) has no head to append to. Reject rather than mint a
-    // bogus head named the hash, matching the server's /v1/search behavior.
+/// `--at` as a commit; `head` must name a head because every search is
+/// recorded on it.
+fn parse_at(head: &str, at: Option<&str>) -> Result<Option<Hash>> {
     if head.len() == 64 && head.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(anyhow!(
-            "'--audit' requires '--head' to name a head, not a commit hash \
-             (the record must be committed to a head to be exportable)"
+            "'--head' must name a head; pass a commit hash with '--at'"
         ));
     }
-    // Commits the record onto `head`: an unreferenced QueryManifest is
-    // invisible to `audit export` and is reclaimed by `db gc`.
-    Ok(Some(engine.record_query_at_head(
-        head,
-        commit,
-        mode,
-        query,
-        embedding,
-        top_k,
-        filter,
-        Some("cli"),
-        hits,
-    )?))
+    at.map(|c| {
+        c.parse::<Hash>()
+            .map_err(|e| anyhow!("invalid '--at' commit: {e}"))
+    })
+    .transpose()
 }
 
-fn emit_hits(
-    json_output: bool,
-    mode: &str,
-    head: &str,
-    commit: Hash,
-    hits: &[neleus_db::EngineHit],
-    audit_manifest: Option<Hash>,
-) -> Result<()> {
+fn emit_hits(json_output: bool, mode: &str, head: &str, found: &neleus_db::Searched) -> Result<()> {
+    let (commit, hits, audit_manifest) = (found.commit, &found.hits, found.record);
     if json_output {
         let json = serde_json::json!({
             "mode": mode,
             "head": head,
             "commit": commit.to_string(),
-            "audit_manifest": audit_manifest.map(|h| h.to_string()),
+            "audit_manifest": audit_manifest.to_string(),
             "hits": hits.iter().map(|h| {
                 serde_json::json!({
                     "chunk_hash": h.chunk_hash.to_string(),
@@ -2165,9 +2189,7 @@ fn emit_hits(
         if hits.is_empty() {
             println!("no results");
         }
-        if let Some(h) = audit_manifest {
-            println!("audit manifest: {h} (attach with `commit new --manifest {h}`)");
-        }
+        println!("recorded: {audit_manifest}");
     }
     Ok(())
 }

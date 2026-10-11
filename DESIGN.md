@@ -39,7 +39,6 @@ verified by hash equations.
     heads/<name>                 commit refs
     states/<name>                staged state refs
     checkpoints/<name>           checkpoint-chain refs
-    queries/<name>               retrieval audit-chain tip
   index/
     segments/<hash>              immutable retrieval index segments
     heads/<commit>               segment set serving a commit
@@ -112,10 +111,13 @@ State is an authenticated, content-addressed, ordered map: a **prolly tree**
 (content-defined Merkle Search Tree / B+-tree) keyed by the raw key. Node
 boundaries are content-defined — a key is a boundary at level `L` iff
 `key_level(key) > L`, where `key_level` counts leading zero bits of
-`hash(key)` in groups of `BITS_PER_LEVEL` (5 ⇒ average fanout 32). Boundary
-status is a pure function of the key, so a key set determines a unique tree
-shape regardless of write order (history independent ⇒ equal states have equal
-roots), and incremental writes touch only the affected root→leaf path. A state
+`keyed_hash(boundary_key, key)` in groups of `BITS_PER_LEVEL` (5 ⇒ average
+fanout 32). `boundary_key` is derived from the per-database `secret` in
+`meta/config.json` (which also derives blob salt keys), so
+writers cannot grind keys into one O(N)-wide leaf; replicas share it via
+`db init --replica-of`. Boundary status is a pure function of the key, so within
+a database a key set determines a unique tree shape regardless of write order
+(history independent ⇒ equal states have equal roots), and incremental writes touch only the affected root→leaf path. A state
 root points to a manifest:
 
 ```text
@@ -189,9 +191,12 @@ Implemented manifest families:
 - `QueryManifest`: content-addressed retrieval audit record containing query
   text or embedding, filters, principal, commit, mode, top-k, returned chunk
   hashes, and (v5) `seq` + `prev` linking it into the head's audit chain.
-  `Engine::record_query_at_head` allocates the sequence, commits the record,
-  and advances `refs/queries/<head>`. A gap in the sequence proves a record
-  was removed from an export; it cannot prove one was never recorded.
+  `Engine::record_query_at_head` allocates the sequence from the newest record
+  on the head's first-parent chain (`audit::query_tip`, no separate ref) and
+  commits the record; the server and CLI record every search. A gap in the
+  sequence proves a record was removed from an export, and each checkpoint
+  pins the latest record so a truncated tail below an anchor is detected too.
+  Neither can prove a record was never written.
 
 `ChunkMetadata` supports retrieval filtering:
 

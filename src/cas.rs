@@ -130,12 +130,12 @@ impl CasStore {
     }
 
     /// Write `bytes` under `hash`, treating the store as a content-addressed
-    /// set. Uses a write-temp + hard-link sequence so that concurrent writers
-    /// of the same hash converge deterministically on the first writer's
+    /// set. Publishes the temp file without replacing an existing one, so
+    /// concurrent writers of the same hash converge on the first writer's
     /// payload — even when the payload bytes differ (the case under
     /// encryption, where each writer produces a fresh ciphertext envelope for
-    /// the same plaintext hash). Without this, `rename` would let the last
-    /// writer overwrite, leaving non-deterministic ciphertext on disk.
+    /// the same plaintext hash). A plain `rename` would let the last writer
+    /// overwrite, leaving non-deterministic ciphertext on disk.
     pub fn put_existing_hash(&self, hash: Hash, bytes: &[u8]) -> Result<()> {
         let path = self.path_for(hash);
         // Already loose or packed — don't write a redundant second copy.
@@ -145,9 +145,6 @@ impl CasStore {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("invalid CAS path {}", path.display()))?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating parent dir {}", parent.display()))?;
-
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -155,23 +152,31 @@ impl CasStore {
         let tmp = parent.join(build_temp_name(file_name)?);
 
         {
-            let mut f = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)
-                .with_context(|| format!("failed creating temp file {}", tmp.display()))?;
+            let open = || OpenOptions::new().create_new(true).write(true).open(&tmp);
+            // The shard dir almost always exists; an unconditional mkdir is a
+            // syscall per put.
+            let mut f = match open() {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed creating parent dir {}", parent.display())
+                    })?;
+                    open()
+                }
+                other => other,
+            }
+            .with_context(|| format!("failed creating temp file {}", tmp.display()))?;
             f.write_all(bytes)
                 .with_context(|| format!("failed writing temp file {}", tmp.display()))?;
             maybe_sync_file(&f)
                 .with_context(|| format!("failed syncing temp file {}", tmp.display()))?;
         }
 
-        let link_result = fs::hard_link(&tmp, &path);
-        // The temp's link count is incremented when hard_link succeeds, so
-        // removing it here is safe in both branches.
-        let _ = fs::remove_file(&tmp);
+        let published = publish_no_replace(&tmp, &path);
+        if published.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
 
-        match link_result {
+        match published {
             Ok(()) => {
                 maybe_sync_dir(parent)
                     .with_context(|| format!("failed syncing parent dir {}", parent.display()))?;
@@ -232,6 +237,70 @@ impl CasStore {
         }
         Ok(())
     }
+}
+
+/// Move `tmp` to `path` unless `path` exists (`AlreadyExists` then, `tmp`
+/// left in place). An atomic no-replace rename where the OS has one: on APFS a
+/// hard link plus unlink costs about three renames. Filesystems without it
+/// fall back to link + unlink.
+fn publish_no_replace(tmp: &Path, path: &Path) -> std::io::Result<()> {
+    match rename_no_replace(tmp, path) {
+        Err(e)
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOTSUP | libc::ENOSYS)
+            ) =>
+        {
+            fs::hard_link(tmp, path)?;
+            let _ = fs::remove_file(tmp);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are valid NUL-terminated paths for the duration of the call.
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (from, to) = (c_path(from)?, c_path(to)?);
+    // SAFETY: both are valid NUL-terminated paths for the duration of the call.
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+fn rename_no_replace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
+}
+
+#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+fn c_path(p: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(p.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
 #[cfg(test)]

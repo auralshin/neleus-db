@@ -209,7 +209,7 @@ mod tests {
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
 
-        let state = StateStore::new(objects, blobs.clone());
+        let state = StateStore::new(objects, blobs.clone(), [7; 32]);
         (commit_store, state, blobs)
     }
 
@@ -462,7 +462,7 @@ mod tests {
         let state_objects = ObjectStore::new(tmp.path().join("objects"));
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        let state = StateStore::new(state_objects, blobs);
+        let state = StateStore::new(state_objects, blobs, [7; 32]);
         let root = state.empty_root().unwrap();
 
         // Hand-craft a forged commit: body says "real" but payload_hash

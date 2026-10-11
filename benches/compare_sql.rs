@@ -3,11 +3,13 @@
 //! native vector index, so vector rows are neleus-only. Postgres/SQLCipher
 //! comparisons live in BENCHMARKS.md. Run: cargo bench --bench compare_sql
 
+mod common;
+
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use neleus_db::engine::{Engine, SearchFilter};
-use neleus_db::manifest::ChunkManifest;
+use neleus_db::engine::{Engine, SearchFilter, SearchQuery};
+use neleus_db::manifest::{ChunkManifest, ChunkingSpec};
 use neleus_db::{Database, Hash};
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -88,14 +90,39 @@ struct NeleusFixture {
 fn setup_neleus() -> NeleusFixture {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("db");
-    Database::init(&root).unwrap();
+    common::init_db(&root);
     let db = Database::open(&root).unwrap();
 
     let mut rng = lcg(42);
     let start = Instant::now();
     let mut commit = Hash::zero();
     let per_commit = N_CHUNKS / COMMITS;
-    for c in 0..COMMITS {
+    let commits = if common::writes_only() { 0 } else { COMMITS };
+    if common::writes_only() {
+        // Pack-first document ingest: the write groups need a searchable
+        // corpus, not 10k individually fsynced manifests.
+        let text: String = (0..N_CHUNKS)
+            .map(|_| synthetic_text(&mut rng, 12) + "\n")
+            .collect();
+        let doc = db
+            .manifest_store
+            .put_doc_manifest_from_bytes(
+                &db.blob_store,
+                "corpus".into(),
+                text.as_bytes(),
+                ChunkingSpec {
+                    method: "fixed".into(),
+                    chunk_size: text.len() / N_CHUNKS,
+                    overlap: 0,
+                },
+                Some(1),
+            )
+            .unwrap();
+        commit = db
+            .create_commit_at_head("main", "bench", "corpus", vec![doc])
+            .unwrap();
+    }
+    for c in 0..commits {
         let mut manifests = Vec::with_capacity(per_commit);
         for i in 0..per_commit {
             let id = c * per_commit + i;
@@ -276,7 +303,7 @@ fn bench_compare(c: &mut Criterion) {
         b.iter(|| {
             neleus
                 .engine
-                .search_semantic(neleus.commit, "vector retrieval latency", 10, &filter)
+                .search_semantic_unrecorded(neleus.commit, "vector retrieval latency", 10, &filter)
                 .unwrap()
         });
     });
@@ -302,7 +329,7 @@ fn bench_compare(c: &mut Criterion) {
         b.iter(|| {
             neleus
                 .engine
-                .search_vector(neleus.commit, &neleus.query_vec, 10, &filter)
+                .search_vector_unrecorded(neleus.commit, &neleus.query_vec, 10, &filter)
                 .unwrap()
         });
     });
@@ -313,7 +340,7 @@ fn bench_compare(c: &mut Criterion) {
         b.iter(|| {
             neleus
                 .engine
-                .search_hybrid(
+                .search_hybrid_unrecorded(
                     neleus.commit,
                     Some("vector retrieval latency"),
                     Some(&neleus.query_vec),
@@ -321,6 +348,89 @@ fn bench_compare(c: &mut Criterion) {
                     &filter,
                 )
                 .unwrap()
+        });
+    });
+    group.finish();
+
+    // What the server pays per request now that every search is recorded.
+    let mut group = c.benchmark_group("recorded_top10");
+    group.bench_function("neleus_semantic_recorded", |b| {
+        b.iter(|| {
+            let hits = neleus
+                .engine
+                .search_semantic_unrecorded(neleus.commit, "vector retrieval latency", 10, &filter)
+                .unwrap();
+            neleus
+                .engine
+                .record_query_at_head(
+                    "main",
+                    neleus.commit,
+                    "semantic",
+                    Some("vector retrieval latency"),
+                    None,
+                    10,
+                    &filter,
+                    Some("bench"),
+                    &hits,
+                )
+                .unwrap()
+        });
+    });
+    group.bench_function("neleus_rrf_recorded", |b| {
+        b.iter(|| {
+            let hits = neleus
+                .engine
+                .search_hybrid_unrecorded(
+                    neleus.commit,
+                    Some("vector retrieval latency"),
+                    Some(&neleus.query_vec),
+                    10,
+                    &filter,
+                )
+                .unwrap();
+            neleus
+                .engine
+                .record_query_at_head(
+                    "main",
+                    neleus.commit,
+                    "hybrid",
+                    Some("vector retrieval latency"),
+                    Some(&neleus.query_vec),
+                    10,
+                    &filter,
+                    Some("bench"),
+                    &hits,
+                )
+                .unwrap()
+        });
+    });
+    // Per-search cost with 8 concurrent searchers; their records group-commit.
+    group.bench_function("neleus_semantic_recorded_8way", |b| {
+        b.iter_custom(|iters| {
+            let per_thread = (iters as usize).div_ceil(8).max(1);
+            let start = Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        for _ in 0..per_thread {
+                            neleus
+                                .engine
+                                .search(
+                                    "main",
+                                    Some(neleus.commit),
+                                    SearchQuery::Semantic("vector retrieval latency"),
+                                    10,
+                                    &filter,
+                                    Some("bench"),
+                                )
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+            start
+                .elapsed()
+                .mul_f64(iters as f64 / (per_thread * 8) as f64)
         });
     });
     group.finish();

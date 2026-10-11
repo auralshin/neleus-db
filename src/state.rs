@@ -10,11 +10,10 @@ use crate::hash::{Hash, hash_blob, hash_typed};
 use crate::object_store::ObjectStore;
 
 const STATE_TAG: &[u8] = b"state_node:";
-const LEVEL_TAG: &[u8] = b"state_level:";
 const STATE_SCHEMA_VERSION: u32 = 3;
 
 /// Fanout knob: a key is a boundary at level L iff `key_level(key) > L`, and
-/// `key_level` counts leading zero bits of `hash(key)` in groups of this many
+/// `key_level` counts leading zero bits of `keyed_hash(key)` in groups of this many
 /// bits. 5 bits ⇒ boundary probability 1/32 per level ⇒ average fanout 32 ⇒
 /// depth ~log32(n) (≈4 for millions of keys). Bigger ⇒ shallower reads, wider
 /// proofs.
@@ -149,6 +148,9 @@ pub struct StateStore {
     node_cache: Arc<std::sync::RwLock<std::collections::HashMap<Hash, Arc<StateNode>>>>,
     manifest_cache:
         Arc<std::sync::RwLock<std::collections::HashMap<StateRoot, Arc<StateManifest>>>>,
+    /// Per-database secret keying the boundary hash, so a writer cannot grind
+    /// keys that never cut a node and build one O(N)-wide leaf.
+    boundary_key: crate::hash::Key,
 }
 
 /// Cache entry cap; overflow clears (perf reset, never a correctness event).
@@ -158,14 +160,40 @@ const STATE_CACHE_CAP: usize = 8192;
 pub const INLINE_VALUE_MAX: usize = 512;
 
 impl StateStore {
-    pub fn new(objects: ObjectStore, blobs: BlobStore) -> Self {
+    pub fn new(objects: ObjectStore, blobs: BlobStore, boundary_key: [u8; 32]) -> Self {
         Self {
             objects,
             blobs,
+            boundary_key: crate::hash::Key(boundary_key),
             empty_root: Arc::new(OnceLock::new()),
             node_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             manifest_cache: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Handle whose large values are salted into `head`'s namespace, like
+    /// every other blob written under a head.
+    pub fn for_head(&self, head: &str) -> Self {
+        Self {
+            blobs: self.blobs.for_head(head),
+            ..self.clone()
+        }
+    }
+
+    /// Boundary level of a key: leading zero bits of the keyed hash divided by
+    /// `BITS_PER_LEVEL`, capped. A key is a boundary at level L iff this is `> L`.
+    fn key_level(&self, key: &[u8]) -> u32 {
+        let h = blake3::keyed_hash(&self.boundary_key.0, key);
+        let mut zeros = 0u32;
+        for &b in h.as_bytes() {
+            if b == 0 {
+                zeros += 8;
+            } else {
+                zeros += b.leading_zeros();
+                break;
+            }
+        }
+        (zeros / BITS_PER_LEVEL).min(MAX_LEVEL)
     }
 
     fn encode_value(&self, value: &[u8]) -> Result<ValueRef> {
@@ -489,7 +517,7 @@ impl StateStore {
         let mut cur: Vec<(Vec<u8>, ValueRef)> = Vec::new();
         for (k, v) in entries {
             cur.push((k.clone(), v.clone()));
-            if key_level(k) > 0 {
+            if self.key_level(k) > 0 {
                 out.push(self.store_leaf(std::mem::take(&mut cur))?);
             }
         }
@@ -510,7 +538,7 @@ impl StateStore {
         let mut cur: Vec<(Vec<u8>, Hash)> = Vec::new();
         for (k, h) in entries {
             cur.push((k.clone(), *h));
-            if key_level(k) > level {
+            if self.key_level(k) > level {
                 out.push(self.store_branch(level, std::mem::take(&mut cur))?);
             }
         }
@@ -617,7 +645,7 @@ impl StateStore {
                 let child_level = node.level.saturating_sub(1);
                 if replaced > 0 {
                     let last = idx + replaced - 1;
-                    if last + 1 < items.len() && key_level(&items[last].0) <= child_level {
+                    if last + 1 < items.len() && self.key_level(&items[last].0) <= child_level {
                         let merged =
                             self.merge_siblings(child_level, items[last].1, items[last + 1].1)?;
                         items.splice(last..last + 2, merged);
@@ -650,7 +678,7 @@ impl StateStore {
                 match (a.last(), b.first()) {
                     // Left's own last child is still un-terminated: it has to
                     // absorb right's first child before this level is re-cut.
-                    (Some((lk, lh)), Some((_, rh))) if key_level(lk) <= child_level => {
+                    (Some((lk, lh)), Some((_, rh))) if self.key_level(lk) <= child_level => {
                         let fused = self.merge_siblings(child_level, *lh, *rh)?;
                         items.pop();
                         items.extend(fused);
@@ -782,22 +810,6 @@ fn value_commit(value: &ValueRef) -> Hash {
     }
 }
 
-/// Boundary level of a key: leading zero bits of `hash(key)` divided by
-/// `BITS_PER_LEVEL`, capped. A key is a boundary at level L iff this is `> L`.
-fn key_level(key: &[u8]) -> u32 {
-    let h = hash_typed(LEVEL_TAG, key);
-    let mut zeros = 0u32;
-    for &b in h.as_bytes() {
-        if b == 0 {
-            zeros += 8;
-        } else {
-            zeros += b.leading_zeros();
-            break;
-        }
-    }
-    (zeros / BITS_PER_LEVEL).min(MAX_LEVEL)
-}
-
 /// Index of the child that would hold `key`. Callers index `entries` with the
 /// result, so `entries` must be non-empty: `load_node` rejects empty nodes and
 /// `verify_path` checks explicitly before calling.
@@ -842,7 +854,7 @@ mod tests {
         objects.ensure_dir().unwrap();
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        StateStore::new(objects, blobs)
+        StateStore::new(objects, blobs, [7; 32])
     }
 
     /// Rebuild the canonical root for `model` directly — the oracle incremental
@@ -1145,7 +1157,7 @@ mod tests {
         }
         assert_eq!(
             root.to_string(),
-            "65f3a311333022cb0a16e6dff0902eb31c57cc6a698b2e3ebeae04c6bce6681b",
+            "45032922d678a5577ec2256f5742e1f73c86a543c4520f6b7637f108c7052a17",
             "state root format changed"
         );
     }
@@ -1227,6 +1239,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn boundary_key_changes_the_tree_not_the_contents() {
+        let tmp = TempDir::new().unwrap();
+        let a = store(&tmp);
+        let objects = ObjectStore::new(tmp.path().join("objects"));
+        let b = StateStore::new(objects, BlobStore::new(tmp.path().join("blobs")), [9; 32]);
+        let (mut ra, mut rb) = (a.empty_root().unwrap(), b.empty_root().unwrap());
+        let keys: Vec<Vec<u8>> = (0..2000).map(|i| format!("k{i:05}").into_bytes()).collect();
+        for k in &keys {
+            ra = a.set(ra, k, b"v").unwrap();
+            rb = b.set(rb, k, b"v").unwrap();
+        }
+        // Different cuts give different roots; lookups and proofs are unaffected.
+        assert_ne!(ra, rb);
+        for k in keys.iter().step_by(97) {
+            assert_eq!(b.get(rb, k).unwrap().as_deref(), Some(&b"v"[..]));
+            assert!(b.proof(rb, k).unwrap().verify(rb, k));
+        }
+    }
+
     /// A key whose `key_level` is 2 or more terminated a node at *every* level
     /// below it, so deleting it needs a merge at each of those levels, not just
     /// the leaf. These keys occur at a rate of about 2^-10, so a small corpus
@@ -1235,14 +1267,16 @@ mod tests {
     fn deletes_of_high_level_boundary_keys_stay_canonical() {
         // Level assignment is a hash, so scan for qualifying keys rather than
         // assuming a corpus contains any, then build a window around them.
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
         let name = |i: usize| format!("k{i:06}").into_bytes();
-        let deep_idx: Vec<usize> = (0..200_000).filter(|&i| key_level(&name(i)) >= 2).collect();
+        let deep_idx: Vec<usize> = (0..200_000)
+            .filter(|&i| s.key_level(&name(i)) >= 2)
+            .collect();
         let pivot = *deep_idx.first().expect("some key must land at level 2+");
         let lo = pivot.saturating_sub(1500);
         let hi = pivot + 1500;
 
-        let tmp = TempDir::new().unwrap();
-        let s = store(&tmp);
         let mut root = s.empty_root().unwrap();
         let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
         let keys: Vec<Vec<u8>> = (lo..hi).map(name).collect();
@@ -1251,13 +1285,17 @@ mod tests {
             model.insert(k.clone(), b"v".to_vec());
         }
 
-        let deep: Vec<Vec<u8>> = keys.iter().filter(|k| key_level(k) >= 2).cloned().collect();
+        let deep: Vec<Vec<u8>> = keys
+            .iter()
+            .filter(|k| s.key_level(k) >= 2)
+            .cloned()
+            .collect();
         assert!(
             !deep.is_empty(),
             "corpus must contain a level-2+ boundary to exercise the nested merge"
         );
         for k in &deep {
-            let level = key_level(k);
+            let level = s.key_level(k);
             root = s.del(root, k).unwrap();
             model.remove(k);
             assert_eq!(
