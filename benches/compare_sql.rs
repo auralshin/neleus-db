@@ -273,9 +273,11 @@ fn bench_compare(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("point_set_durable");
     group.sample_size(50);
+    // Counters live outside the routine: criterion calls it once per sample,
+    // and a reset counter rewrites existing keys, which costs no write at all.
+    let mut i = 0usize;
     group.bench_function("neleus_state_set", |b| {
         let db = neleus.engine.db();
-        let mut i = 0usize;
         b.iter(|| {
             let key = format!("bench-set-{i}");
             i += 1;
@@ -288,7 +290,6 @@ fn bench_compare(c: &mut Criterion) {
             .conn
             .prepare("INSERT OR REPLACE INTO kv(key, value) VALUES (?1, ?2)")
             .unwrap();
-        let mut i = 0usize;
         b.iter(|| {
             let key = format!("bench-set-{i}");
             i += 1;

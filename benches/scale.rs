@@ -258,11 +258,14 @@ fn bench_scale(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("coalesced_single_write");
     group.sample_size(30);
+    // Outside the routine so every call writes new keys (see compare_sql).
+    let next = std::sync::atomic::AtomicUsize::new(0);
     group.bench_function("neleus_coalesced_8writers", |b| {
         let writer = Arc::new(f.engine.coalescing_writer("text"));
         b.iter_custom(|iters| {
             // Per-op cost under 8-way concurrency, amortized.
             let per_thread = (iters as usize).div_ceil(8).max(1);
+            let base = next.fetch_add(per_thread, std::sync::atomic::Ordering::Relaxed);
             let start = Instant::now();
             std::thread::scope(|s| {
                 for t in 0..8 {
@@ -270,7 +273,7 @@ fn bench_scale(c: &mut Criterion) {
                     s.spawn(move || {
                         for i in 0..per_thread {
                             writer
-                                .set(format!("b-{t}-{i}").as_bytes(), b"payload")
+                                .set(format!("b-{t}-{}", base + i).as_bytes(), b"payload")
                                 .unwrap();
                         }
                     });
