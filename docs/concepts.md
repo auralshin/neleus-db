@@ -1,120 +1,80 @@
 # Concepts
 
-The mental model. Read this before [../DESIGN.md](../DESIGN.md), which goes
-to the byte level.
+The model in brief. [../DESIGN.md](../DESIGN.md) covers the byte level.
 
 ## Content addressing
 
-Everything durable is identified by the BLAKE3 hash of its bytes. A blob's
-name is `blake3("blob:" ‖ salt ‖ bytes)`, where the salt is a keyed hash of
-the bytes under a key derived from the database `secret` and the head's
-namespace (the part before the first `/`, e.g. a tenant); a commit's name is
-`blake3("commit:" ‖ dag_cbor(commit))`. The domain prefix (`blob:`,
-`commit:`, `manifest:`, …) keeps types from colliding.
+Every durable object is named by the BLAKE3 hash of its bytes, with a type
+prefix (`blob:`, `commit:`, `manifest:`, ...) so types cannot collide. Change a
+byte and the name changes, so a reference can never silently point at
+different content.
 
-Two consequences fall straight out:
+Blobs are stored as `salt || content`. The salt is a keyed hash of the content
+under a key derived from the database `secret` and the head's namespace (the
+part before the first `/`). So identical content dedups within a namespace but
+gets different ids across tenants, and an id cannot be confirmed from guessed
+content without the secret.
 
-- **Dedup is free within a namespace.** Identical content under one namespace
-  writes once; across namespaces it gets distinct ids, so one tenant cannot
-  detect another's documents, and an id cannot be confirmed by guessing
-  content without the secret.
-- **Tampering is detectable.** Change a byte, change the hash. A reference to
-  the old hash no longer resolves to the altered bytes — it resolves to
-  nothing, or to the original if it still exists. You cannot quietly swap
-  what a hash points to.
+## Objects
 
-This is the whole trust story. Proofs, checkpoints, and signed commits are
-all built on "the name is the hash of the content."
+- **Blobs**: raw bytes (chunk text, embeddings, prompts, outputs).
+- **Manifests**: typed DAG-CBOR objects that point at blobs:
+  `DocManifest` (a chunked document), `ChunkManifest`, `SummaryManifest`,
+  `RunManifest` (one model call: prompt, params, inputs, outputs, retrieved
+  chunks), and `QueryManifest` (one retrieval: principal, query, commit
+  searched, hits). The last is the audit record.
+- **State**: a versioned key/value map stored as a prolly tree (a Merkle
+  search tree). The same key set always gives the same root. Node boundaries
+  are keyed by the database secret so a writer cannot force huge nodes. Any
+  key has an O(log n) membership or non-membership proof against a root.
+  Session memory lives in a reserved keyspace of state.
+- **Commits**: `{parents, author, message, state_root, manifests, ...}`,
+  optionally ed25519-signed. Each commit's state also indexes every manifest
+  committed so far under `__manifests__/`.
 
-## Objects and manifests
+## Two planes
 
-- **Blobs** — raw bytes (chunk text, embeddings, values, prompts).
-- **Manifests** — typed DAG-CBOR objects that reference blobs by hash:
-  - `DocManifest` — a chunked document (list of chunk-blob hashes + metadata).
-  - `ChunkManifest` — one chunk with an optional embedding and metadata.
-  - `SummaryManifest` — a hierarchical summary pointing at its children.
-  - `RunManifest` — one model invocation: prompt, system prompt, params,
-    inputs, outputs, retrieved chunks.
-  - `QueryManifest` — one retrieval: principal, query, the commit queried,
-    every returned chunk. This is the audit record.
-- **State** — a versioned key/value map stored as a content-addressed prolly
-  tree (a Merkle B+-tree).
-- **Commits** — `{parents, author, message, state_root, manifests, …}`,
-  optionally ed25519-signed. The git-shaped unit of history.
+- **Canonical**: `blobs/`, `objects/`, `refs/`. Content-addressed and the
+  source of truth. Its encoding is fixed by golden tests.
+- **Serving**: `index/` (BM25, HNSW, metadata) and in-memory caches. Derived
+  from canonical data and never hashed into any identity. Deleting `index/`
+  only costs a rebuild.
 
-## State: a versioned KV with proofs
-
-State is an ordered, content-addressed prolly tree (Merkle Search Tree). Node
-boundaries are derived from a hash of the key keyed by a per-database secret
-(derived from `secret`), so within a database the shape is a pure function of the key
-set — the same keys always yield the same root, regardless of write order. The
-secret stops a writer from choosing keys that never cut a node and building one
-huge leaf.
-High fanout keeps it shallow (depth `~log32(n)`), so reads, writes, and proofs
-all follow a short root→leaf path. Small values inline into leaves, large ones
-become blobs. Because every node's hash commits to its subtree, you can produce
-an O(log n) **membership or non-membership proof** for any key against a state
-root, verifiable from the root hash alone.
-
-Session memory (`session append/list/gc`) lives in a reserved keyspace of the
-state store, so it inherits proofs, history, and encryption for free, and
-adds TTL on top.
-
-## The two planes
-
-This is the load-bearing idea.
-
-```
-CANONICAL plane — immutable, content-addressed, the source of truth
-  blobs/  objects/  refs/        ← hashed into identity; the trust anchor
-
-SERVING plane — derived, rebuildable, fast, never hashed into identity
-  index/segments/  index/heads/  ← BM25 + HNSW + metadata; delete & rebuild
-  in-memory caches               ← segments, state objects, blobs
-```
-
-The canonical plane is frozen discipline: its byte encoding is locked by
-golden tests, because changing it would invalidate every existing hash and
-proof. The serving plane is the opposite — it is *derived* from canonical
-data and never hashed into any identity, so it is free to use mutable,
-cache-friendly, SIMD-friendly layouts and proven index libraries. Delete
-`index/` and you lose nothing but warm-up time.
-
-Every query runs against a commit root, which gives you **snapshot isolation**
-and **time-travel** (`search --head <h> --at <commit-hash>`) for free.
+Every query runs against a commit, so you get snapshot reads and can search
+any past commit of a head.
 
 ## Retrieval
 
-- **BM25** over an inverted index with MaxScore pruning (cost tracks result
-  density, not corpus size).
-- **Vector** via a hand-rolled HNSW graph; at production dims (≥256) the graph
-  traverses on SQ8 int8 codes and reranks the top candidates in f32. Recall
-  is pinned in tests against an exact brute-force oracle (recall@10 ≥ 0.90).
-- **Hybrid** runs both concurrently and fuses with Reciprocal Rank Fusion.
-- **Filters** (tenant, doc type, language, ACL, validity instant) are
-  prefilters — applied before scoring, never after, so they never leak
-  existence through scores or timing.
+- **BM25** (`semantic` mode) over an inverted index.
+- **Vector** search over an HNSW graph, using int8 (SQ8) codes at 256+
+  dimensions with f32 rerank. Embeddings are supplied by the caller.
+- **Hybrid** fuses both with Reciprocal Rank Fusion.
+- **Filters** (tenant, doc type, language, ACL tags, validity time) apply
+  before scoring, and BM25 statistics cover only what the caller may see.
 
 ## Verifiability
 
-Four layers, each building on content addressing:
+1. **Signed commits**: ed25519 over the commit's payload hash.
+2. **Checkpoints**: an append-only, optionally signed chain per head. Each one
+   links its predecessor, holds an RFC 6962 Merkle root over every
+   checkpointed commit, and pins the newest retrieval record and event-log
+   entry. Keep a checkpoint hash outside the database to detect later
+   rewrites.
+3. **Chunk proofs**: one commit plus one state path to the manifest's
+   `__manifests__/` entry, the manifest, and optionally the chunk bytes.
+   Proof size does not grow with history. A proof can carry an anchor that
+   ties the commit to a checkpoint.
+4. **Retrieval records**: a per-head chain (`refs/records/<head>`) with a
+   gapless `seq`, kept off the commit history. Every search on a head adds
+   one. Audit bundles export a window of them with the edge records that
+   show nothing was dropped.
 
-1. **Signed commits** — ed25519 over the commit's canonical payload hash.
-2. **Checkpoint chains** — an append-only object chain per head, each
-   checkpoint committing to its predecessor's hash and (optionally) signed. A
-   transparency-log spine: rewriting history breaks the chain even for
-   someone holding the commit signing key. Publish the latest hash anywhere
-   durable to externally anchor everything below it.
-3. **Chunk proofs** — a self-contained bundle proving `(commit, chunk)`:
-   commit hash → a state path showing the commit indexes the manifest → the
-   manifest that lists the chunk → the chunk bytes, every link a hash
-   equation. The size does not grow with history. Verifiable offline.
-4. **Audit records** — `QueryManifest`s in a per-head record chain kept off
-   the data history (`refs/records/<head>`), exportable as a signed bundle. The audit log is itself content-addressed and provable.
+What a chunk proof shows is that a chunk was in the corpus at a commit. It does
+not show the chunk was retrieved; the retrieval record does that.
 
-## Local and hosted are the same engine
+## Same engine, local or served
 
-Embed the crate (`Engine::open`) and you get the full API in-process. Run
-`neleus-db serve` and the HTTP server is a thin layer over the *same*
-`Engine` — local and hosted behavior cannot drift. Replication is git-style
-push/pull of content-addressed packs, fast-forward only.
+`Engine::open` gives the full API in process. `neleus-db serve` is a thin HTTP
+layer over the same `Engine`. Replication is push/pull of content-addressed
+packs, fast-forward only, between databases that share the same `secret`
+(`db init --replica-of <url>`).

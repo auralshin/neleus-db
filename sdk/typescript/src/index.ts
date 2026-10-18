@@ -184,11 +184,13 @@ export class Client {
     });
   }
 
-  async prove(commit: string, chunk: string, includeContent = true): Promise<string> {
+  // Tenant-scoped keys must name one of their heads and pass includeContent = false.
+  async prove(commit: string, chunk: string, includeContent = true, head?: string): Promise<string> {
     const r = await this.json<{ proof_cbor: string }>("POST", "/v1/proofs/chunk", {
       commit,
       chunk,
       include_content: includeContent,
+      ...(head === undefined ? {} : { head }),
     });
     return r.proof_cbor;
   }

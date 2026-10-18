@@ -1,169 +1,145 @@
 # CLI reference
 
-Two binaries: `neleus-db` (database + server) and `neleus-verify` (standalone
-audit verifier).
+Two binaries: `neleus-db` and `neleus-verify`. Global flags: `--db <path>`
+(default `./neleus_db`), `--json`. `neleus-db <group> <cmd> --help` is
+authoritative.
 
-Global flags on `neleus-db`:
+## db
 
-- `--db <path>` — database directory (default `./neleus_db`).
-- `--json` — machine-readable output. Most commands honor it.
+- `db init <path> [--replica-of <url>] [--token-env <VAR>]`: Create a database; `--replica-of` clones a `serve` peer and adopts its secret.
+- `db reencrypt [--new-password-env <VAR>]`: Rotate the encryption password (default env `NELEUS_DB_NEW_ENCRYPTION_PASSWORD`).
+- `db pack <out> [--compress]`: Export to one file; `--compress` uses zstd.
+- `db unpack <input> [--force] [--verify-only]`: Restore from a pack, or only check it.
+- `db repack`: Consolidate loose objects into packs.
+- `db packs`: List pack files.
+- `db gc [--prune] [--grace-secs <n>]`: Report unreachable objects; delete with `--prune`. Grace default 3600.
+- `db pull --remote <url> [--token-env <VAR>]`: Pull objects and fast-forward refs from a peer.
+- `db push --remote <url> [--token-env <VAR>]`: Push to a peer (fast-forward only).
 
-Run `neleus-db <group> --help` for the authoritative flag list; this is the
-map.
+`--token-env` defaults to `NELEUS_DB_TOKEN`; the remote needs an admin key.
 
-## db — lifecycle, backup, GC, replication
+## blob, object
 
-| Command | What it does |
-|---|---|
-| `db init <path> [--replica-of <url>] [--token-env <VAR>]` | Create a new database; `--replica-of` clones a `serve` peer and adopts its database secret, which later pulls and pushes require. |
-| `db reencrypt --new-password-env <VAR>` | Rotate the encryption password (re-wraps ciphertext; `master_salt` unchanged). |
-| `db pack <out> [--compress]` | Export the whole DB to one self-contained file. |
-| `db unpack <input> [--force] [--verify-only]` | Restore from a pack; `--verify-only` checks integrity without writing. |
-| `db repack` | Consolidate loose objects into pack files. |
-| `db packs` | List internal pack files. |
-| `db gc [--prune] [--grace-secs <n>]` | Reclaim unreachable objects. Dry-run unless `--prune`. |
-| `db pull --remote <url> [--token-env <VAR>]` | Pull missing objects + fast-forward refs from a `serve` peer. |
-| `db push --remote <url> [--token-env <VAR>]` | Push to a `serve` peer (fast-forward only). |
+- `blob put <file>`: Store bytes, print the hash.
+- `blob get <hash> <out-file>`: Write bytes for a hash.
+- `object inspect <hash>`: Decode an object and report its type.
 
-## blob / object — raw content
+## manifest
 
-| Command | What it does |
-|---|---|
-| `blob put <file>` | Store bytes, print the hash. |
-| `blob get <hash> <out>` | Read bytes by hash. |
-| `object inspect <hash>` | Decode an object, reporting its detected type. |
+- `manifest put-doc --source <s> --file <f> --chunk-size <n>`: Chunk a file and store a `DocManifest`.
+- `manifest put-run --model <m> --prompt-file <f>`: Record one model call as a `RunManifest`.
 
-## manifest — documents and runs
+`put-doc` flags: `--overlap <n>` (default 0), `--tenant <t>`, `--doc-type <t>`,
+`--language <l>`, `--valid-from <unix>`, `--valid-to <unix>`,
+`--expires-at <unix>`, `--acl <tag>` (repeatable).
 
-| Command | What it does |
-|---|---|
-| `manifest put-doc --source <s> --file <f> --chunk-size <n> [--overlap <n>] [--doc-type <t>] [--language <l>] [--valid-from <unix>] [--valid-to <unix>] [--expires-at <unix>] [--acl <tag>]…` | Chunk a file, store chunks + a `DocManifest` with metadata. |
-| `manifest put-run --model <m> --prompt-file <f> [--provider …] [--system-prompt-file …] [--params-json …] [--param k=v]… [--retrieved-chunk <hash>]… [--io-hashes in:<hash>] [--io-hashes out:<hash>] …` | Record one model invocation as a `RunManifest`. |
+`put-run` flags: `--provider <p>`, `--system-prompt-file <f>`,
+`--params-json <f>`, `--param k=v` (repeatable, numbers and bools inferred),
+`--retrieved-chunk <hash>` (repeatable), `--io-hashes in:<hash>|out:<hash>`
+(repeatable), `--sdk-version <v>`, `--agent-id <id>`, `--started-at <unix>`,
+`--ended-at <unix>` (both default to now).
 
-## state — versioned KV
+## state
 
-| Command | What it does |
-|---|---|
-| `state set <head> <key> <value-file> [--key-encoding utf8\|hex\|base64]` | Write a value. |
-| `state get <head> <key> [--key-encoding …] [--out-file <p>]` | Read a value. |
-| `state del <head> <key> [--key-encoding …]` | Delete a key. |
-| `state set-many <head> <entries-file>` / `state del-many <head> <keys-file>` | Batch writes/deletes from a JSON file. |
-| `state compact <head>` | No-op — the prolly-tree state is always canonical (retained for compatibility). |
+- `state set <head> <key> <value-file>`: Write a value.
+- `state get <head> <key> [--out-file <p>]`: Read a value.
+- `state del <head> <key>`: Delete a key.
+- `state set-many <head> <entries-file>`: Batch write; JSON `[{"key": "...", "value_base64": "..."}]`.
+- `state del-many <head> <keys-file>`: Batch delete; JSON `["k1", "k2"]`.
+- `state compact <head>`: No-op; the tree is always canonical. Prints the state root.
 
-## commit / log / proof — history and proofs
+`set`, `get`, `del` take `--key-encoding utf8|hex|base64` (default `utf8`).
 
-| Command | What it does |
-|---|---|
-| `commit new --head <h> --author <a> --message <m> [--manifest <hash>]… [--sign-key <key>]` | Create a commit, optionally ed25519-signed; auto-indexes. |
-| `commit verify <hash> --public-key <hex>` | Verify a signed commit. |
-| `log <head>` | Walk commit history. |
-| `proof state <head> <key> [--key-encoding …]` | Membership/non-membership proof for a key. |
-| `proof chunk --head <h> --chunk <hash> [--include-content] [--anchor-head <h>] [--out <file>]` | Build an offline chunk-proof bundle; `--anchor-head` adds an inclusion proof in that head's latest checkpoint. |
-| `proof verify-chunk <input>` | Verify a chunk-proof bundle (exit 1 on invalid). |
+## commit, log, proof
 
-## index / search — retrieval
+- `commit new --head <h> --author <a> --message <m> [--manifest <hash>]... [--sign-key <seed>]`: Create a commit, optionally ed25519-signed.
+- `commit verify <hash> --public-key <hex>`: Verify a signed commit.
+- `log <head>`: Walk commit history.
+- `proof state <head> <key> [--key-encoding ...]`: Membership or non-membership proof.
+- `proof chunk --head <h> --chunk <hash> [--include-content] [--anchor-head <h>] [--out <file>]`: Chunk proof bundle. `--head` is a head or commit; `--anchor-head` adds inclusion in that head's latest checkpoint; without `--out`, prints base64 JSON.
+- `proof verify-chunk <input>`: Verify a CBOR bundle from `proof chunk --out`; exit 1 if invalid.
 
-| Command | What it does |
-|---|---|
-| `index build --head <h>` | Build the index for a commit (also happens lazily on first query). |
-| `index stats --head <h>` | Segment/chunk/term/vector counts. |
-| `search semantic --head <h> (--query <q> \| --query-file <f>) [--top-k <n>] [filters] [--at <commit>]` | BM25 search. |
-| `search vector --head <h> --embedding-file <f> [--top-k <n>] [filters] [--at <commit>]` | HNSW vector search. |
-| `search hybrid --head <h> [--query <q>] [--embedding-file <f>] [--top-k <n>] [filters] [--at <commit>]` | BM25 + vector, RRF-fused. |
+## index, search
 
-`head` must name a head: every search is recorded on it as a chained
-`QueryManifest` and its hash is printed. `--at` searches a past commit
-(time-travel) while still recording on `head`. Filter
-flags shared by all modes: `--tenant`, `--doc-type`, `--language`, `--acl
-<tag>` (repeatable), `--valid-at <unix>`.
+- `index build --head <h>`: Build the index (also built lazily on first query).
+- `index stats --head <h>`: Segment, chunk, term, and vector counts.
+- `search semantic --head <h> (--query <q> | --query-file <f>)`: BM25.
+- `search vector --head <h> --embedding-file <f>`: HNSW vector search.
+- `search hybrid --head <h> [--query <q> | --query-file <f>] [--embedding-file <f>]`: BM25 + vector, RRF-fused.
 
-## key / checkpoint — signing and transparency log
+Search flags: `--at <commit>` (search a past commit), `--top-k <n>` (default
+10), `--tenant <t>`, `--doc-type <t>`, `--language <l>`, `--acl <tag>`
+(repeatable), `--valid-at <unix>`.
 
-| Command | What it does |
-|---|---|
-| `key generate --out <file>` | Generate an ed25519 keypair; prints the public key, writes the seed (0600). |
-| `checkpoint new --head <h> [--sign-key <key>]` | Append a checkpoint to the head's chain. |
-| `checkpoint verify --head <h> [--public-key <hex>] [--require-signatures]` | Verify the chain to genesis. |
+Every search is recorded on `--head`, including `--at` searches. The record
+hash is printed.
 
-## session — episodic memory
+## key, checkpoint
 
-| Command | What it does |
-|---|---|
-| `session append --head <h> --session-id <id> [--role <r>] (--content <s> \| --content-file <f>) [--ttl-secs <n>]` | Append a turn. |
-| `session list --head <h> --session-id <id> [--include-expired]` | List turns (oldest first). |
-| `session gc --head <h>` | Remove expired records (honors the retention floor). |
+- `key generate --out <file>`: Write an ed25519 seed (0600), print the public key.
+- `checkpoint new --head <h> [--sign-key <seed>]`: Append a checkpoint.
+- `checkpoint verify --head <h> [--public-key <hex>] [--require-signatures]`: Verify the chain to genesis.
 
-## audit — the audit surface
+## session
 
-| Command | What it does |
-|---|---|
-| `audit log --head <h> [--from <unix>] [--to <unix>]` | List retrieval audit records. |
-| `audit export --head <h> [--from] [--to] --out <file> [--sign-key <key>] [--anchor <checkpoint>]` | Write a self-contained, optionally signed bundle; `--anchor` adds a consistency proof from that retained checkpoint. |
-| `audit verify <input> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>]` | Verify a bundle offline (same as `neleus-verify`); `--anchor` checks the bundle's log extends that checkpoint. |
+- `session append --head <h> --session-id <id> [--role <r>] (--content <s> | --content-file <f>) [--ttl-secs <n>]`: Append a turn. Roles: `user`, `assistant`, `tool`, `summary`, ...
+- `session list --head <h> --session-id <id> [--include-expired]`: List turns, oldest first.
+- `session gc --head <h>`: Remove expired records.
 
-## policy / events — monitor and enforce
+## audit
 
-| Command | What it does |
-|---|---|
-| `policy list` | Print the current policy set. |
-| `policy set <file.json>` | Replace the whole set (policy-as-code apply). |
-| `policy rm --id <id>` | Remove one policy. |
-| `policy eval [--head <h>]` | Score every enabled policy against live state. |
-| `events list [--since <seq>]` | List recorded violation/enforcement events. |
-| `events verify` | Verify the event chain is intact (tamper-evident). |
+- `audit log --head <h> [--from <unix>] [--to <unix>]`: List retrieval records.
+- `audit export --head <h> --out <file> [--from] [--to] [--sign-key <seed>] [--anchor <checkpoint>]`: Write a `.nelaudit` bundle; `--anchor` adds a consistency proof from a retained checkpoint.
+- `audit verify <input> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>]`: Verify a bundle offline, same as `neleus-verify`.
 
-`enforce`-mode policies also gate the server's write endpoints. See
-[policy.md](policy.md).
+`--from`/`--to` default to the full history.
 
-## erasure: GDPR right-to-be-forgotten
+## policy, events
 
-| Command | What it does |
-|---|---|
-| `erasure request --subject <id> [--reason <r>] [--sign-key <seed>]` | Shred the subject's content, keeping the signed commitment chain. |
-| `erasure list` | List recorded erasure records. |
-| `erasure verify --public-key <hex>` | Check every signed erasure record against a public key. |
+- `policy list`: Print the policy set.
+- `policy set <file>`: Replace the set from JSON `{"policies":[{"id","rule","mode"}]}`.
+- `policy rm --id <id>`: Remove one policy.
+- `policy eval [--head <h>]`: Evaluate enabled policies against live state.
+- `events list [--since <seq>]`: List violation and enforcement events.
+- `events verify`: Verify the event hash chain.
 
-`--reason` is `request` (default), `ttl`, or `account-closure`. Erasure removes
-the subject's *content* while leaving the commit graph and its hashes intact, so
-history still verifies and the removal is itself an auditable, hash-chained
-event. With `--sign-key` the record is ed25519-signed, which is what lets a third
-party confirm who authorized it.
+`enforce` policies also gate server writes. See [policy.md](policy.md).
 
-Encryption at rest makes this a crypto-shred and is the robust guarantee;
-without it the physical overwrite is best-effort on copy-on-write filesystems
-and SSDs. Over HTTP the same operations are `POST`/`GET /v1/erasure` (admin).
+## erasure
 
-## serve / auth — hosted mode
+- `erasure request --subject <id> [--reason request|ttl|account-closure] [--sign-key <seed>]`: Shred the subject's content; commit hashes stay intact.
+- `erasure list`: List erasure records.
+- `erasure verify --public-key <hex>`: Check signed erasure records.
 
-| Command | What it does |
-|---|---|
-| `serve --addr <a> [--open] [--no-bootstrap] [--allow-remote] [--no-auth] [--cors-origin <origin>] [--sign-key <seed>]` | Start the HTTP server + bundled console. |
-| `auth add-key --id <id> --role <reader\|writer\|admin> [--tenant <t>]` | Mint an API token (printed once). |
-| `auth remove-key --id <id>` | Revoke a key. |
-| `auth list-keys` | List key metadata (never secrets). |
+With encryption at rest this is a crypto-shred; without it, overwrite is
+best-effort on copy-on-write filesystems and SSDs.
 
-`serve` bundles the web console at `/` and prints a `neleus://…` connection
-string on startup. `--open` launches a browser; on loopback a bootstrap admin
-token is minted (disable with `--no-bootstrap`). See [http-api.md](http-api.md)
-for the routes.
+## serve, auth
 
-`--sign-key <seed>` (from `key generate`) signs audit bundles exported over
-HTTP. Startup says which mode you are in; without it those bundles carry only
-the unkeyed integrity footer, which anyone editing the file can recompute.
+- `serve`: Start the HTTP server and bundled console.
+- `auth add-key --id <id> --role reader|writer|admin [--tenant <t>]`: Mint an API token (printed once); `--tenant` pins it to `<tenant>/`.
+- `auth remove-key --id <id>`: Revoke a key.
+- `auth list-keys`: List key metadata.
 
-## neleus-verify — standalone auditor binary
+`serve` flags:
 
-No database, no network. Hand it the bundle.
+- `--addr <a>`: Bind address (default `127.0.0.1:7117`).
+- `--allow-remote`: Allow non-loopback binds; requires auth keys. Terminate TLS in front.
+- `--no-auth`: Disable auth (loopback only).
+- `--no-bootstrap`: Do not mint the loopback bootstrap admin token.
+- `--cors-origin <origin>`: Set `Access-Control-Allow-Origin`; `*` allows any.
+- `--open`: Open the console in a browser.
+- `--sign-key <seed>`: Sign audit bundles exported over HTTP.
+
+Routes: [http-api.md](http-api.md).
+
+## neleus-verify
 
 ```
-neleus-verify <bundle.nelaudit> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>] [--json]
+neleus-verify <bundle> [--public-key <hex>] [--require-signature] [--anchor <checkpoint>] [--json]
 ```
 
-Prints `VERIFIED: …` and exits 0, or `INVALID: …` and exits 1. Every claim is
-re-derived from bytes carried in the bundle.
-
-A bundle proves its window complete: it carries the record just before the
-window (or starts at sequence 0) and every record from the window up to each
-checkpoint's pinned record, so records dropped from either end are rejected.
-The report lists the keys that signed carried commits (`commit_keys`); compare
-them with the principals you trust.
+Needs no database or network. Prints `VERIFIED: ...` and exits 0, or
+`INVALID: ...` and exits 1. The report includes `commits_signed` and
+`commit_keys` (keys that signed carried commits); compare those with the keys
+you trust.

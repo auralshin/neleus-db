@@ -1,451 +1,230 @@
 # Design
 
-This is the single design document for the current codebase. It describes
-implemented architecture only; proposal-only ideas are listed as future work.
+## Planes
 
-## 1. Core Model
+- **Canonical**: blobs, typed DAG-CBOR objects, manifests, state, commits,
+  checkpoints, and retrieval records. Immutable, content-addressed, hashed into
+  identity.
+- **Serving**: retrieval indexes under `index/` (`engine::Engine`). Derived
+  and rebuildable; deleting `index/` costs warm-up time, not data.
 
-Neleus DB separates canonical truth from derived serving structures.
-
-Canonical data is immutable and content-addressed:
-
-- `BlobStore` stores raw bytes under `blobs/`.
-- `ObjectStore` stores typed DAG-CBOR objects under `objects/`.
-- `ManifestStore` stores document, chunk, summary, run, and query manifests.
-- `StateStore` stores versioned key/value state.
-- `CommitStore` stores a git-like commit graph over state and manifests.
-
-Derived data is rebuildable:
-
-- `engine::Engine` stores retrieval indexes under `index/`.
-- Index data is encrypted when database encryption is enabled, but it is not
-  part of canonical identity.
-- Deleting `index/` loses warm query performance, not durable truth.
-
-Every externally meaningful record can be traced back to canonical bytes and
-verified by hash equations.
-
-## 2. On-Disk Layout
+## On-disk layout
 
 ```text
 <db_root>/
-  blobs/                         raw content-addressed payloads
-    aa/bb/<hash>                 loose blob files
-    pack/                        consolidated blob packs
-  objects/                       typed content-addressed objects
-    aa/bb/<hash>                 loose object files
-    pack/                        consolidated object packs
-  refs/
-    heads/<name>                 commit refs
-    states/<name>                staged state refs
-    checkpoints/<name>           checkpoint-chain refs
-  index/
-    segments/<hash>              immutable retrieval index segments
-    heads/<commit>               segment set serving a commit
-  wal/                           ref-update WAL records
-  meta/
-    config.json                  database config
-    recovery.lock                open/recovery lock
+  blobs/, objects/              loose files (aa/bb/<hash>) and pack/
+  refs/heads/<name>             head commit
+  refs/states/<name>            staged state root
+  refs/checkpoints/<name>       newest checkpoint
+  refs/records/<name>           newest retrieval record
+  index/segments/<hash>         immutable index segments
+  index/heads/<commit>          segment set serving a commit
+  wal/                          ref WAL
+  meta/config.json              config, including the database secret
+  meta/events.jsonl             hash-chained event log
+  meta/auth.json, policy.json   API keys, policies
 ```
 
-Loose CAS files are the write path. `db repack` consolidates loose blobs and
-objects into pack files; reads check loose files and then pack indexes.
+Writes go to loose files; `db repack` moves them into packs.
 
-## 3. Canonical Encoding and Hashing
+## Content addressing
 
-Canonical serialization uses DAG-CBOR through `src/canonical.rs`. Hashing uses
-BLAKE3 plus domain separators so different object families cannot collide by
-sharing bytes.
-
-Domain tags include:
-
-- `blob:`
-- `manifest:`
-- `manifest_leaf:`
-- `state_node:` (covers state nodes *and* the state manifest; leaves and
-  branches are hashed uniformly as `dag_cbor(StateNode)`)
-- `state_level:` (key-boundary derivation, not an object domain)
-- `merkle_node:`
-- `merkle_root:` (transparency-log root, with the leaf count sealed in)
-- `commit:`
-- `commit_payload:`
-- `checkpoint:`
-- `checkpoint_payload:`
-- `checkpoint_leaf:` (a commit's leaf in the checkpoint transparency log)
-- `index_segment:`
-
-Representative formulas:
+Objects are DAG-CBOR (`canonical.rs`) hashed with BLAKE3 under a domain tag,
+so objects of different kinds cannot share a hash: `blob:`, `manifest:`,
+`manifest_leaf:`, `state_node:`, `commit:`, `commit_payload:`, `checkpoint:`,
+`checkpoint_payload:`, `checkpoint_leaf:`, `merkle_node:`, `merkle_root:`,
+`index_segment:`.
 
 ```text
-H_blob       = blake3("blob:" || bytes)
-H_manifest   = blake3("manifest:" || dag_cbor(manifest))
-H_state_node = blake3("state_node:" || dag_cbor(state_object))
-H_commit     = blake3("commit:" || dag_cbor(commit))
+H_blob     = blake3("blob:" || salt || content)
+H_manifest = blake3("manifest:" || dag_cbor(manifest))
+H_node     = blake3("state_node:" || dag_cbor(node))
+H_commit   = blake3("commit:" || dag_cbor(commit))
 ```
 
-Golden-byte tests in `canonical.rs` lock selected encodings so schema changes
-do not accidentally change canonical bytes.
+## Secret and salted blobs
 
-## 4. Database Lifecycle
+`meta/config.json` holds a random 32-byte `secret`. It derives the state-tree
+boundary key and the blob salt keys.
 
-`Database::init` creates directories and `meta/config.json`, then writes the
-empty state root. `Database::open`:
+A blob is stored as `salt || content`; its id hashes the whole payload. The
+salt is a keyed hash of the content under a key for the head's namespace (the
+head name before the first `/`, see `BlobStore::for_head`). The same content in
+two tenants gets two ids, and an id cannot be confirmed from content without
+the secret. Proofs carry the payload; `ChunkProof::chunk_content` strips the
+salt.
 
-1. Acquires `meta/recovery.lock`.
-2. Loads config and validates durability/encryption settings.
-3. Creates stores over `blobs/`, `objects/`, `refs/`, and `wal/`.
-4. Replays ref WAL entries.
-5. Cleans orphan atomic-write temp files.
+Replicas must share the secret (`db init --replica-of <url>`). Sync refuses to
+merge databases whose secrets or encryption configs differ.
 
-Config schema version is `3`. Current config fields include:
+## State
 
-- `verify_on_read`
-- optional `compression = "zstd"`
-- optional `encryption`
-- optional `durability = "os" | "full"`
-- optional `retention_min_secs`
-
-## 5. State Store
-
-State is an authenticated, content-addressed, ordered map: a **prolly tree**
-(content-defined Merkle Search Tree / B+-tree) keyed by the raw key. Node
-boundaries are content-defined — a key is a boundary at level `L` iff
-`key_level(key) > L`, where `key_level` counts leading zero bits of
-`keyed_hash(boundary_key, key)` in groups of `BITS_PER_LEVEL` (5 ⇒ average
-fanout 32). `boundary_key` is derived from the per-database `secret` in
-`meta/config.json` (which also derives blob salt keys), so
-writers cannot grind keys into one O(N)-wide leaf; replicas share it via
-`db init --replica-of`. Boundary status is a pure function of the key, so within
-a database a key set determines a unique tree shape regardless of write order
-(history independent ⇒ equal states have equal roots), and incremental writes touch only the affected root→leaf path. A state
-root points to a manifest:
+State is a prolly tree keyed by raw key. A key is a boundary at level `L` when
+the leading zero bits of `keyed_hash(boundary_key, key)`, divided by 5, exceed
+`L` (average fanout 32). The key is secret, so writers cannot grind keys into
+one huge leaf. Boundaries depend only on the key, so equal key sets have equal
+roots regardless of write order.
 
 ```text
-StateManifest {
-  schema_version,
-  root: Option<Hash>   // content hash of the root node; None = empty
-}
+StateManifest { schema_version, root: Option<Hash> }
+StateNode { level, items: Leaf([(key, Inline(bytes) | Value(blob))])
+                        | Branch([(last_key, child)]) }
 ```
 
-A node references its children by content hash, so a node's hash commits to its
-entire subtree — the tree is its own Merkle commitment, no separate merkle root:
+Values up to 512 bytes are inline; larger ones are blobs. Writes copy the
+root-to-leaf path and re-chunk locally. Deletes remove the entry; there are no
+tombstones.
+
+A `StateProof` is the node path from the root to the leaf that holds the key
+or would hold it, plus `Found` or `Missing`. The verifier re-hashes each node,
+checks routing by `last_key`, and inspects the leaf. Its size is the tree
+height.
+
+## Manifests
+
+Schema version 5. `DocManifest` (document, chunking spec, chunk hashes),
+`ChunkManifest` (text, byte range, optional embedding and metadata),
+`SummaryManifest`, `RunManifest` (a model call with prompt, outputs, tool
+calls, retrieved chunks, and trace lineage; model identity is as declared by
+the caller), and `QueryManifest` (one retrieval record).
+
+`ChunkMetadata` carries tenant, doc type, language, validity window,
+expiration, and ACL tags. An empty ACL is public; otherwise the caller's ACL
+filter must overlap it.
+
+## Commits and signing
 
 ```text
-StateNode {
-  level,
-  items: Leaf([(key, ValueRef)])        // ValueRef = Inline(bytes) | Value(blob hash)
-       | Branch([(last_key, child)])     // last_key = max key in the child subtree
-}
+Commit { schema_version, parents, timestamp, author, message,
+         state_root, manifests, signature?, payload_hash? }
 ```
 
-High fanout makes the tree shallow — depth `~log32(n)` (≈2–4 levels for
-millions of keys) — so reads, writes, and proofs all follow a short root→leaf
-path. Reads descend by routing to the first child whose `last_key >= key`.
-Writes copy-on-write that path and re-run the cut rule locally (splits and
-merges fall out of re-chunking); an empty base bulk-builds the canonical tree
-bottom-up in one pass. Values up to `INLINE_VALUE_MAX` (`512` bytes) are inline;
-larger values go to `BlobStore`. `del` removes the entry — no tombstones,
-absence is the only "not present" — and an emptied state returns to the
-canonical empty root. Range scans (`scan_prefix`) walk leaves in key order.
-Structural sharing across versions makes diffs, sync, and GC cheap. Decoded
-nodes and manifests are cached in process.
+A signature covers `commit_payload:` over the commit with `signature` and
+`payload_hash` cleared. The signature's `key_id` names its ed25519 key, so
+offline verifiers check signed commits without a store. A server started with
+a signing key signs every commit it makes.
 
-## 6. State Proofs
+A commit that introduces manifests writes a `__manifests__/<hash>` key for each
+into its state.
 
-`StateProof` verifies membership or non-membership against a state root without
-trusting the caller's result — from the root hash alone.
+## Retrieval record chain
 
-It carries:
+The server and CLI record every search; there is no opt-out. Library callers
+record through `Engine::search`; only `search_*_unrecorded` skips it. Searching
+a past commit (`commit` over HTTP, `--at` in the CLI) still records on the head.
 
-- manifest schema version and the root hash it anchors to
-- the search path: the actual `StateNode`s from the root to the leaf that holds
-  the key, or that would hold it
-- final outcome (`Found(value commitment)` or `Missing`)
+`refs/records/<head>` names the newest `QueryManifest`. Each record carries a
+gapless `seq` and a `prev` link. A batch writes its manifests, then one ref
+update commits it, so searches never add commits to data history. Concurrent
+recordings on a head group-commit (`engine/recorder.rs`). A `seq` gap shows a
+withheld record; nothing can show a search that was never recorded.
 
-Verification recomputes each path node's content hash, checks the first against
-the committed root and each branch's routing pointer (`route` by `last_key`)
-against the next node, and validates the terminal leaf: the key is present
-(membership) or absent in the leaf its range routes to (non-membership). Both
-cases are a single root→leaf path — proof size is the tree height
-`O(log_B n)`, independent of the number of writes.
+## Checkpoints
 
-## 7. Manifests
-
-`MANIFEST_SCHEMA_VERSION` is `5`.
-
-Implemented manifest families:
-
-- `DocManifest`: source document, original blob, chunking spec, chunk hashes,
-  and optional document-level metadata.
-- `ChunkManifest`: chunk text, byte range, optional embedding, optional
-  metadata.
-- `SummaryManifest`: summary text, optional embedding, child links, hierarchy
-  level, optional metadata.
-- `RunManifest`: model invocation with prompt, inputs, outputs, tool calls,
-  provider metadata, retrieved chunks, SDK version, agent id, and (v4) trace
-  lineage — `trace_id` (groups runs of one task across agent handoffs and model
-  switches), `parent_span` (the parent run's manifest hash, a verifiable span
-  edge), and `delegated_from` (the agent that handed off). The model/provider on
-  each run is the *declared* identity; neleus records what the caller stated, it
-  cannot cryptographically attest which remote model actually ran.
-- `QueryManifest`: content-addressed retrieval audit record containing query
-  text or embedding, filters, principal, commit, mode, top-k, returned chunk
-  hashes, and (v5) `seq` + `prev` linking it into the head's audit chain.
-  `Engine::record_query_at_head` allocates the sequence from the newest record
-  (`refs/records/<head>`, read by `audit::query_tip`) and publishes the batch
-  with one update of that ref; records never become commits on the data head,
-  so recording never adds commits to the data history. The server and
-  CLI record every search. A gap in the
-  sequence proves a record was removed from an export, and each checkpoint
-  pins the latest record so a truncated tail below an anchor is detected too.
-  Neither can prove a record was never written.
-
-`ChunkMetadata` supports retrieval filtering:
-
-- tenant
-- doc type
-- language
-- valid-from / valid-to
-- expiration
-- ACL tags
-
-Empty ACL means public. Non-empty ACL requires overlap with the caller's ACL
-filter.
-
-## 8. Commits and Signing
-
-Commits are canonical objects:
+`refs/checkpoints/<head>` names the newest checkpoint in a per-head hash chain:
 
 ```text
-Commit {
-  schema_version,
-  parents,
-  timestamp,
-  author,
-  message,
-  state_root,
-  manifests,
-  signature?,
-  payload_hash?
-}
+Checkpoint { schema_version, prev, head, commit, sequence, created_at,
+             signature?, key_id?, log_root, log_spine, query_tip?, event_tip? }
 ```
 
-Signed commits use `commit_payload:` over the unsigned commit body. The
-payload hash is stored so verifiers can re-derive the exact bytes that were
-signed. A signature's `key_id` names its ed25519 key, so offline verifiers
-(chunk proofs, audit bundles) check every carried signed commit without a
-store. A server started with a signing key signs every commit it makes.
+- `log_root` is an RFC 6962 Merkle root over every checkpointed commit, with
+  the leaf count sealed in. `log_spine` makes each append O(log J).
+- `prove_commit_logged` (inclusion) and `prove_append_only` (consistency) give
+  O(log J) offline proofs. `verify_chain` walks the whole chain.
+- `query_tip` pins the newest retrieval record and `event_tip` the newest event,
+  so truncation below a held checkpoint is detectable.
 
-Signing is pluggable through:
-
-- `CommitSigner`
-- `CommitVerifier`
-
-The built-in implementation uses ed25519 through `Ed25519Signer` and
-`Ed25519Verifier`. Key files are written with restrictive permissions.
-
-## 9. Retrieval Engine
-
-`engine::Engine` is the resident serving layer over a `Database`.
-
-Index layout:
+## Chunk proofs
 
 ```text
-index/segments/<hash>   immutable IndexSegment
-index/heads/<commit>    SegmentSetManifest for that commit
+commit -> state path to "__manifests__/<manifest>" -> manifest -> chunk payload
 ```
 
-A segment set is ordered oldest to newest; newer chunks win on chunk-hash
-collisions. Indexes cover the first-parent ancestry of a commit. Each commit
-adds a delta segment, and chains longer than `MERGE_THRESHOLD` (`8`) are
-merged into one segment.
+The prover searches ancestry for the introducing manifest, but the proof
+carries only the queried commit and one state path, so it does not grow with
+history. `prove_chunk_anchored` adds a checkpoint, its inclusion proof for a
+logged commit, and the first-parent path from that commit to the proof's
+commit.
 
-`IndexSegment` contains:
+## Audit bundles
 
-- chunk rows and metadata columns
-- BM25 postings
-- normalized vectors
-- scalar-quantized vectors for sufficiently large dimensions
-- HNSW graph when the segment has at least `256` vectors
+`audit` exports a head's record chain over a time window as a `NELAUDIT` file:
+named entries, a BLAKE3 footer, and an optional ed25519 signature over it.
 
-Query modes:
+- `meta.json`, `summary.txt`, `retrievals.jsonl`
+- `objects/<hash>`: commit and manifest bytes
+- `checkpoints/<hash>`: the latest checkpoint only, with
+  `checkpoint_inclusion` showing its commit is the last leaf of its log root
+- `pinned/<hash>`: the record that checkpoint pins
+- `edge/<hash>`: the record before the window and every record from the window
+  up to each pin, so the window is provably complete
+- with `--anchor`: `anchor/<hash>`, `anchor_inclusion`, and a consistency proof
+  from the retained checkpoint
 
-- lexical BM25
-- vector search with HNSW and exact-scan fallback
-- hybrid search using reciprocal rank fusion
+Verification needs no database or network. Against an anchor, truncation or
+re-chaining at or below the anchor's pin is rejected.
 
-Filters are applied before scoring where possible:
+## Erasure
 
-- tenant
-- doc type
-- language
-- ACL tags
-- validity instant
+`erase_subject` shreds blobs referenced only by one subject's runs, documents,
+and the retrievals that returned them; shared blobs are kept. It crypto-shreds
+when encryption is on and deletes otherwise. Manifests, commits, and
+checkpoints stay, so the chain still verifies. A signed `ErasureRecord` in the
+event log marks the deletion as authorized rather than tampering. A chunk proof
+for erased content sets `content_erased` and carries no bytes. Heads whose
+index used a shredded blob are reindexed.
 
-Hits carry `(commit, chunk_hash, score, preview)`. `Engine::prove` upgrades a
-hit to an offline-verifiable chunk proof.
+## Retrieval engine
 
-## 10. Session Memory
+`index/heads/<commit>` lists the segments covering a commit's first-parent
+ancestry. Each commit adds a delta segment; chains longer than 8 merge. A
+segment holds chunk rows, metadata columns, BM25 postings, vectors (SQ8 codes
+at 256 dims and above), and an HNSW graph above 1,024 vectors.
 
-Session memory is implemented over the state store under the reserved
-`__session__/` keyspace.
+Modes are BM25, vector (HNSW or exact scan), and hybrid by reciprocal rank
+fusion. Filters (tenant, doc type, language, ACL, validity) apply before
+scoring; filters narrower than 1,024 rows use exact scan.
 
-`SessionRecord` stores:
+Tenant isolation: BM25 statistics cover only what the caller may see, tenant
+queries read only that tenant's postings, and tenant vector queries use the
+tenant's own graph or an exact scan, never the shared graph.
 
-- session id
-- sequence number
-- optional role
-- content blob hash
-- created timestamp
-- optional expiration timestamp
+## Server and auth
 
-Reads filter expired records when a `now` instant is supplied. `session gc`
-tombstones expired records and compacts state, but honors
-`retention_min_secs`; canonical committed history is not automatically removed.
+`server` is std-only HTTP/1.1, loopback by default, with no in-process TLS.
+Headers, bodies, connections, and top-k are bounded; mutations take a
+single-writer lock. `serve` embeds the web console. API keys (`nlk_`) are
+stored as BLAKE3 hashes in `meta/auth.json`. Roles are
+`reader < writer < admin`. A tenant-bound key reaches only that tenant's heads,
+and its search filter is forced to that tenant.
 
-## 11. Audit
+## Durability
 
-Every audited retrieval is a `QueryManifest` in the head's record chain
-(`refs/records/<head>`), outside the data commit history.
+`durability` is process-wide, set at `Database::open`: `full` (default,
+`F_FULLFSYNC` on macOS), `barrier` (`F_BARRIERFSYNC` on macOS, full sync
+elsewhere), or `os` (no sync).
 
-`audit` can:
+CAS objects publish with a no-replace rename, falling back to a hard link.
+Commits move heads by compare-and-set. Head, staging, and record refs use
+`write_atomic` (temp file plus rename) without a WAL; checkpoint refs and
+sync's head writes go through the WAL, replayed on open. An interrupted write
+leaves only unreachable objects.
 
-- collect a head's record chain in a time window
-- export a self-contained `NELAUDIT` bundle
-- optionally sign the bundle footer with ed25519
-- verify the bundle offline without a database or network
+## Encryption and integrity
 
-Bundle entries include metadata, a summary, retrieval JSONL, canonical commit
-and manifest bytes, and checkpoint bytes. Verification re-derives claims from
-the carried bytes by hash equations.
+Optional AES-256-GCM or ChaCha20-Poly1305 over blobs, objects, and index
+segments. The master key comes from Argon2id (`m=19456 KiB, t=2, p=1`) at
+open; per-object keys from HKDF. Compression is optional `zstd`. With
+`verify_on_read`, reads re-hash bytes under the expected tag.
 
-## 12. Checkpoints
+## Other components
 
-Checkpoints form an append-only hash chain per head under
-`refs/checkpoints/<head>`.
-
-Each checkpoint records (schema version `3`):
-
-- head name
-- commit hash
-- previous checkpoint hash
-- timestamp
-- author
-- optional signature
-- payload hash
-- `log_root`: Merkle root (RFC 6962 shape, leaf count sealed in) over every
-  commit checkpointed on this head so far, plus `log_spine` (the perfect
-  subtree roots) so the next append is O(log J) rather than a rebuild. `prove_commit_logged` and
-  `prove_append_only` yield O(log J) proofs that verify offline; the chain walk
-  remains available but is O(J).
-
-`CheckpointStore::verify_chain` walks from the current checkpoint tip to
-genesis, verifies hash links, and optionally requires signatures.
-
-## 13. Chunk Proofs
-
-`retrieval_proof` creates offline-verifiable proof bundles for search hits.
-
-A chunk proof links:
-
-```text
-commit -> state path for "__manifests__/<manifest>" -> manifest -> chunk bytes
-```
-
-Every commit that introduces manifests writes their index keys into its
-state, so the proof is one commit plus one state path, independent of how
-many writes followed. The prover searches the ancestry for the manifest; the
-verifier replays the hash equations and checks the commit's state indexes it.
-
-## 14. Server, Auth, and Tenancy
-
-`server` is a small std-only HTTP/1.1 server around `Engine`.
-
-Properties:
-
-- loopback by default; TLS termination is expected in front for remote use
-- bounded headers, bodies, connections, and top-k
-- bearer token auth
-- single-writer mutex for mutating requests
-- CORS support when configured
-
-`auth` stores API keys in `meta/auth.json`.
-
-- Tokens use the `nlk_` prefix.
-- Stored records contain BLAKE3 token hashes, not raw tokens.
-- Secret comparison is constant-time.
-- Roles form a ladder: `reader < writer < admin`.
-- Optional tenant binding scopes heads and filters structurally.
-
-Tenant-scoped keys can only access their tenant's head namespace and have
-search filters forced to that tenant.
-
-## 15. Sync and Replication
-
-`sync` implements content-addressed push/pull over packs.
-
-Rules:
-
-- ref updates are fast-forward only
-- divergent refs are reported, not overwritten
-- checkpoint chains merge only when the remote chain contains the local tip
-- encryption configs must match exactly
-
-HTTP sync uses the same server API and caps response sizes.
-
-## 16. Crash Safety and Concurrency
-
-File writes use temp-file plus atomic rename. In `full` durability mode, file
-and directory syncs are used; `os` mode relies on normal operating-system
-flush behavior.
-
-Ref updates write WAL entries before the ref file is changed. `Database::open`
-replays WAL records. State mutations do not use a separate WAL because the ref
-CAS is the commit point; interrupted writes leave unreachable CAS garbage.
-
-Locks:
-
-- `refs/.refs.lock` protects ref mutation.
-- `meta/recovery.lock` protects recovery and migration on open.
-
-## 17. Encryption, Compression, and Integrity
-
-Encryption is optional and configured in `meta/config.json`.
-
-- AEAD: AES-256-GCM or ChaCha20-Poly1305
-- password KDF: Argon2id (`m=19456 KiB`, `t=2`, `p=1`)
-- per-object keys: HKDF
-- randomness: OS CSPRNG through `getrandom`
-- key material is zeroized where applicable
-
-Blobs, objects, and index segments are encrypted when encryption is enabled.
-Authentication failure is treated as wrong key or tampering.
-
-Compression is optional `zstd`.
-
-When `verify_on_read` is enabled:
-
-- blob reads re-hash bytes with `blob:`
-- object reads re-hash typed bytes with the expected tag
-
-## 18. Garbage Collection and Packs
-
-`gc` is reachability-based. It marks live objects from refs, commits, states,
-manifests, checkpoints, and derived references, then can prune unreachable
-loose files and rewrite packs to keep only live content.
-
-`db pack` and `db unpack` provide a single-file backup/restore format with an
-integrity footer. Pack verification checks structure and hashes.
-
-## 19. Current Non-Goals and Future Work
-
-The implementation intentionally does not include:
-
-- In-process TLS; deploy TLS/mTLS in front of the server.
-- External KMS/HSM integration.
-- Distributed consensus; replication is git-style fast-forward sync.
-- Dependency-heavy search libraries; BM25, HNSW, and HTTP are implemented in
-  this repository.
-
-These are viable future additions, but they are not part of the current
-architecture.
+- **Session memory**: `__session__/` keys. `session gc` deletes expired
+  records older than `retention_min_secs`.
+- **Event log**: hash-chained; holds policy violations, enforcement actions,
+  and erasure records.
+- **Sync**: push/pull over packs; refs fast-forward only, divergence is
+  reported.
+- **GC**: marks from heads, states, record chains, and checkpoints. `db pack` /
+  `db unpack` give a single-file backup.

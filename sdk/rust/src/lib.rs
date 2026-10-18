@@ -7,7 +7,7 @@
 //! let client = Client::new("http://127.0.0.1:7117", Some("nlk_…".into()));
 //! let doc = client.put_document("main", "kb.md", "policy text", Default::default())?;
 //! let res = client.search("main", SearchOpts { query: Some("policy".into()), ..Default::default() })?;
-//! let proof = client.prove(&res.commit, &res.hits[0].chunk, true)?;
+//! let proof = client.prove(&res.commit, &res.hits[0].chunk, true, None)?;
 //! assert!(client.verify(&proof)?.valid);
 //! # Ok(()) }
 //! ```
@@ -219,11 +219,13 @@ impl Client {
         )
     }
 
-    pub fn prove(&self, commit: &str, chunk: &str, include_content: bool) -> Result<String, Error> {
-        let v: serde_json::Value = self.post(
-            "/v1/proofs/chunk",
-            &json!({"commit": commit, "chunk": chunk, "include_content": include_content}),
-        )?;
+    /// Tenant-scoped keys must name one of their heads and pass `include_content: false`.
+    pub fn prove(&self, commit: &str, chunk: &str, include_content: bool, head: Option<&str>) -> Result<String, Error> {
+        let mut body = json!({"commit": commit, "chunk": chunk, "include_content": include_content});
+        if let Some(h) = head {
+            body["head"] = json!(h);
+        }
+        let v: serde_json::Value = self.post("/v1/proofs/chunk", &body)?;
         Ok(v["proof_cbor"].as_str().unwrap_or_default().to_string())
     }
 

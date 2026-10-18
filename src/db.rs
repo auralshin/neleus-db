@@ -52,6 +52,18 @@ pub fn manifest_index_key(manifest: Hash) -> Vec<u8> {
 
 pub const MANIFEST_INDEX_PREFIX: &str = "__manifests__/";
 
+/// The manifest index backs chunk proofs, so only commits may write it.
+fn reject_reserved<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
+    for key in keys {
+        if key.starts_with(MANIFEST_INDEX_PREFIX.as_bytes()) {
+            return Err(anyhow::anyhow!(
+                "state keys under '{MANIFEST_INDEX_PREFIX}' are reserved for the manifest index"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Database {
     pub root: PathBuf,
@@ -269,12 +281,14 @@ impl Database {
     /// Set `key` to `value` in the head's staged state, returning the new state
     /// root. Retries under concurrent contention.
     pub fn state_set_at_head(&self, head: &str, key: &[u8], value: &[u8]) -> Result<Hash> {
+        reject_reserved([key])?;
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.for_head(head).set(base_root, key, value)
         })
     }
 
     pub fn state_del_at_head(&self, head: &str, key: &[u8]) -> Result<Hash> {
+        reject_reserved([key])?;
         self.apply_state_update_with_cas(head, |base_root| self.state_store.del(base_root, key))
     }
 
@@ -283,6 +297,7 @@ impl Database {
     }
 
     pub fn state_set_many_at_head(&self, head: &str, pairs: &[(&[u8], &[u8])]) -> Result<Hash> {
+        reject_reserved(pairs.iter().map(|(k, _)| *k))?;
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.for_head(head).set_many(base_root, pairs)
         })
@@ -294,12 +309,14 @@ impl Database {
         head: &str,
         ops: &[(&[u8], Option<&[u8]>)],
     ) -> Result<Hash> {
+        reject_reserved(ops.iter().map(|(k, _)| *k))?;
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.for_head(head).write_many(base_root, ops)
         })
     }
 
     pub fn state_del_many_at_head(&self, head: &str, keys: &[&[u8]]) -> Result<Hash> {
+        reject_reserved(keys.iter().copied())?;
         self.apply_state_update_with_cas(head, |base_root| {
             self.state_store.del_many(base_root, keys)
         })
@@ -650,6 +667,24 @@ mod tests {
         assert!(db_root.join("index").exists());
         assert!(db_root.join("wal").exists());
         assert!(db_root.join("meta").join("config.json").exists());
+    }
+
+    #[test]
+    fn manifest_index_keys_are_reserved() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("db");
+        Database::init(&root).unwrap();
+        let db = Database::open(&root).unwrap();
+        let key = format!("{MANIFEST_INDEX_PREFIX}forged").into_bytes();
+        assert!(db.state_set_at_head("main", &key, b"").is_err());
+        assert!(db.state_del_at_head("main", &key).is_err());
+        assert!(db.state_set_many_at_head("main", &[(&key, b"")]).is_err());
+        assert!(
+            db.state_write_many_at_head("main", &[(&key, None)])
+                .is_err()
+        );
+        assert!(db.state_del_many_at_head("main", &[&key]).is_err());
+        assert!(db.state_set_at_head("main", b"ok", b"v").is_ok());
     }
 
     #[test]
