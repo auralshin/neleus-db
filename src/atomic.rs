@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -14,40 +14,68 @@ use crate::lock::process_is_alive;
 /// nanosecond.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Process-wide durability policy (config `durability`):
-/// - full (default): fsync file + dir per atomic write, so the temp file's
-///   bytes reach disk before the publishing rename and the rename before the
-///   next op — power-loss durable, no torn commit/ref.
-/// - os: no fsync. Renames stay crash-of-process atomic and are faster, but a
-///   power loss can drop or tear a just-acknowledged write. Opt-in only.
+/// Process-wide durability policy (config `durability`), applied per file and
+/// per directory on every atomic write:
+/// - full (default): flush to stable storage (`F_FULLFSYNC` on macOS), so a
+///   write is power-loss durable before it is acknowledged.
+/// - barrier: order writes without forcing them to storage (`F_BARRIERFSYNC`
+///   on macOS, the class SQLite's WAL commit uses there); a power loss can drop
+///   recent writes but not reorder them. Platforms without a barrier flush.
+/// - os: no sync. Renames stay crash-of-process atomic, but a power loss can
+///   drop or tear a just-acknowledged write.
 ///
 /// Global because `write_atomic` has no config context; set at open. Defaults
-/// to durable so an unset config never silently trades away crash safety.
-static FSYNC_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// to full so an unset config never silently trades away crash safety.
+static DURABILITY: AtomicU8 = AtomicU8::new(Durability::Full as u8);
 
-/// Switch the process-wide durability policy (true = fsync everything).
-pub fn set_full_durability(enabled: bool) {
-    FSYNC_FULL.store(enabled, Ordering::Relaxed);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Durability {
+    Os = 0,
+    Barrier = 1,
+    Full = 2,
 }
 
-fn fsync_enabled() -> bool {
-    // Unit tests cannot observe power loss; fsync would only slow them down.
-    !cfg!(test) && FSYNC_FULL.load(Ordering::Relaxed)
+pub fn set_durability(mode: Durability) {
+    DURABILITY.store(mode as u8, Ordering::Relaxed);
+}
+
+fn sync(f: &File) -> std::io::Result<()> {
+    // Unit tests cannot observe power loss; syncing would only slow them down.
+    if cfg!(test) {
+        return Ok(());
+    }
+    match DURABILITY.load(Ordering::Relaxed) {
+        m if m == Durability::Full as u8 => f.sync_all(),
+        m if m == Durability::Barrier as u8 => barrier(f),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn barrier(f: &File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: the fd is valid for the lifetime of `f`.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_BARRIERFSYNC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn barrier(f: &File) -> std::io::Result<()> {
+    f.sync_all()
 }
 
 pub(crate) fn maybe_sync_file(f: &File) -> std::io::Result<()> {
-    if fsync_enabled() {
-        f.sync_all()
-    } else {
-        Ok(())
-    }
+    sync(f)
 }
 
 pub(crate) fn maybe_sync_dir(path: &Path) -> std::io::Result<()> {
-    if !fsync_enabled() {
+    if cfg!(test) || DURABILITY.load(Ordering::Relaxed) == Durability::Os as u8 {
         return Ok(());
     }
-    File::open(path)?.sync_all()
+    sync(&File::open(path)?)
 }
 
 /// Build a unique temp filename of the shape `.{stem}.tmp-{pid}-{nanos}-{seq}`.

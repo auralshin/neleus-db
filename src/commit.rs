@@ -68,14 +68,32 @@ pub trait CommitSigner {
     fn sign(&self, payload_hash: Hash, commit: &Commit) -> Result<CommitSignature>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommitStore {
     objects: ObjectStore,
+    /// Signs every commit [`Self::create_commit`] makes, when set.
+    signer: Option<std::sync::Arc<dyn CommitSigner + Send + Sync>>,
+}
+
+impl std::fmt::Debug for CommitStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommitStore")
+            .field("objects", &self.objects)
+            .field("signed", &self.signer.is_some())
+            .finish()
+    }
 }
 
 impl CommitStore {
     pub fn new(objects: ObjectStore) -> Self {
-        Self { objects }
+        Self {
+            objects,
+            signer: None,
+        }
+    }
+
+    pub fn set_signer(&mut self, signer: std::sync::Arc<dyn CommitSigner + Send + Sync>) {
+        self.signer = Some(signer);
     }
 
     pub fn create_commit(
@@ -86,6 +104,16 @@ impl CommitStore {
         author: String,
         message: String,
     ) -> Result<CommitHash> {
+        if let Some(signer) = self.signer.clone() {
+            return self.create_signed_commit(
+                signer.as_ref(),
+                parents,
+                state_root,
+                manifests,
+                author,
+                message,
+            );
+        }
         self.validate_references(state_root, &manifests)?;
         let commit = Commit {
             schema_version: COMMIT_SCHEMA_VERSION,
@@ -101,7 +129,7 @@ impl CommitStore {
         self.objects.put_serialized(COMMIT_TAG, &commit)
     }
 
-    pub fn create_signed_commit<S: CommitSigner>(
+    pub fn create_signed_commit<S: CommitSigner + ?Sized>(
         &self,
         signer: &S,
         parents: Vec<CommitHash>,

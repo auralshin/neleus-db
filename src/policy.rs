@@ -371,7 +371,7 @@ fn eval_head(
         }
         Rule::RequirePrincipal => {
             let from = now.saturating_sub(MONITOR_WINDOW_SECS);
-            let (records, _) = crate::audit::collect(db, head, from, now).unwrap_or_default();
+            let records = crate::audit::collect(db, head, from, now).unwrap_or_default();
             if records.is_empty() {
                 (Status::Pass, "No retrievals in window.".into())
             } else if records.iter().all(|r| r.principal.is_some()) {

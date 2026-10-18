@@ -162,7 +162,8 @@ neleus-verify <bundle.nelaudit> [--public-key <hex>] [--require-signature] [--an
 Prints `VERIFIED: …` and exits 0, or `INVALID: …` and exits 1. Every claim is
 re-derived from bytes carried in the bundle.
 
-A verified bundle also reports `chain_complete` (`--json`) with a `NOTE:` in the
-text output when it is false. False means the retrieval chain does not start at
-sequence 0: expected for a windowed `--from`/`--to` export, and evidence of a
-withheld prefix otherwise. Check the period is the one you asked for.
+A bundle proves its window complete: it carries the record just before the
+window (or starts at sequence 0) and every record from the window up to each
+checkpoint's pinned record, so records dropped from either end are rejected.
+The report lists the keys that signed carried commits (`commit_keys`); compare
+them with the principals you trust.

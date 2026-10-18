@@ -45,6 +45,13 @@ fn cas_backoff(attempt: usize) {
     std::thread::sleep(Duration::from_nanos(nanos));
 }
 
+/// State key under which a commit records that it introduced `manifest`.
+pub fn manifest_index_key(manifest: Hash) -> Vec<u8> {
+    format!("{MANIFEST_INDEX_PREFIX}{manifest}").into_bytes()
+}
+
+pub const MANIFEST_INDEX_PREFIX: &str = "__manifests__/";
+
 #[derive(Debug, Clone)]
 pub struct Database {
     pub root: PathBuf,
@@ -56,13 +63,7 @@ pub struct Database {
     pub refs: RefsStore,
     pub wal: Wal,
     pub config: Config,
-    /// Retrieval-chain tip as of each commit (`audit::query_tip`). Commits are
-    /// immutable, so entries never go stale.
-    pub(crate) query_tips: QueryTipCache,
 }
-
-pub(crate) type QueryTipCache =
-    Arc<std::sync::Mutex<std::collections::HashMap<Hash, Option<(Hash, u64)>>>>;
 
 /// Outcome of [`Database::repack`]: per-store consolidation totals.
 #[derive(Debug, Clone, Copy, Default)]
@@ -95,7 +96,8 @@ pub struct Config {
     pub compression: Option<String>,
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
-    /// "os" (default: crash-safe, fast) or "full" (fsync per write).
+    /// "full" (default: flush per write), "barrier" (ordered, not flushed), or
+    /// "os" (no sync). See `atomic::Durability`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<String>,
     /// Minimum record age in seconds before session GC may remove it, even
@@ -188,11 +190,12 @@ impl Database {
         }
 
         match config.durability.as_deref() {
-            None | Some("full") => crate::atomic::set_full_durability(true),
-            Some("os") => crate::atomic::set_full_durability(false),
+            None | Some("full") => crate::atomic::set_durability(crate::atomic::Durability::Full),
+            Some("barrier") => crate::atomic::set_durability(crate::atomic::Durability::Barrier),
+            Some("os") => crate::atomic::set_durability(crate::atomic::Durability::Os),
             Some(other) => {
                 return Err(anyhow::anyhow!(
-                    "unknown durability '{other}' (expected \"os\" or \"full\")"
+                    "unknown durability '{other}' (expected \"full\", \"barrier\", or \"os\")"
                 ));
             }
         }
@@ -247,7 +250,6 @@ impl Database {
             refs,
             wal,
             config,
-            query_tips: QueryTipCache::default(),
         })
     }
 
@@ -304,7 +306,10 @@ impl Database {
     }
 
     /// Commit `manifests` onto `head`, advancing the head ref. Fails loudly
-    /// rather than silently rolling back a concurrent staged write.
+    /// rather than silently rolling back a concurrent staged write. Each
+    /// manifest is also indexed in the commit's state under
+    /// [`manifest_index_key`], so a chunk proof is one state path, not a walk
+    /// of every commit since the chunk was written.
     pub fn create_commit_at_head(
         &self,
         head: &str,
@@ -322,12 +327,22 @@ impl Database {
             // `resolve_state_root` (which would re-read the ref and could
             // observe a peer's write, producing a spurious mismatch later).
             let staged_before = self.refs.state_get(head)?;
-            let state_root = match staged_before {
+            let base_root = match staged_before {
                 Some(s) => s,
                 None => match parent {
                     Some(commit_hash) => self.commit_store.get_commit(commit_hash)?.state_root,
                     None => self.state_store.empty_root()?,
                 },
+            };
+            let keys: Vec<Vec<u8>> = manifests.iter().map(|m| manifest_index_key(*m)).collect();
+            let state_root = if keys.is_empty() {
+                base_root
+            } else {
+                let pairs: Vec<(&[u8], &[u8])> =
+                    keys.iter().map(|k| (k.as_slice(), &[][..])).collect();
+                self.state_store
+                    .for_head(head)
+                    .set_many(base_root, &pairs)?
             };
             let candidate = self.commit_store.create_commit(
                 parents,

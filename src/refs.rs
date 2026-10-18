@@ -27,6 +27,7 @@ impl RefsStore {
         fs::create_dir_all(self.heads_dir())?;
         fs::create_dir_all(self.states_dir())?;
         fs::create_dir_all(self.checkpoints_dir())?;
+        fs::create_dir_all(self.records_dir())?;
         Ok(())
     }
 
@@ -116,6 +117,28 @@ impl RefsStore {
         Ok(())
     }
 
+    /// Newest retrieval record for a head. The record chain lives here, off
+    /// the head's commit history, so searching never lengthens data history.
+    pub fn record_get(&self, name: &str) -> Result<Option<Hash>> {
+        validate_ref_name(name)?;
+        read_hash(self.record_path(name))
+    }
+
+    /// The single commit point for a batch of records: the manifests are
+    /// already durable, so an interrupted write loses only unacknowledged ones.
+    pub fn record_set(&self, name: &str, hash: Hash) -> Result<()> {
+        validate_ref_name(name)?;
+        self.ensure_dirs()?;
+        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
+        write_atomic(&self.record_path(name), format!("{hash}\n").as_bytes())?;
+        Ok(())
+    }
+
+    /// Every `(name, hash)` under `refs/records/`, sorted by name.
+    pub fn list_records(&self) -> Result<Vec<(String, Hash)>> {
+        list_refs(&self.records_dir())
+    }
+
     /// Every `(name, hash)` under `refs/heads/`, sorted by name.
     pub fn list_heads(&self) -> Result<Vec<(String, Hash)>> {
         list_refs(&self.heads_dir())
@@ -140,6 +163,14 @@ impl RefsStore {
 
     fn checkpoints_dir(&self) -> PathBuf {
         self.root.join("checkpoints")
+    }
+
+    fn records_dir(&self) -> PathBuf {
+        self.root.join("records")
+    }
+
+    fn record_path(&self, name: &str) -> PathBuf {
+        self.records_dir().join(name)
     }
 
     fn checkpoint_path(&self, name: &str) -> PathBuf {

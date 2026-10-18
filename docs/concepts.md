@@ -106,10 +106,11 @@ Four layers, each building on content addressing:
    someone holding the commit signing key. Publish the latest hash anywhere
    durable to externally anchor everything below it.
 3. **Chunk proofs** — a self-contained bundle proving `(commit, chunk)`:
-   commit hash → first-parent ancestry → the manifest that lists the chunk →
-   the chunk bytes, every link a hash equation. Verifiable offline.
-4. **Audit records** — `QueryManifest`s committed to history, exportable as a
-   signed bundle. The audit log is itself content-addressed and provable.
+   commit hash → a state path showing the commit indexes the manifest → the
+   manifest that lists the chunk → the chunk bytes, every link a hash
+   equation. The size does not grow with history. Verifiable offline.
+4. **Audit records** — `QueryManifest`s in a per-head record chain kept off
+   the data history (`refs/records/<head>`), exportable as a signed bundle. The audit log is itself content-addressed and provable.
 
 ## Local and hosted are the same engine
 

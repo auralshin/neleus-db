@@ -112,6 +112,14 @@ harness = false
 name = "verifiability"
 harness = false
 
+[[bench]]
+name = "datasets"
+harness = false
+
+[[bench]]
+name = "agent"
+harness = false
+
 [[bin]]
 name = "neleus-verify"
 path = "src/bin/neleus-verify.rs"

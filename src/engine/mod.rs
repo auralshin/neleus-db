@@ -32,7 +32,7 @@ pub use segment::{ChunkInput, IndexSegment, SearchFilter, SegmentHit};
 pub use writer::WriteCoalescer;
 
 const SEGMENT_TAG: &[u8] = b"index_segment:";
-const HEAD_SCHEMA_VERSION: u32 = 1;
+const HEAD_SCHEMA_VERSION: u32 = 2;
 
 /// Merge a head's segment chain into one segment past this length.
 const MERGE_THRESHOLD: usize = 8;
@@ -120,6 +120,14 @@ impl Engine {
     /// Open a database and wrap it in a resident engine.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self::new(Database::open(path)?))
+    }
+
+    /// Sign every commit this engine makes with `signer`.
+    pub fn set_commit_signer(
+        &mut self,
+        signer: Arc<dyn crate::commit::CommitSigner + Send + Sync>,
+    ) {
+        self.db.commit_store.set_signer(signer);
     }
 
     pub fn db(&self) -> &Database {
@@ -597,9 +605,14 @@ impl Engine {
                 "search must name a head to record on; pass a commit hash as `at`"
             ));
         }
+        let tip = self.resolve_commit(head)?;
+        // The record names `head`, so the searched commit must be in its history.
         let commit = match at {
+            Some(c) if c != tip && !crate::sync::is_ancestor(&self.db, c, tip)? => {
+                return Err(anyhow!("commit {c} is not in the history of head '{head}'"));
+            }
             Some(c) => c,
-            None => self.resolve_commit(head)?,
+            None => tip,
         };
         let (mode, text, embedding, hits) = match query {
             SearchQuery::Semantic(q) => (
@@ -809,7 +822,9 @@ impl Engine {
             .record(head, record, |batch| self.commit_records(head, batch))
     }
 
-    /// Chain `batch` after the head's newest record and land it in one commit.
+    /// Chain `batch` after the head's newest record and publish it with one
+    /// record-ref update. Records stay off the head's commit history, so
+    /// searching never lengthens the ancestry a chunk proof carries.
     fn commit_records(&self, head: &str, batch: &[recorder::Record]) -> Result<Vec<Hash>> {
         // Serialize the read-compute-commit of the audit tip across processes:
         // two recorders reading the same tip would mint the same sequence
@@ -818,13 +833,15 @@ impl Engine {
             self.db.root.join(".audit.lock"),
             std::time::Duration::from_secs(10),
         )?;
-        let mut tip = crate::audit::query_tip(&self.db, self.db.refs.head_get(head)?)?;
+        let mut tip = crate::audit::query_tip(&self.db, head)?;
         let blobs = self.db.blob_store.for_head(head);
         let mut manifests = Vec::with_capacity(batch.len());
         for r in batch {
-            let (prev, seq) = match tip {
-                Some((h, seq)) => (Some(h), seq + 1),
-                None => (None, 0),
+            // Times never go backwards along the chain, so a time window
+            // is a contiguous run of sequence numbers.
+            let (prev, seq, at) = match tip {
+                Some((h, seq, at)) => (Some(h), seq + 1, now_unix()?.max(at)),
+                None => (None, 0, now_unix()?),
             };
             let m = self.build_query_manifest(
                 &blobs,
@@ -838,17 +855,14 @@ impl Engine {
                 &r.hits,
                 seq,
                 prev,
+                at,
             )?;
-            tip = Some((m, seq));
+            tip = Some((m, seq, at));
             manifests.push(m);
         }
-        let first = batch.first().and_then(|r| r.principal.as_deref());
-        let author = match first {
-            Some(p) if batch.iter().all(|r| r.principal.as_deref() == Some(p)) => p,
-            _ => "audit",
-        };
-        self.db
-            .create_commit_at_head(head, author, "audit: retrieval", manifests.clone())?;
+        if let Some((last, _, _)) = tip {
+            self.db.refs.record_set(head, last)?;
+        }
         Ok(manifests)
     }
 
@@ -879,6 +893,7 @@ impl Engine {
             hits,
             0,
             None,
+            now_unix()?,
         )
     }
 
@@ -896,6 +911,7 @@ impl Engine {
         hits: &[EngineHit],
         seq: u64,
         prev: Option<Hash>,
+        executed_at: u64,
     ) -> Result<Hash> {
         let query_text = match query_text {
             Some(q) => Some(blobs.put(q.as_bytes())?),
@@ -919,7 +935,7 @@ impl Engine {
             top_k: top_k as u32,
             filters,
             principal: principal.map(str::to_string),
-            executed_at: now_unix()?,
+            executed_at,
             hits: hits
                 .iter()
                 .map(|h| QueryHit {

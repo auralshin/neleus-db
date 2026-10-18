@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One run per branch; a newer push cancels the older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            console/package-lock.json
+            sdk/typescript/package-lock.json
+
+      - name: Lint
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test
+
+      # Before Build: build.rs embeds console/dist into the binary.
+      - name: Console
+        run: |
+          npm --prefix console ci
+          npm --prefix console run build
+
+      - name: Build
+        run: cargo build --release
+
+      # After Build: the TS suite spawns target/release/neleus-db.
+      - name: SDKs
+        run: |
+          cargo test --manifest-path sdk/rust/Cargo.toml
+          cargo check --manifest-path sdk/python-native/Cargo.toml
+          npm --prefix sdk/typescript ci
+          npm --prefix sdk/typescript test

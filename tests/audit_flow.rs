@@ -157,13 +157,9 @@ fn withheld_retrieval_is_detected() {
         audit::verify_bundle(&out, None, false).unwrap()
     };
     assert_eq!(report.retrievals, 4);
-    assert!(
-        report.chain_complete,
-        "an intact chain must report complete"
-    );
 
     // Sequence numbers are contiguous and prev-links agree.
-    let (records, _) = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+    let records = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
     let mut seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
     seqs.sort_unstable();
     assert_eq!(seqs, vec![0, 1, 2, 3]);
@@ -240,7 +236,7 @@ fn rewritten_record_fields_are_rejected() {
     audit::verify_bundle(&out, None, false).expect("honest bundle verifies");
 
     let raw = std::fs::read(&out).unwrap();
-    let (records, _) = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+    let records = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
     let forged: Vec<String> = records
         .iter()
         .map(|r| {
@@ -270,9 +266,87 @@ fn rewritten_record_fields_are_rejected() {
     );
 }
 
+/// A time window is provably complete at both ends: the record before it and
+/// the records linking it to the checkpoint's pin travel with the bundle, and
+/// dropping either is rejected.
+#[test]
+fn window_exports_carry_their_edges() {
+    let tmp = TempDir::new().unwrap();
+    let root = tmp.path().join("db");
+    Database::init(&root).unwrap();
+    let engine = Engine::open(&root).unwrap();
+    let (_doc, commit) = engine
+        .put_document("main", "kb", b"alpha beta gamma corpus", spec(), None, "t")
+        .unwrap();
+    let filter = SearchFilter::default();
+    let search = || {
+        let hits = engine
+            .search_semantic_unrecorded(commit, "corpus", 5, &filter)
+            .unwrap();
+        engine
+            .record_query_at_head(
+                "main",
+                commit,
+                "semantic",
+                Some("corpus"),
+                None,
+                5,
+                &filter,
+                None,
+                &hits,
+            )
+            .unwrap();
+    };
+    // Three one-second epochs: records 0-1, 2-3 (then a checkpoint), 4.
+    search();
+    search();
+    std::thread::sleep(Duration::from_millis(1100));
+    search();
+    search();
+    neleus_db::checkpoint::CheckpointStore::new(engine.db())
+        .create("main", None)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    search();
+    let times: Vec<u64> = {
+        let mut r = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+        r.sort_by_key(|r| r.seq);
+        r.iter().map(|r| r.executed_at).collect()
+    };
+    assert!(times.windows(2).all(|w| w[0] <= w[1]));
+    let (t0, t1, t2) = (times[0], times[2], times[4]);
+    assert!(t0 < t1 && t1 < t2);
+
+    let verify = |from: u64, to: u64, drop: &str| {
+        let out = tmp.path().join("w.nelaudit");
+        audit::export(engine.db(), "main", from, to, &out, None).unwrap();
+        let raw = std::fs::read(&out).unwrap();
+        let has_edge = String::from_utf8_lossy(&raw).contains("edge/");
+        let cut = tmp.path().join("cut.nelaudit");
+        rebuild_without(&raw, None, drop, &cut);
+        (has_edge, audit::verify_bundle(&cut, None, false))
+    };
+    // Middle window: needs the record before it; the pin is inside it.
+    assert!(verify(t1, t1, "").1.is_ok());
+    assert!(verify(t1, t1, "edge/").1.is_err());
+    // Window before the pin: needs the records linking it to the pin.
+    let (has_edge, ok) = verify(t0, t0, "");
+    assert!(has_edge && ok.is_ok());
+    assert!(verify(t0, t0, "edge/").1.is_err());
+    // Window after the pin: only the record before it.
+    assert!(verify(t2, t2, "").1.is_ok());
+    assert!(verify(t2, t2, "edge/").1.is_err());
+}
+
 /// Re-emit a bundle with `retrievals.jsonl` replaced and `meta.json`'s count
 /// adjusted, recomputing the integrity footer so only the sequence gap is wrong.
 fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) {
+    rebuild_without(raw, Some((jsonl, count)), "", out);
+}
+
+/// Re-emit a bundle without entries named `drop*` (empty drops nothing),
+/// optionally replacing the records, with a fresh integrity footer.
+fn rebuild_without(raw: &[u8], records: Option<(&str, usize)>, drop: &str, out: &std::path::Path) {
     let mut p = 16usize;
     let n = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
@@ -285,20 +359,23 @@ fn rebuild_bundle(raw: &[u8], jsonl: &str, count: usize, out: &std::path::Path) 
         p += 8;
         let data = raw[p..p + dl].to_vec();
         p += dl;
-        let data = if name == "retrievals.jsonl" {
-            jsonl.as_bytes().to_vec()
-        } else if name == "meta.json" {
-            let mut v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-            v["retrievals"] = serde_json::json!(count);
-            serde_json::to_vec_pretty(&v).unwrap()
-        } else {
-            data
+        if !drop.is_empty() && name.starts_with(drop) {
+            continue;
+        }
+        let data = match records {
+            Some((jsonl, _)) if name == "retrievals.jsonl" => jsonl.as_bytes().to_vec(),
+            Some((_, count)) if name == "meta.json" => {
+                let mut v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                v["retrievals"] = serde_json::json!(count);
+                serde_json::to_vec_pretty(&v).unwrap()
+            }
+            _ => data,
         };
         entries.push((name, data));
     }
     let mut buf = Vec::new();
     buf.extend_from_slice(b"NELAUDIT");
-    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, data) in &entries {
         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());

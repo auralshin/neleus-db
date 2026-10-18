@@ -234,6 +234,67 @@ fn q3_q4_auditor(c: &mut Criterion) {
         );
     }
 
+    // Proof size depends on the tree shape, which each database's secret
+    // keys: report the spread over fresh databases, not one sample.
+    {
+        let mut sizes: Vec<(usize, usize)> = (0..20)
+            .map(|i| {
+                let root = dir.path().join(format!("shape{i}"));
+                common::init_db(&root);
+                let db = Database::open(&root).unwrap();
+                let mut sroot = db.state_store.empty_root().unwrap();
+                let keys: Vec<Vec<u8>> = (0..1000u32)
+                    .map(|k| format!("key_{k:05}").into_bytes())
+                    .collect();
+                let pairs: Vec<(&[u8], &[u8])> =
+                    keys.iter().map(|k| (k.as_slice(), &b"v"[..])).collect();
+                sroot = db.state_store.set_many(sroot, &pairs).unwrap();
+                let proof = db.state_store.proof(sroot, b"key_00042").unwrap();
+                (to_cbor(&proof).unwrap().len(), proof.path.len())
+            })
+            .collect();
+        sizes.sort();
+        eprintln!(
+            "[q3] state proof over 20 databases (1000 keys): min {} B, median {} B, max {} B; \
+             depth {}-{}",
+            sizes[0].0,
+            sizes[10].0,
+            sizes[19].0,
+            sizes.iter().map(|s| s.1).min().unwrap(),
+            sizes.iter().map(|s| s.1).max().unwrap()
+        );
+    }
+
+    // Signed bundle: the footer signature and the checkpoint signature are
+    // checked against the auditor's public key.
+    {
+        let key = dir.path().join("audit.key");
+        let public = neleus_db::signing::generate_keypair_file(&key).unwrap();
+        let signer = neleus_db::signing::Ed25519Signer::from_seed_file(&key).unwrap();
+        let path = sizes.iter().find(|s| s.0 == 64).unwrap().1.clone();
+        let db = Database::open(dir.path().join("db64")).unwrap();
+        CheckpointStore::new(&db)
+            .create("main", Some(&signer))
+            .unwrap();
+        let signed = dir.path().join("signed.nelaudit");
+        audit::export(&db, "main", 0, u64::MAX, &signed, Some(&signer)).unwrap();
+        let reps = 50;
+        let start = Instant::now();
+        for _ in 0..reps {
+            audit::verify_bundle(&signed, Some(&public), true).unwrap();
+        }
+        let signed_t = start.elapsed() / reps;
+        let start = Instant::now();
+        for _ in 0..reps {
+            audit::verify_bundle(&path, None, false).unwrap();
+        }
+        eprintln!(
+            "[q4] R=64 signed bundle ({} B): verify with key {signed_t:?} (unsigned {:?})",
+            std::fs::metadata(&signed).unwrap().len(),
+            start.elapsed() / reps
+        );
+    }
+
     let mut group = c.benchmark_group("q3_auditor_verify");
     for (r, path, _, _) in &sizes {
         group.bench_function(format!("in_process_R={r}"), |b| {
@@ -325,9 +386,166 @@ fn q5_idf_leakage(_c: &mut Criterion) {
     );
 }
 
+// ---------------------------------------------------------------- Q4b/Q5b
+// Chunk-proof size must not grow with recorded searches (records live off the
+// data head), and a tenant's filtered BM25 time against others' corpus size.
+
+fn q4b_q5b_scaling(_c: &mut Criterion) {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("db");
+    common::init_db(&root);
+    let engine = Engine::open(&root).unwrap();
+    let (_doc, commit) = engine
+        .put_document(
+            "main",
+            "kb",
+            b"agent memory chunk that a proof will cover",
+            ChunkingSpec {
+                method: "fixed".into(),
+                chunk_size: 64,
+                overlap: 0,
+            },
+            None,
+            "bench",
+        )
+        .unwrap();
+    let chunk = engine
+        .search_semantic_unrecorded(commit, "agent memory", 1, &SearchFilter::default())
+        .unwrap()[0]
+        .chunk_hash;
+    let mut done = 0usize;
+    for target in [0usize, 100, 1000] {
+        while done < target {
+            engine
+                .search(
+                    "main",
+                    None,
+                    neleus_db::engine::SearchQuery::Semantic("agent memory"),
+                    5,
+                    &SearchFilter::default(),
+                    None,
+                )
+                .unwrap();
+            done += 1;
+        }
+        let tip = engine.resolve_commit("main").unwrap();
+        let proof = engine.prove(tip, chunk, false).unwrap();
+        eprintln!(
+            "[q4b] after {target:>4} recorded searches: chunk proof {} B, {} state node(s) in path",
+            to_cbor(&proof).unwrap().len(),
+            proof.manifest_proof.path.len()
+        );
+    }
+
+    // Nor do writes: the proof is one state path, not the ancestry since.
+    let mut written = 0usize;
+    for target in [100usize, 1000] {
+        while written < target {
+            engine
+                .db()
+                .create_commit_at_head("main", "bench", "write", vec![])
+                .unwrap();
+            written += 1;
+        }
+        let tip = engine.resolve_commit("main").unwrap();
+        let proof = engine.prove(tip, chunk, false).unwrap();
+        eprintln!(
+            "[q4b] after {target:>4} writes: chunk proof {} B, {} state node(s) in path",
+            to_cbor(&proof).unwrap().len(),
+            proof.manifest_proof.path.len()
+        );
+    }
+
+    let tenant = |t: &str| ChunkMetadata {
+        tenant: Some(t.into()),
+        ..Default::default()
+    };
+    let filter = SearchFilter {
+        tenant: Some("a".into()),
+        ..Default::default()
+    };
+    let doc = |i: usize, text: &str, meta: ChunkMetadata| ChunkInput {
+        chunk_hash: hash_typed(b"q5b:", format!("{i}").as_bytes()),
+        text: text.to_string(),
+        embedding: None,
+        meta: Some(meta),
+    };
+    // 30 independent batches per size; a channel shows as a shift in batch
+    // medians. Permutation test on the 0-vs-100k difference of medians.
+    let batches = 30usize;
+    let mut medians: Vec<(usize, Vec<f64>)> = Vec::new();
+    for others in [0usize, 10_000, 100_000] {
+        let mut inputs: Vec<ChunkInput> = (0..1000)
+            .map(|i| doc(i, "shared probe term and filler", tenant("a")))
+            .collect();
+        inputs.extend((0..others).map(|i| doc(10_000_000 + i, "shared probe term", tenant("b"))));
+        let seg = IndexSegment::build(vec![], inputs);
+        let mut per_batch = Vec::with_capacity(batches);
+        for _ in 0..batches {
+            let reps = 200u32;
+            let start = Instant::now();
+            for _ in 0..reps {
+                assert!(!seg.bm25("probe", 10, &filter).is_empty());
+            }
+            per_batch.push((start.elapsed() / reps).as_secs_f64() * 1e6);
+        }
+        let (lo, mid, hi) = bootstrap_median(&per_batch);
+        eprintln!(
+            "[q5b] tenant a (1000 docs) filtered BM25 with {others:>6} other-tenant docs: \
+             median {mid:.2} us (95% CI {lo:.2}-{hi:.2}) over {batches} batches"
+        );
+        medians.push((others, per_batch));
+    }
+    let p = permutation_p(&medians[0].1, &medians[2].1);
+    eprintln!("[q5b] 0 vs 100000 other-tenant docs: permutation p = {p:.4}");
+    let p = permutation_p(&medians[1].1, &medians[2].1);
+    eprintln!("[q5b] 10000 vs 100000 other-tenant docs: permutation p = {p:.4}");
+}
+
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    s[s.len() / 2]
+}
+
+/// Median with a 95% percentile-bootstrap interval.
+fn bootstrap_median(v: &[f64]) -> (f64, f64, f64) {
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(1);
+    let mut boots: Vec<f64> = (0..2000)
+        .map(|_| {
+            median(
+                &(0..v.len())
+                    .map(|_| v[rng.gen_range(0..v.len())])
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    boots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (boots[50], median(v), boots[1949])
+}
+
+/// Two-sided permutation test on the difference of medians.
+fn permutation_p(a: &[f64], b: &[f64]) -> f64 {
+    use rand::SeedableRng;
+    use rand::seq::SliceRandom;
+    let observed = (median(a) - median(b)).abs();
+    let mut pooled: Vec<f64> = a.iter().chain(b).copied().collect();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(2);
+    let trials = 10_000;
+    let hits = (0..trials)
+        .filter(|_| {
+            pooled.shuffle(&mut rng);
+            let (x, y) = pooled.split_at(a.len());
+            (median(x) - median(y)).abs() >= observed
+        })
+        .count();
+    (hits + 1) as f64 / (trials + 1) as f64
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(20);
-    targets = q2_checkpoint_chain, q3_q4_auditor, q5_idf_leakage
+    targets = q2_checkpoint_chain, q3_q4_auditor, q5_idf_leakage, q4b_q5b_scaling
 }
 criterion_main!(benches);

@@ -72,7 +72,8 @@ fn main() -> ExitCode {
                         "log_size": report.log_size,
                         "anchored": report.anchored,
                         "bundle_key_id": report.bundle_key_id,
-                        "chain_complete": report.chain_complete,
+                        "commits_signed": report.commits_signed,
+                        "commit_keys": report.commit_keys,
                     })
                 );
             } else {
@@ -96,12 +97,11 @@ fn main() -> ExitCode {
                     report.from,
                     report.to,
                 );
-                // Internally consistent but not anchored at seq 0: expected for
-                // a windowed export, evidence of a withheld prefix otherwise.
-                if !report.chain_complete {
+                if !report.commit_keys.is_empty() {
                     println!(
-                        "NOTE: retrieval chain does not start at sequence 0, so this bundle covers \
-                         part of the head's history. Confirm the period is the one you asked for."
+                        "{} signed commits, by: {}",
+                        report.commits_signed,
+                        report.commit_keys.join(", ")
                     );
                 }
             }

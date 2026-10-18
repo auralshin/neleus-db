@@ -196,7 +196,15 @@ fn setup_sqlite() -> SqliteFixture {
     let tmp = TempDir::new().unwrap();
     let conn = Connection::open(tmp.path().join("bench.sqlite")).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-    conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    // Same durability class as the neleus run: FULL fsyncs every commit.
+    let sync = match std::env::var("NELEUS_BENCH_DURABILITY").as_deref() {
+        Ok("full") => "FULL",
+        _ => "NORMAL",
+    };
+    conn.pragma_update(None, "synchronous", sync).unwrap();
+    // macOS fsync() skips the drive cache; F_FULLFSYNC is what std's sync_all uses.
+    conn.pragma_update(None, "fullfsync", sync == "FULL")
+        .unwrap();
     conn.execute_batch(
         "CREATE TABLE kv (key BLOB PRIMARY KEY, value BLOB);
          CREATE VIRTUAL TABLE chunks USING fts5(text);",

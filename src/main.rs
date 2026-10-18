@@ -1150,35 +1150,11 @@ fn main() -> Result<()> {
                             db.create_commit_at_head(&head, &author, &message, manifest_hashes)?
                         }
                         Some(key_path) => {
-                            let signer =
-                                neleus_db::signing::Ed25519Signer::from_seed_file(&key_path)?;
-                            // Signed commits build on the staged/committed
-                            // state of the head, then advance the head ref.
-                            let parent = db.refs.head_get(&head)?;
-                            // Snapshot staged state once: the commit is signed
-                            // over it and the CAS guards on it. Re-reading at the
-                            // CAS would let a write that raced the signing window
-                            // pass the check and be silently rolled back.
-                            let expected_state = db.refs.state_get(&head)?;
-                            let state_root = db.resolve_state_root(&head)?;
-                            let candidate = db.commit_store.create_signed_commit(
-                                &signer,
-                                parent.into_iter().collect(),
-                                state_root,
-                                manifest_hashes,
-                                author.clone(),
-                                message.clone(),
-                            )?;
-                            if !db
-                                .refs
-                                .state_compare_and_set(&head, expected_state, state_root)?
-                                || !db.refs.head_compare_and_set(&head, parent, candidate)?
-                            {
-                                return Err(anyhow!(
-                                    "concurrent update on head '{head}' while signing; retry"
-                                ));
-                            }
-                            candidate
+                            let mut db = db.clone();
+                            db.commit_store.set_signer(std::sync::Arc::new(
+                                neleus_db::signing::Ed25519Signer::from_seed_file(&key_path)?,
+                            ));
+                            db.create_commit_at_head(&head, &author, &message, manifest_hashes)?
                         }
                     };
                     // Index eagerly so the next query is warm.
@@ -1800,7 +1776,7 @@ fn main() -> Result<()> {
             let db = Database::open(&db_path)?;
             match command {
                 AuditCommands::Log { head, from, to } => {
-                    let (records, _) = neleus_db::audit::collect(&db, &head, from, to)?;
+                    let records = neleus_db::audit::collect(&db, &head, from, to)?;
                     if json_output {
                         println!("{}", serde_json::to_string_pretty(&records)?);
                     } else {
@@ -1904,10 +1880,11 @@ fn main() -> Result<()> {
                                 "log_size": r.log_size,
                                 "anchored": r.anchored,
                                 "bundle_key_id": r.bundle_key_id,
-                                "chain_complete": r.chain_complete,
+                                "commits_signed": r.commits_signed,
+                                "commit_keys": r.commit_keys,
                             }),
                             &format!(
-                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, checkpoint log of {} ({}){}{}",
+                                "VERIFIED: {} retrievals on head '{}', chain intact across {} commits, checkpoint log of {} ({}){}",
                                 r.retrievals,
                                 r.head,
                                 r.commits,
@@ -1918,13 +1895,6 @@ fn main() -> Result<()> {
                                 } else {
                                     ""
                                 },
-                                if r.chain_complete {
-                                    ""
-                                } else {
-                                    "\nNOTE: retrieval chain does not start at sequence 0, so this \
-                                     bundle covers part of the head's history. Confirm the period \
-                                     is the one you asked for."
-                                }
                             ),
                         )?,
                         Err(e) => {

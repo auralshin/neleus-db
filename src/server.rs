@@ -106,7 +106,7 @@ struct ServerState {
 }
 
 /// Binds and serves on background threads until [`ServerHandle::shutdown`].
-pub fn start(engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
+pub fn start(mut engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
     let listener =
         TcpListener::bind(&config.addr).with_context(|| format!("binding {}", config.addr))?;
     let addr = listener.local_addr()?;
@@ -134,6 +134,13 @@ pub fn start(engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
         None => None,
     };
     let audit_public_key = audit_signer.as_ref().map(|s| s.public_key_hex());
+    // The same key signs every commit the server makes, so commits are
+    // attributable offline rather than only by the author string.
+    if let Some(path) = &config.audit_signing_key {
+        engine.set_commit_signer(Arc::new(crate::signing::Ed25519Signer::from_seed_file(
+            path,
+        )?));
+    }
 
     let auth_root = if config.no_auth {
         None
@@ -935,7 +942,11 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // No head to scope against; global rules (encryption at rest,
             // retention) apply regardless of the selector.
             gate_write(db, req, "blobs", "")?;
-            let hash = db.blob_store.put(&req.body)?;
+            // Salt a tenant's blobs in its own namespace, as its heads are.
+            let hash = match req.principal.as_ref().and_then(|p| p.tenant.as_deref()) {
+                Some(t) => db.blob_store.for_head(&format!("{t}/")).put(&req.body)?,
+                None => db.blob_store.put(&req.body)?,
+            };
             Ok(Response::Json(200, json!({"hash": hash.to_string()})))
         }
 
@@ -1324,8 +1335,22 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // include_content it returns raw chunk bytes. A tenant-scoped key
             // must not use it to read another tenant's content — deny the
             // content-bearing form, same as the untenanted /v1/blobs read.
-            if include && req.principal.as_ref().is_some_and(|p| p.tenant.is_some()) {
+            let tenant = req.principal.as_ref().is_some_and(|p| p.tenant.is_some());
+            if include && tenant {
                 bail!("forbidden: include_content proofs are not available to tenant-scoped keys");
+            }
+            // A tenant key proves only commits in the history of its own heads.
+            if tenant {
+                let head = match v.get("anchor_head") {
+                    None | Some(Value::Null) => str_field(&v, "head").map_err(|_| {
+                        anyhow!("bad request: tenant-scoped keys must name a 'head' for proofs")
+                    })?,
+                    Some(_) => str_field(&v, "anchor_head")?,
+                };
+                let tip = engine.resolve_commit(scope_head(req, head)?)?;
+                if commit != tip && !crate::sync::is_ancestor(db, commit, tip)? {
+                    bail!("forbidden: commit {commit} is not in the history of '{head}'");
+                }
             }
             let proof = match v.get("anchor_head") {
                 None | Some(Value::Null) => engine.prove(commit, chunk, include)?,
@@ -1462,8 +1487,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let mut heads = Vec::new();
             for (name, commit) in db.refs.list_heads()? {
                 let chain = engine.checkpoints().verify_chain(&name, None, false);
-                let (records, _) =
-                    crate::audit::collect(db, &name, month_ago, now).unwrap_or_default();
+                let records = crate::audit::collect(db, &name, month_ago, now).unwrap_or_default();
                 let mut principals: Vec<&str> = records
                     .iter()
                     .filter_map(|r| r.principal.as_deref())
@@ -1506,7 +1530,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let from = v.get("from").and_then(Value::as_u64).unwrap_or(0);
             let to = v.get("to").and_then(Value::as_u64).unwrap_or(u64::MAX);
-            let (records, _) = crate::audit::collect(db, head, from, to)?;
+            let records = crate::audit::collect(db, head, from, to)?;
             Ok(Response::Json(
                 200,
                 json!({"head": head, "from": from, "to": to, "records": records}),
@@ -1636,7 +1660,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 crate::erasure::EraseOptions {
                     reason,
                     requested_by,
-                    signer: None,
+                    signer: state.audit_signer.as_ref(),
                 },
             )?;
             Ok(Response::Json(200, serde_json::to_value(record)?))
@@ -1914,15 +1938,21 @@ mod tests {
 
         // A DIFFERENT tenant searching the same commit gets nothing: its
         // key forces filter.tenant="rival", and acme-stamped chunks fail it.
-        let rival = add_key(&root, "rival-key", Role::Reader, Some("rival")).unwrap();
+        let rival = add_key(&root, "rival-key", Role::Writer, Some("rival")).unwrap();
         let commit = doc["commit"].as_str().unwrap();
+        let rival_doc = post_json(
+            &url,
+            "/v1/documents",
+            Some(&rival),
+            serde_json::json!({"head": "rival/kb", "source": "r.txt", "text": "rival notes"}),
+        );
+        assert!(rival_doc["commit"].is_string(), "{rival_doc}");
         let cross = post_json(
             &url,
             "/v1/search",
             Some(&rival),
             serde_json::json!({
                 "at": "rival/kb",
-                "commit": commit,
                 "mode": "semantic",
                 "query": "roadmap secret"
             }),
@@ -1931,6 +1961,79 @@ mod tests {
             cross["hits"].as_array().unwrap().is_empty(),
             "tenant must never see another tenant's chunks: {cross}"
         );
+        // Nor search acme's commit through its own head: not in its history.
+        let foreign_commit = http_request(
+            &url,
+            "POST",
+            "/v1/search",
+            Some(&rival),
+            &[],
+            Some(
+                serde_json::json!({"at": "rival/kb", "commit": commit, "query": "roadmap"})
+                    .to_string()
+                    .as_bytes(),
+            ),
+        );
+        assert!(foreign_commit.is_err());
+
+        // Proofs: a tenant names its own head, and the commit must be in it.
+        let acme_chunk = post_json(
+            &url,
+            "/v1/search",
+            Some(&acme),
+            serde_json::json!({"at": "acme/kb", "mode": "semantic", "query": "roadmap"}),
+        )["hits"][0]["chunk"]
+            .clone();
+        let prove = |key: &str, body: serde_json::Value| {
+            http_request(
+                &url,
+                "POST",
+                "/v1/proofs/chunk",
+                Some(key),
+                &[],
+                Some(body.to_string().as_bytes()),
+            )
+        };
+        assert!(
+            prove(
+                &acme,
+                serde_json::json!({"head": "acme/kb", "commit": commit, "chunk": acme_chunk})
+            )
+            .is_ok()
+        );
+        assert!(
+            prove(
+                &rival,
+                serde_json::json!({"commit": commit, "chunk": acme_chunk})
+            )
+            .is_err()
+        );
+        assert!(
+            prove(
+                &rival,
+                serde_json::json!({"head": "rival/kb", "commit": commit, "chunk": acme_chunk})
+            )
+            .is_err()
+        );
+
+        // Raw blob uploads are salted in the caller's namespace.
+        let upload = |key: &str| -> Value {
+            serde_json::from_slice(
+                &http_request(
+                    &url,
+                    "POST",
+                    "/v1/blobs",
+                    Some(key),
+                    &[],
+                    Some(b"same bytes"),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_ne!(upload(&acme)["hash"], upload(&rival)["hash"]);
+        assert_ne!(upload(&acme)["hash"], upload(&admin)["hash"]);
+        assert_eq!(upload(&acme)["hash"], upload(&acme)["hash"]);
 
         // The admin (trust root, untenanted) can see everything, scoped or not.
         let scoped = post_json(
@@ -2129,6 +2232,20 @@ mod tests {
             Some(format!("ed25519:{public_hex}")),
             "bundle must name the signing key"
         );
+
+        // Commits made through the server carry its signature.
+        assert!(report.commits_signed > 0, "server commits must be signed");
+        assert_eq!(report.commit_keys, vec![format!("ed25519:{public_hex}")]);
+
+        // Erasure records are signed with the same key.
+        let erased = post_json(
+            &url,
+            "/v1/erasure",
+            token,
+            serde_json::json!({"subject": "nobody", "reason": "test"}),
+        );
+        let record: crate::erasure::ErasureRecord = serde_json::from_value(erased).unwrap();
+        crate::erasure::verify_record(&record, &public_hex).expect("signed erasure record");
 
         handle.shutdown();
     }

@@ -44,7 +44,7 @@ export function AuditLog({ conn, onStatus }: { conn: Conn; onStatus: (m: string,
         <button className="btn btn-glass btn-sm" onClick={exportBundle}>Export bundle</button>
       </div>
       <p className="hint">
-        Each row is a content-addressed <code>QueryManifest</code> committed to history. Export produces a
+        Each row is a content-addressed <code>QueryManifest</code> in the head's gapless record chain. Export produces a
         tamper-evident bundle verifiable offline with <code>neleus-verify</code> — no Neleus, no network.
       </p>
       <div className="table-scroll">

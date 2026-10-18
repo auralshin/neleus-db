@@ -192,8 +192,10 @@ Implemented manifest families:
   text or embedding, filters, principal, commit, mode, top-k, returned chunk
   hashes, and (v5) `seq` + `prev` linking it into the head's audit chain.
   `Engine::record_query_at_head` allocates the sequence from the newest record
-  on the head's first-parent chain (`audit::query_tip`, no separate ref) and
-  commits the record; the server and CLI record every search. A gap in the
+  (`refs/records/<head>`, read by `audit::query_tip`) and publishes the batch
+  with one update of that ref; records never become commits on the data head,
+  so recording never adds commits to the data history. The server and
+  CLI record every search. A gap in the
   sequence proves a record was removed from an export, and each checkpoint
   pins the latest record so a truncated tail below an anchor is detected too.
   Neither can prove a record was never written.
@@ -230,7 +232,9 @@ Commit {
 
 Signed commits use `commit_payload:` over the unsigned commit body. The
 payload hash is stored so verifiers can re-derive the exact bytes that were
-signed.
+signed. A signature's `key_id` names its ed25519 key, so offline verifiers
+(chunk proofs, audit bundles) check every carried signed commit without a
+store. A server started with a signing key signs every commit it makes.
 
 Signing is pluggable through:
 
@@ -301,11 +305,12 @@ tombstones expired records and compacts state, but honors
 
 ## 11. Audit
 
-Every audited retrieval is a `QueryManifest` committed into canonical history.
+Every audited retrieval is a `QueryManifest` in the head's record chain
+(`refs/records/<head>`), outside the data commit history.
 
 `audit` can:
 
-- collect query manifests reachable from a head in a time window
+- collect a head's record chain in a time window
 - export a self-contained `NELAUDIT` bundle
 - optionally sign the bundle footer with ed25519
 - verify the bundle offline without a database or network
@@ -344,12 +349,13 @@ genesis, verifies hash links, and optionally requires signatures.
 A chunk proof links:
 
 ```text
-commit -> first-parent ancestry -> manifest -> chunk bytes
+commit -> state path for "__manifests__/<manifest>" -> manifest -> chunk bytes
 ```
 
-The prover walks bounded ancestry, carries the relevant commit and manifest
-bytes, and optionally includes chunk content. The verifier replays the hash
-equations and confirms the chunk is referenced by a reachable manifest.
+Every commit that introduces manifests writes their index keys into its
+state, so the proof is one commit plus one state path, independent of how
+many writes followed. The prover searches the ancestry for the manifest; the
+verifier replays the hash equations and checks the commit's state indexes it.
 
 ## 14. Server, Auth, and Tenancy
 

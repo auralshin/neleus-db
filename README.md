@@ -67,7 +67,7 @@ Cognee) offers cryptographic tamper-evidence. See
   anchor the whole history.
 - Every search recorded as a content-addressed query audit record, sequence-chained
   per head so a record dropped from an export is detectable
-- Offline chunk proofs spanning commit ancestry
+- Offline chunk proofs: one commit plus one state path, independent of history length
 
 **Operations**
 - `neleus-db serve`: std-only HTTP server, API keys (BLAKE3-hashed,

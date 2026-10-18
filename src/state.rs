@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Result, anyhow};
@@ -329,6 +330,10 @@ impl StateStore {
             let new_root = self.build_from_sorted(entries)?;
             return self.store_manifest(&new_state_manifest(new_root));
         }
+        // Stage nodes in memory while folding keys in one at a time, then write
+        // only those the final root reaches: each key's intermediate path is
+        // superseded by the next, and writing it would cost a file per node.
+        let _staging = Staging::begin();
         let mut cur = manifest.root;
         for (key, value) in ops {
             cur = match (cur, value) {
@@ -354,7 +359,28 @@ impl StateStore {
                 }
             };
         }
+        let staged = Staging::take();
+        if let Some(root) = cur {
+            self.persist_staged(root, &staged)?;
+        }
         self.store_manifest(&new_state_manifest(cur))
+    }
+
+    /// Write the staged nodes reachable from `root`; a node not staged is
+    /// already on disk, and so is everything below it.
+    fn persist_staged(&self, root: Hash, staged: &HashMap<Hash, Arc<StateNode>>) -> Result<()> {
+        let mut stack = vec![root];
+        while let Some(hash) = stack.pop() {
+            let Some(node) = staged.get(&hash) else {
+                continue;
+            };
+            self.objects.put_serialized(STATE_TAG, node.as_ref())?;
+            self.cache_node(hash, Arc::clone(node));
+            if let NodeItems::Branch(entries) = &node.items {
+                stack.extend(entries.iter().map(|(_, child)| *child));
+            }
+        }
+        Ok(())
     }
 
     /// The tree is always canonical (shape is a pure function of the key set),
@@ -750,12 +776,19 @@ impl StateStore {
     }
 
     fn store_node(&self, node: &StateNode) -> Result<Hash> {
-        let hash = self.objects.put_serialized(STATE_TAG, node)?;
-        self.cache_node(hash, Arc::new(node.clone()));
+        let node = Arc::new(node.clone());
+        if let Some(hash) = Staging::stage(&node)? {
+            return Ok(hash);
+        }
+        let hash = self.objects.put_serialized(STATE_TAG, node.as_ref())?;
+        self.cache_node(hash, node);
         Ok(hash)
     }
 
     fn load_node(&self, hash: Hash) -> Result<Arc<StateNode>> {
+        if let Some(n) = Staging::get(hash) {
+            return Ok(n);
+        }
         if let Some(n) = self
             .node_cache
             .read()
@@ -779,6 +812,49 @@ impl StateStore {
         let node = Arc::new(node);
         self.cache_node(hash, Arc::clone(&node));
         Ok(node)
+    }
+}
+
+thread_local! {
+    static STAGED: std::cell::RefCell<Option<HashMap<Hash, Arc<StateNode>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-thread node staging for one batch; dropping it discards anything left,
+/// so a failed batch writes nothing it staged.
+struct Staging;
+
+impl Staging {
+    fn begin() -> Self {
+        STAGED.with(|s| *s.borrow_mut() = Some(HashMap::new()));
+        Staging
+    }
+
+    fn take() -> HashMap<Hash, Arc<StateNode>> {
+        STAGED.with(|s| s.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Stage `node` if a batch is open; returns its hash, or `None` to write.
+    fn stage(node: &Arc<StateNode>) -> Result<Option<Hash>> {
+        STAGED.with(|s| {
+            let mut s = s.borrow_mut();
+            let Some(map) = s.as_mut() else {
+                return Ok(None);
+            };
+            let hash = node_hash(node)?;
+            map.insert(hash, Arc::clone(node));
+            Ok(Some(hash))
+        })
+    }
+
+    fn get(hash: Hash) -> Option<Arc<StateNode>> {
+        STAGED.with(|s| s.borrow().as_ref().and_then(|m| m.get(&hash).cloned()))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        STAGED.with(|s| *s.borrow_mut() = None);
     }
 }
 
@@ -865,6 +941,59 @@ mod tests {
             .map(|(k, v)| (k.clone(), s.encode_value(v).unwrap()))
             .collect();
         s.build_from_sorted(entries).unwrap()
+    }
+
+    /// A batch into a populated tree writes only nodes its final tree uses,
+    /// not each key's superseded path.
+    #[test]
+    fn batch_writes_only_reachable_nodes() {
+        let tmp = TempDir::new().unwrap();
+        let s = store(&tmp);
+        let count = || walkdir_count(&tmp.path().join("objects"));
+        let base: Vec<(Vec<u8>, Vec<u8>)> = (0..2000u32)
+            .map(|i| (format!("a{i:05}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let pairs: Vec<(&[u8], &[u8])> = base
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let r1 = s.set_many(s.empty_root().unwrap(), &pairs).unwrap();
+        let before = count();
+        let batch: Vec<(Vec<u8>, Vec<u8>)> = (0..1000u32)
+            .map(|i| (format!("b{i:05}").into_bytes(), b"w".to_vec()))
+            .collect();
+        let pairs: Vec<(&[u8], &[u8])> = batch
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+            .collect();
+        let r2 = s.set_many(r1, &pairs).unwrap();
+        let written = count() - before;
+        let reachable = s.reachable_from(r2).unwrap().len();
+        assert!(
+            written <= reachable,
+            "wrote {written} objects for a tree of {reachable}"
+        );
+
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = base.into_iter().collect();
+        model.extend(batch);
+        let manifest = s.load_manifest_or_empty(r2).unwrap();
+        assert_eq!(manifest.root, oracle_root(&s, &model));
+    }
+
+    fn walkdir_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| {
+                        if e.path().is_dir() {
+                            walkdir_count(&e.path())
+                        } else {
+                            1
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     #[test]

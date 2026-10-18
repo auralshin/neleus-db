@@ -2,15 +2,16 @@
 //!
 //! ```text
 //! commit hash = blake3("commit:" || commit_bytes)
-//!   -> parents[0] chain to the introducing commit
-//!   -> manifests contains manifest_hash = blake3("manifest:" || bytes)
+//!   -> state_root holds key "__manifests__/<manifest_hash>" (one state path)
+//!   -> manifest_hash = blake3("manifest:" || bytes)
 //!   -> referenced blobs contain chunk_hash = blake3("blob:" || salt || content)
 //! ```
 //!
-//! Manifest type is pinned by canonical round-trip (decode -> re-encode
-//! must reproduce the bytes). An optional anchor ties `commit` to a
-//! checkpoint: a logged commit's first-parent chain reaches it, and the
-//! checkpoint's Merkle root includes that logged commit.
+//! Every commit indexes the manifests it introduces in its state, so the proof
+//! is one state path whatever the history length. Manifest type is pinned by
+//! canonical round-trip. An optional anchor ties `commit` to a checkpoint: a
+//! logged commit's first-parent chain reaches it, and the checkpoint's Merkle
+//! root includes that logged commit.
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -24,8 +25,9 @@ use crate::manifest::{
     ChunkManifest, DocManifest, MANIFEST_TAG, ManifestReferences, RunManifest, SummaryManifest,
 };
 use crate::merkle::MerkleProof;
+use crate::state::{StateOutcome, StateProof};
 
-pub const CHUNK_PROOF_SCHEMA_VERSION: u32 = 2;
+pub const CHUNK_PROOF_SCHEMA_VERSION: u32 = 3;
 
 /// Cap on the ancestry walk while locating the introducing commit.
 const MAX_PROOF_WALK: usize = 10_000;
@@ -33,11 +35,12 @@ const MAX_PROOF_WALK: usize = 10_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkProof {
     pub schema_version: u32,
-    /// The commit the retrieval ran against (head of the proof path).
+    /// The commit the retrieval ran against.
     pub commit: CommitHash,
-    /// Canonical commit bytes from `commit` down to the introducing commit,
-    /// each linked to the next via `parents[0]`.
-    pub commit_path: Vec<Vec<u8>>,
+    /// Canonical bytes of `commit`.
+    pub commit_bytes: Vec<u8>,
+    /// Membership of the manifest's index key in `commit`'s state.
+    pub manifest_proof: StateProof,
     pub manifest_hash: Hash,
     pub manifest_bytes: Vec<u8>,
     pub chunk_hash: Hash,
@@ -87,61 +90,68 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Prove `chunk_hash` was retrievable at `commit`; walks first parents to
-/// the introducing commit.
+/// Prove `chunk_hash` was retrievable at `commit`. The prover searches the
+/// ancestry for the manifest; the proof carries only `commit` and one path.
 pub fn prove_chunk(
     db: &Database,
     commit: CommitHash,
     chunk_hash: Hash,
     include_content: bool,
 ) -> Result<ChunkProof> {
-    let mut commit_path: Vec<Vec<u8>> = Vec::new();
-    let mut cursor = commit;
-
-    for _ in 0..MAX_PROOF_WALK {
-        let bytes = db.commit_store.raw_commit_bytes(cursor)?;
-        let c: Commit = from_cbor(&bytes)?;
-        commit_path.push(bytes);
-
+    let commit_bytes = db.commit_store.raw_commit_bytes(commit)?;
+    let state_root = from_cbor::<Commit>(&commit_bytes)?.state_root;
+    let mut queue = std::collections::VecDeque::from([commit]);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(cursor) = queue.pop_front() {
+        if !seen.insert(cursor) {
+            continue;
+        }
+        if seen.len() > MAX_PROOF_WALK {
+            break;
+        }
+        let c = db.commit_store.get_commit(cursor)?;
         for &manifest_hash in &c.manifests {
             let manifest_bytes = db.manifest_store.raw_manifest_bytes(manifest_hash)?;
-            if manifest_references_chunk(&manifest_bytes, chunk_hash)?.is_some() {
-                let mut content_erased = false;
-                let chunk_bytes = if include_content {
-                    match db.blob_store.get_payload(chunk_hash) {
-                        Ok(b) => Some(b),
-                        // Erased + covered: emit a commitment-only proof.
-                        Err(_) if crate::erasure::covers(&db.root, chunk_hash)? => {
-                            content_erased = true;
-                            None
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    None
-                };
-                return Ok(ChunkProof {
-                    schema_version: CHUNK_PROOF_SCHEMA_VERSION,
-                    commit,
-                    commit_path,
-                    manifest_hash,
-                    manifest_bytes,
-                    chunk_hash,
-                    chunk_bytes,
-                    content_erased,
-                    anchor: None,
-                });
+            if manifest_references_chunk(&manifest_bytes, chunk_hash)?.is_none() {
+                continue;
             }
+            let key = crate::db::manifest_index_key(manifest_hash);
+            let manifest_proof = db.state_store.proof(state_root, &key)?;
+            if !matches!(manifest_proof.outcome, StateOutcome::Found(_)) {
+                continue;
+            }
+            let mut content_erased = false;
+            let chunk_bytes = if include_content {
+                match db.blob_store.get_payload(chunk_hash) {
+                    Ok(b) => Some(b),
+                    // Erased + covered: emit a commitment-only proof.
+                    Err(_) if crate::erasure::covers(&db.root, chunk_hash)? => {
+                        content_erased = true;
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                None
+            };
+            return Ok(ChunkProof {
+                schema_version: CHUNK_PROOF_SCHEMA_VERSION,
+                commit,
+                commit_bytes,
+                manifest_proof,
+                manifest_hash,
+                manifest_bytes,
+                chunk_hash,
+                chunk_bytes,
+                content_erased,
+                anchor: None,
+            });
         }
-
-        match c.parents.first() {
-            Some(&parent) => cursor = parent,
-            None => break,
-        }
+        queue.extend(c.parents);
     }
 
     Err(anyhow!(
-        "no manifest reachable from commit {} references chunk {}",
+        "no manifest indexed at commit {} references chunk {}",
         commit,
         chunk_hash
     ))
@@ -214,36 +224,21 @@ pub fn verify_chunk_proof(proof: &ChunkProof) -> Result<&'static str> {
             proof.schema_version
         ));
     }
-    if proof.commit_path.is_empty() {
-        return Err(anyhow!("proof has an empty commit path"));
+    // 1. The commit bytes hash to the claimed commit, and any signature holds.
+    if hash_typed(COMMIT_TAG, &proof.commit_bytes) != proof.commit {
+        return Err(anyhow!("commit bytes do not hash to {}", proof.commit));
     }
+    let commit: Commit = from_cbor(&proof.commit_bytes)
+        .map_err(|e| anyhow!("commit bytes do not decode as a commit: {e}"))?;
+    crate::signing::verify_commit_signature(&commit).map_err(|e| anyhow!("commit: {e}"))?;
 
-    // 1. Head of the path must hash to the claimed commit.
-    let mut expected = proof.commit;
-    let mut introducing: Option<Commit> = None;
-    for (i, bytes) in proof.commit_path.iter().enumerate() {
-        let actual = hash_typed(COMMIT_TAG, bytes);
-        if actual != expected {
-            return Err(anyhow!(
-                "commit path link {i} hashes to {actual}, expected {expected}"
-            ));
-        }
-        let c: Commit = from_cbor(bytes)
-            .map_err(|e| anyhow!("commit path link {i} does not decode as a commit: {e}"))?;
-        if i + 1 < proof.commit_path.len() {
-            expected = *c
-                .parents
-                .first()
-                .ok_or_else(|| anyhow!("commit path link {i} is a root but the path continues"))?;
-        }
-        introducing = Some(c);
-    }
-    let introducing = introducing.expect("non-empty path");
-
-    // 2. The introducing commit must list the manifest.
-    if !introducing.manifests.contains(&proof.manifest_hash) {
+    // 2. The commit's state indexes the manifest.
+    let key = crate::db::manifest_index_key(proof.manifest_hash);
+    if !matches!(proof.manifest_proof.outcome, StateOutcome::Found(_))
+        || !proof.manifest_proof.verify(commit.state_root, &key)
+    {
         return Err(anyhow!(
-            "introducing commit does not reference manifest {}",
+            "commit state does not index manifest {}",
             proof.manifest_hash
         ));
     }
@@ -448,8 +443,34 @@ mod tests {
 
         // Query ran at c2; the chunk was introduced at c1.
         let proof = prove_chunk(&db, c2, chunk, false).unwrap();
-        assert_eq!(proof.commit_path.len(), 2);
         verify_chunk_proof(&proof).unwrap();
+        let near = to_cbor(&proof).unwrap().len();
+
+        // Later writes do not lengthen the proof: it is one state path.
+        let mut last = c2;
+        for i in 0..50 {
+            last = db
+                .create_commit_at_head("main", "agent", &format!("w{i}"), vec![])
+                .unwrap();
+        }
+        let far = prove_chunk(&db, last, chunk, false).unwrap();
+        verify_chunk_proof(&far).unwrap();
+        assert!(to_cbor(&far).unwrap().len() <= near + 64);
+    }
+
+    #[test]
+    fn unindexed_manifest_fails() {
+        let (_tmp, db) = test_db();
+        let (doc_hash, chunk) = ingest(&db, b"content");
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![doc_hash])
+            .unwrap();
+        let mut proof = prove_chunk(&db, commit, chunk, false).unwrap();
+        // A manifest the commit's state never indexed cannot borrow its path.
+        let (other, _) = ingest(&db, b"never committed");
+        proof.manifest_bytes = db.manifest_store.raw_manifest_bytes(other).unwrap();
+        proof.manifest_hash = other;
+        assert!(verify_chunk_proof(&proof).is_err());
     }
 
     #[test]
@@ -460,8 +481,8 @@ mod tests {
             .create_commit_at_head("main", "agent", "m", vec![doc_hash])
             .unwrap();
         let mut proof = prove_chunk(&db, commit, chunk, false).unwrap();
-        let last = proof.commit_path[0].len() - 1;
-        proof.commit_path[0][last] ^= 0xff;
+        let last = proof.commit_bytes.len() - 1;
+        proof.commit_bytes[last] ^= 0xff;
         assert!(verify_chunk_proof(&proof).is_err());
     }
 

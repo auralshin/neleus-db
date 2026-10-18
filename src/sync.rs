@@ -29,6 +29,7 @@ pub struct MergeReport {
     pub refs_updated: Vec<String>,
     pub refs_skipped: Vec<String>,
     pub checkpoints_updated: Vec<String>,
+    pub records_updated: Vec<String>,
 }
 
 /// Merge a remote tree: copy missing blobs/objects, fast-forward heads,
@@ -158,6 +159,20 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
         }
     }
 
+    // Record chains: adopt the remote tip when our tip is in its prev chain.
+    for (name, remote_tip) in remote_refs.list_records()? {
+        match db.refs.record_get(&name)? {
+            Some(local) if local == remote_tip => {}
+            Some(local) if !record_chain_contains(db, remote_tip, local)? => {
+                report.refs_skipped.push(format!("records:{name}"));
+            }
+            _ => {
+                db.refs.record_set(&name, remote_tip)?;
+                report.records_updated.push(name);
+            }
+        }
+    }
+
     Ok(report)
 }
 
@@ -178,7 +193,11 @@ pub fn merge_pack_file(db: &Database, pack_file: &Path) -> Result<MergeReport> {
 }
 
 /// Is `ancestor` reachable from `descendant` through any parent edges?
-fn is_ancestor(db: &Database, ancestor: CommitHash, descendant: CommitHash) -> Result<bool> {
+pub(crate) fn is_ancestor(
+    db: &Database,
+    ancestor: CommitHash,
+    descendant: CommitHash,
+) -> Result<bool> {
     let mut queue = vec![descendant];
     let mut seen = std::collections::HashSet::new();
     let mut steps = 0usize;
@@ -195,6 +214,26 @@ fn is_ancestor(db: &Database, ancestor: CommitHash, descendant: CommitHash) -> R
         }
         let commit = db.commit_store.get_commit(hash)?;
         queue.extend(commit.parents);
+    }
+    Ok(false)
+}
+
+fn record_chain_contains(db: &Database, tip: Hash, needle: Hash) -> Result<bool> {
+    let mut cursor = Some(tip);
+    let mut steps = 0usize;
+    while let Some(hash) = cursor {
+        if hash == needle {
+            return Ok(true);
+        }
+        steps += 1;
+        if steps > MAX_ANCESTRY_WALK {
+            bail!("record chain walk exceeded {MAX_ANCESTRY_WALK}");
+        }
+        cursor = db
+            .manifest_store
+            .get_query_manifest(hash)
+            .with_context(|| format!("reading record {hash}"))?
+            .prev;
     }
     Ok(false)
 }

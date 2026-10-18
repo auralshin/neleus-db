@@ -155,8 +155,8 @@ fn bench_chunk_proof(c: &mut Criterion) {
     let proof = prove_chunk(&db, commit, chunk, true).unwrap();
     verify_chunk_proof(&proof).unwrap();
     eprintln!(
-        "[proofs] chunk proof bytes (ancestry depth {}, content included): {}",
-        DEPTH + 1,
+        "[proofs] chunk proof bytes ({} commits after ingest, content included): {}",
+        DEPTH,
         to_cbor(&proof).unwrap().len()
     );
 

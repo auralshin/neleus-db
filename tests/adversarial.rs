@@ -238,13 +238,9 @@ fn a6_withhold_a_record_from_a_bundle() {
     }
     let out = tmp.path().join("full.nelaudit");
     audit::export(engine.db(), "main", 0, u64::MAX, &out, None).unwrap();
-    assert!(
-        audit::verify_bundle(&out, None, false)
-            .unwrap()
-            .chain_complete
-    );
+    audit::verify_bundle(&out, None, false).unwrap();
 
-    let (records, _) = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+    let records = audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
     let kept: Vec<String> = records
         .iter()
         .filter(|r| r.seq != 2)
@@ -281,7 +277,7 @@ fn a7_never_record_the_retrieval() {
     let report = audit::verify_bundle(&out, None, false).unwrap();
 
     // The bundle is internally perfect and describes nothing.
-    let detected = !(report.retrievals == 0 && report.chain_complete);
+    let detected = report.retrievals != 0;
     record(
         "Serve retrievals, record none",
         detected,
@@ -312,26 +308,31 @@ fn a8_swap_chunk_content() {
     );
 }
 
-/// A9. Truncate a chunk proof's ancestry to hide an intervening commit.
+/// A9. Graft a chunk proof's manifest-index path from another state onto the
+/// queried commit, claiming a manifest that commit never introduced.
 #[test]
-fn a9_truncate_chunk_ancestry() {
+fn a9_graft_chunk_state_path() {
     let (_t, engine, _c) = fixture(4);
     let commit = engine.resolve_commit("main").unwrap();
     let hits = engine
         .search_semantic_unrecorded(commit, "record 0", 5, &SearchFilter::default())
         .unwrap();
     let mut proof = prove_chunk(engine.db(), commit, hits[0].chunk_hash, false).unwrap();
-    let detected = if proof.commit_path.len() > 1 {
-        proof.commit_path.remove(1);
-        verify_chunk_proof(&proof).is_err()
-    } else {
-        true
-    };
+    let elsewhere = engine.db().state_set_at_head("other", b"k", b"v").unwrap();
+    proof.manifest_proof = engine
+        .db()
+        .state_store
+        .proof(
+            elsewhere,
+            &neleus_db::db::manifest_index_key(proof.manifest_hash),
+        )
+        .unwrap();
+    let detected = verify_chunk_proof(&proof).is_err();
     record(
-        "Truncate a chunk proof's ancestry",
+        "Graft a chunk proof's state path",
         detected,
         true,
-        "parent link",
+        "state root",
     );
 }
 
@@ -509,7 +510,7 @@ fn set_records(entries: &mut [(String, Vec<u8>)], jsonl: &str, count: usize) {
 fn write_bundle(entries: &[(String, Vec<u8>)], out: &std::path::Path) {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"NELAUDIT");
-    buf.extend_from_slice(&2u32.to_le_bytes());
+    buf.extend_from_slice(&3u32.to_le_bytes());
     buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for (name, data) in entries {
         buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
@@ -543,11 +544,14 @@ fn tamper_injection_trials() {
     let (tmp, engine, _c) = fixture(1);
     let commit = engine.resolve_commit("main").unwrap();
     let filter = SearchFilter::default();
+    let mut anchor = None;
     for i in 0..RECORDS + UNANCHORED {
         if i == RECORDS {
-            CheckpointStore::new(engine.db())
-                .create("main", None)
-                .unwrap();
+            anchor = Some(
+                CheckpointStore::new(engine.db())
+                    .create("main", None)
+                    .unwrap(),
+            );
         }
         let hits = engine
             .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
@@ -566,8 +570,11 @@ fn tamper_injection_trials() {
             )
             .unwrap();
     }
+    // The auditor retained this checkpoint; without an anchor an exporter can
+    // forge the latest checkpoint too, so every trial verifies against it.
+    let anchor = anchor.unwrap();
     let out = tmp.path().join("base.nelaudit");
-    audit::export(engine.db(), "main", 0, u64::MAX, &out, None).unwrap();
+    audit::export_anchored(engine.db(), "main", 0, u64::MAX, &out, None, anchor).unwrap();
     let base = parse_bundle(&std::fs::read(&out).unwrap());
     let base_records: Vec<AuditRecord> = base
         .iter()
@@ -586,27 +593,60 @@ fn tamper_injection_trials() {
         let name = format!("objects/{manifest}");
         entries.retain(|(n, _)| *n != name);
     };
+    // Edit the record at `from` and re-hash and re-link every record above it,
+    // as an operator controlling the store can.
+    let rechain = |entries: &mut Vec<(String, Vec<u8>)>, recs: &mut [AuditRecord], from: u64| {
+        let mut order: Vec<usize> = (0..recs.len()).collect();
+        order.sort_by_key(|&k| recs[k].seq);
+        let mut prev: Option<String> = None;
+        for k in order {
+            let r = &mut recs[k];
+            if r.seq < from {
+                prev = Some(r.manifest.clone());
+                continue;
+            }
+            let name = format!("objects/{}", r.manifest);
+            let bytes = entries.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+            let mut qm: QueryManifest = from_cbor(&bytes).unwrap();
+            if r.seq == from {
+                qm.principal = Some("forged".into());
+            }
+            qm.prev = prev.as_ref().map(|p| p.parse::<Hash>().unwrap());
+            let forged = to_cbor(&qm).unwrap();
+            let hash = hash_typed(MANIFEST_TAG, &forged).to_string();
+            entries.retain(|(n, _)| *n != name);
+            entries.push((format!("objects/{hash}"), forged));
+            r.manifest = hash.clone();
+            r.principal = qm.principal.clone();
+            r.prev = prev.clone();
+            prev = Some(hash);
+        }
+    };
 
     // (class, expected detections out of TRIALS)
     let classes = [
         ("control (no change)", 0),
-        ("edit a record field", TRIALS),
-        ("re-forge a manifest", TRIALS),
+        ("edit a record line", TRIALS),
+        ("re-forge a manifest at or below the pin", TRIALS),
         ("drop a middle record", TRIALS),
+        ("drop the oldest records", TRIALS),
         ("truncate from an anchored record", TRIALS),
         // NOT DETECTED: no anchor covers records after the last checkpoint.
         ("truncate unanchored records only", 0),
+        ("edit and re-chain at or below the pin", TRIALS),
+        // NOT DETECTED: re-chaining above the anchor's pin leaves it intact.
+        ("edit and re-chain after the checkpoint", 0),
         ("duplicate a record", TRIALS),
         ("swap two sequence numbers", TRIALS),
     ];
     let mut rng = StdRng::seed_from_u64(7);
     let path = tmp.path().join("trial.nelaudit");
     println!(
-        "\n  TAMPER INJECTION: {TRIALS} seeded trials per class, {} records \
-         ({UNANCHORED} after the last checkpoint)",
+        "\n  TAMPER INJECTION (coverage of a deterministic verifier): {TRIALS} seeded \
+         trials per class, {} records ({UNANCHORED} after the anchored checkpoint)",
         RECORDS + UNANCHORED
     );
-    println!("  {:<34} {:>9}", "class", "detected");
+    println!("  {:<40} {:>9}", "class", "detected");
     for (class, expected) in classes {
         let mut detected = 0;
         for _ in 0..TRIALS {
@@ -614,14 +654,18 @@ fn tamper_injection_trials() {
             let mut recs = base_records.clone();
             let i = rng.gen_range(0..recs.len());
             match class {
-                "edit a record field" => match rng.gen_range(0..5) {
+                "edit a record line" => match rng.gen_range(0..5) {
                     0 => recs[i].principal = Some("forged".into()),
                     1 => recs[i].top_k += 1,
                     2 => recs[i].executed_at -= 1,
                     3 => recs[i].hits[0].score_micro += 1,
                     _ => recs[i].mode = "vector".into(),
                 },
-                "re-forge a manifest" => {
+                "re-forge a manifest at or below the pin" => {
+                    // Above the pin, the newest record has no successor to
+                    // break; that case is "edit and re-chain after".
+                    let seq = rng.gen_range(0..RECORDS as u64);
+                    let i = recs.iter().position(|r| r.seq == seq).unwrap();
                     let old = recs[i].manifest.clone();
                     let name = format!("objects/{old}");
                     let bytes = &entries.iter().find(|(n, _)| *n == name).unwrap().1;
@@ -639,6 +683,13 @@ fn tamper_injection_trials() {
                     let r = recs.remove(i);
                     drop_object(&mut entries, &r.manifest);
                 }
+                "drop the oldest records" => {
+                    let to = rng.gen_range(1..(RECORDS + UNANCHORED) as u64);
+                    for r in recs.iter().filter(|r| r.seq < to) {
+                        drop_object(&mut entries, &r.manifest);
+                    }
+                    recs.retain(|r| r.seq >= to);
+                }
                 "truncate from an anchored record" | "truncate unanchored records only" => {
                     let from = if class.starts_with("truncate from") {
                         rng.gen_range(1..RECORDS as u64)
@@ -649,6 +700,13 @@ fn tamper_injection_trials() {
                         drop_object(&mut entries, &r.manifest);
                     }
                     recs.retain(|r| r.seq < from);
+                }
+                "edit and re-chain at or below the pin" => {
+                    rechain(&mut entries, &mut recs, rng.gen_range(0..RECORDS as u64));
+                }
+                "edit and re-chain after the checkpoint" => {
+                    let from = rng.gen_range(RECORDS as u64..(RECORDS + UNANCHORED) as u64);
+                    rechain(&mut entries, &mut recs, from);
                 }
                 "duplicate a record" => recs.push(recs[i].clone()),
                 "swap two sequence numbers" => {
@@ -668,15 +726,12 @@ fn tamper_injection_trials() {
             }
             set_records(&mut entries, &jsonl, recs.len());
             write_bundle(&entries, &path);
-            let accepted = matches!(
-                audit::verify_bundle(&path, None, false),
-                Ok(r) if r.chain_complete
-            );
+            let accepted = audit::verify_bundle_anchored(&path, None, false, anchor).is_ok();
             if !accepted {
                 detected += 1;
             }
         }
-        println!("  {class:<34} {detected:>5}/{TRIALS}");
+        println!("  {class:<40} {detected:>5}/{TRIALS}");
         assert_eq!(detected, expected, "{class}");
     }
 }

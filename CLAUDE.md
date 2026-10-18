@@ -24,10 +24,14 @@ verification detects, including seeded tamper-injection trials.
   past commit is searched with `commit` (HTTP) / `--at` (CLI), still recorded
   on the head. Library callers record too via `Engine::search`; only the
   explicit `search_*_unrecorded` methods skip it.
-- The retrieval chain tip is derived from the commit graph
-  (`audit::query_tip`, memoized per commit); there is no query ref. Records
-  carry a gapless `seq` + `prev`; each checkpoint pins the newest record
-  (`query_tip`) so the bundle verifier catches truncation below an anchor.
+- Retrieval records live off the data head: `refs/records/<head>` names the
+  newest record, and each record carries a gapless `seq` + `prev`. A batch
+  writes its manifests, then one record-ref update commits it, so searches
+  never add commits to data history. Each
+  checkpoint pins the newest record (`query_tip`); bundles verified against an
+  anchor reject truncation or re-chaining at or below the anchor's pin.
+- Bundle verification checks each carried checkpoint's commit is the last
+  leaf of its own log root (`checkpoint_inclusion` / `anchor_inclusion`).
 - One per-database `secret` in `meta/config.json` derives the state-tree
   boundary key and the blob salt keys. Replicas must share it: create them
   with `db init --replica-of <url>`; merges with different secrets are refused.
@@ -37,12 +41,16 @@ verification detects, including seeded tamper-injection trials.
   carry the payload; `ChunkProof::chunk_content` strips the salt.
 - Concurrent recordings on a head group-commit (`engine/recorder.rs`).
 - Audit bundles carry only the latest checkpoint; `--anchor` adds a
-  consistency proof from a retained checkpoint. Chunk proofs can carry an
-  inclusion anchor (`prove_chunk_anchored`).
+  consistency proof from a retained checkpoint, plus edge records (the record
+  before the window and records up to each pin) so a window is provably
+  complete. Chunk proofs are one commit plus a state path to the manifest's
+  `__manifests__/` index key; they can carry an inclusion anchor
+  (`prove_chunk_anchored`).
 - Tenant-scoped vector queries use the tenant's own graph or an exact scan,
   never the shared graph.
-- Durability (`os` | `full`, default `full`) is process-wide, set at
-  `Database::open`. CAS objects publish with a no-replace rename (hard-link
+- Durability (`full` | `barrier` | `os`, default `full`) is process-wide, set
+  at `Database::open`. `full` issues `F_FULLFSYNC` on macOS, `barrier` issues
+  `F_BARRIERFSYNC` (SQLite's class there), `os` no sync. CAS objects publish with a no-replace rename (hard-link
   fallback); head and staging refs are `write_atomic` without WAL; checkpoint
   refs keep WAL.
 - BM25 statistics are scoped to what the caller may see.
