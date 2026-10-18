@@ -1,88 +1,76 @@
 # Contributing
 
-Thanks for taking the time. A few things that will save you (and the review)
-a round trip.
+## License
 
-## License of contributions
+Contributions are dual-licensed under [Apache-2.0](LICENSE-APACHE) and
+[MIT](LICENSE-MIT) unless you state otherwise. Submit only code you can
+license this way.
 
-neleus-db is dual-licensed under [Apache-2.0](LICENSE-APACHE) and
-[MIT](LICENSE-MIT). Unless you explicitly state otherwise, any contribution
-you intentionally submit for inclusion, as defined in the Apache-2.0 license,
-is dual licensed as above, without any additional terms or conditions. Don't
-submit code you can't license this way.
+## Byte format
 
-## The one rule that matters: don't break the byte format
+These are hashed into object identities. Changing how they serialize breaks
+every existing database and proof:
 
-The canonical plane is a trust anchor. These are hashed into object
-identities, so a change to how they serialize silently invalidates every
-existing database and every proof:
+- `src/canonical.rs`: DAG-CBOR encoding and golden-byte tests.
+- Hash domains in `src/hash.rs` (`blob:`, `manifest:`, `manifest_leaf:`,
+  `state_node:`, `commit:`, `commit_payload:`, `checkpoint:`,
+  `checkpoint_payload:`, `checkpoint_leaf:`, `merkle_node:`, `merkle_root:`,
+  `index_segment:`).
+- On-disk shapes of `Commit`, `StateNode`/`StateManifest`, the manifest types,
+  `Checkpoint`, and the encryption envelope.
 
-- `src/canonical.rs`: DAG-CBOR encoding, golden-byte tests
-- hash domains applied through `src/hash.rs` (`blob:`, `manifest:`,
-  `manifest_leaf:`, `state_node:`, `state_level:`, `commit:`,
-  `commit_payload:`, `checkpoint:`, `checkpoint_payload:`, `checkpoint_leaf:`,
-  `merkle_node:`, `merkle_root:`, `index_segment:`)
-- on-disk shapes of `Commit`, `StateNode`/`StateManifest`, the manifest
-  types, `Checkpoint`, and the encryption envelope
+A format change needs a schema version bump; open an issue first. Do not
+update golden bytes without knowing why they changed. Replace old formats
+outright; no migration shims.
 
-If you change any of these, you are changing the format. That needs a schema
-version bump and an explicit decision, so open an issue first. The golden
-tests in `canonical.rs` exist to fail loudly when this happens by accident;
-do not "fix" them by updating the expected bytes without understanding why.
+The serving plane (`src/engine/`) is rebuilt from canonical data and is free
+to change, as long as recall holds.
 
-This project has no deployed users yet, so we **replace** old formats rather
-than carry migration shims (e.g. PBKDF2 to Argon2id was a straight swap, not a
-compat path). Greenfield until stated otherwise: don't add backward-compat
-layers.
-
-The serving plane (`src/engine/`, `src/index`-derived data) is the opposite:
-it's rebuildable from canonical data and never hashed into identity, so it's
-free to change. Optimize it freely; just keep recall pinned (see below).
-
-## Before you open a PR
+## Commands
 
 ```bash
-cargo test            # all of it must pass, no exceptions
-cargo clippy          # zero warnings; CI treats them as errors
+cargo build                    # embeds console/dist (default `console` feature)
+cargo build --no-default-features   # API only, no Node needed
+npm --prefix console ci && npm --prefix console run build
+cargo test
 cargo fmt
+cargo clippy
+cargo test --test adversarial -- --nocapture --test-threads=1
 ```
 
-For changes to the retrieval engine, the recall oracle tests
-(`engine::vector`, `engine::segment`) must still hold: HNSW recall@10 ≥ 0.90
-against the exact brute-force oracle, on both the f32 and SQ8 paths. If you
-touch indexing, run the benchmarks and note any regression:
+Engine changes must keep the recall tests in `engine::vector` and
+`engine::segment` passing (HNSW recall@10 >= 0.90 on the f32 and SQ8 paths).
+If you touch indexing, run the benchmarks you need and note regressions:
 
 ```bash
-cargo bench --bench compare_sql
-cargo bench --bench scale
+NELEUS_BENCH_DURABILITY=os cargo bench --bench compare_sql --bench state --bench scale --bench verifiability
+NELEUS_BENCH_DURABILITY=full NELEUS_BENCH_ENCRYPT=1 NELEUS_BENCH_WRITES_ONLY=1 \
+  cargo bench --bench compare_sql --bench scale -- 'point_set|semantic_recorded|coalesced' \
+  --warm-up-time 1 --measurement-time 3 --sample-size 10
 ```
+
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo fmt --check`, the
+console build, `cargo test`, `cargo build --release`, and the SDK suites
+(Rust tests, Python-native check, TypeScript tests). Run `cargo clippy`
+locally; CI does not run it.
 
 ## Style
 
-- Match the surrounding code. Comments are dev-style: one line, telegraphic,
-  only where the *why* isn't obvious. No narrative blocks, no restating what
-  the code says.
-- Errors use `anyhow` with `with_context`; surface the path/hash that failed.
-- No new heavy dependencies in the canonical plane. The serving plane and
-  server can take well-justified deps, but the bar is high: most of this
-  (HNSW, the HTTP server, the HTTP client) is hand-rolled on purpose.
-- Crypto is the exception: never hand-roll it. Use the RustCrypto / dalek
-  crates already in the tree.
+- Match the surrounding code. Comments are one line, only where the why is
+  not obvious.
+- Errors use `anyhow` with `with_context`, naming the path or hash that failed.
+- Avoid new dependencies, especially in the canonical plane.
+- Never hand-roll crypto; use the RustCrypto and dalek crates already in use.
 
-## Security-sensitive changes
+## Security
 
-Anything touching encryption, signing, auth, the WAL, or the proof/verify
-paths gets extra scrutiny. Call it out in the PR description, explain the
-threat model you're addressing, and add a test that fails without your fix.
-If you find a vulnerability, please don't open a public issue; email the
-maintainer first.
+Changes to encryption, signing, auth, the WAL, or proof verification need a
+note in the PR on the threat addressed and a test that fails without the fix.
+Report vulnerabilities by email to the maintainer, not in a public issue.
 
-## Tests are part of the change
+## Pull requests
 
-Every behavioral change ships with a test. Bug fixes ship with a test that
-reproduces the bug first. "It works on my machine" is not a test.
-
-## Scope
-
-Keep PRs focused. One concern per PR. If you notice unrelated dead code or a
-nearby cleanup, mention it; don't fold it in.
+- Every behavior change ships with a test; bug fixes start with a failing test.
+- One concern per PR. Mention unrelated cleanups instead of including them.

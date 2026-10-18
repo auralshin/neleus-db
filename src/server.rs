@@ -1444,7 +1444,9 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let _w = state.write_lock.lock().expect("write lock poisoned");
             gate_write(db, req, "checkpoints", head)?;
-            let hash = engine.checkpoints().create(head, None)?;
+            let hash = engine
+                .checkpoints()
+                .create(head, state.audit_signer.as_ref())?;
             Ok(Response::Json(200, json!({"checkpoint": hash.to_string()})))
         }
 
@@ -2212,6 +2214,12 @@ mod tests {
             token,
             serde_json::json!({"at": "main", "mode": "semantic", "query": "corpus"}),
         );
+        post_json(
+            &url,
+            "/v1/checkpoints",
+            token,
+            serde_json::json!({"head": "main"}),
+        );
 
         let bundle = http_request(
             &url,
@@ -2231,6 +2239,12 @@ mod tests {
             report.bundle_key_id,
             Some(format!("ed25519:{public_hex}")),
             "bundle must name the signing key"
+        );
+
+        // Checkpoints made through the server are signed with the same key.
+        assert_eq!(
+            report.checkpoints_signed, 1,
+            "server checkpoints must be signed"
         );
 
         // Commits made through the server carry its signature.

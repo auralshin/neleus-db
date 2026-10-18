@@ -1,31 +1,13 @@
 # Examples
 
-This directory contains runnable examples for common `neleus-db` workflows.
+Run with `cargo run --example <name>`.
 
-## Run examples
-
-```bash
-cargo run --example 01_basic_blob_storage
-cargo run --example 02_state_and_commits
-cargo run --example 03_document_chunking
-cargo run --example 05_state_proofs
-```
-
-## Example list
-
-### 01) Basic blob storage
-Shows immutable blob put/get and hash-based deduplication.
-
-### 02) State and commits
-Shows versioned state roots, Git-like commits, head updates, and time-travel reads.
-
-### 03) Document chunking
-Shows deterministic fixed chunking via `DocManifest` and retrieving chunk blobs.
-
-### 05) State proofs
-Shows membership, non-membership, and deletion proofs using `StateStore::proof` and `verify_proof`.
-
-## Notes
-
-- Each example uses `tempfile::TempDir` and is self-contained.
-- Examples target the current public API (`Database::init` + `Database::open`).
+| Example | Shows |
+|---|---|
+| `01_basic_blob_storage` | Blob put/get and deduplication by hash |
+| `02_state_and_commits` | Versioned state, commits, and reads at past roots |
+| `03_document_chunking` | Fixed-size chunking into a `DocManifest` |
+| `05_state_proofs` | Membership, non-membership, and deletion proofs |
+| `07_retrieval_quality` | nDCG@10 and Recall@10 on a BEIR corpus; takes two JSONL files (see file header) |
+| `sync_count` | Helper for `benches/tools/sync-count.sh` |
+| `06_claude_run.py` | Python: audit a Claude call end to end (needs `anthropic` and an API key; see file header) |

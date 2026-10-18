@@ -1,108 +1,91 @@
 # Policy enforcement
 
-The audit log tells you whether the data *was* handled correctly. Policy turns
-that from an observation into a control: declarative rules that **monitor**
-live state and **enforce** them at write time — neleus refuses the write that
-would create a violation.
+Policies are rules that neleus checks continuously (monitor) or at write time
+(enforce, which rejects the write). They live in `meta/policy.json` and are
+set with `policy set`, `POST /v1/policy`, or the console's Policies view.
+Violations go to a hash-chained event log and can trigger a webhook.
 
-Policies live in `meta/policy.json` and are edited as code (CLI `policy set`,
-HTTP `POST /v1/policy`, or the **Policies** view in the console). Violations are
-recorded to a tamper-evident event log and can fire a webhook.
-
-## The model
-
-A policy binds a **rule** to a set of **heads**, in a **mode**, at a
-**severity**:
+## Policy set
 
 ```json
 {
   "webhook": "http://127.0.0.1:9000/hook",
   "policies": [
-    { "id": "clinical-encrypted",
-      "rule": { "kind": "require-encryption-at-rest" },
+    { "id": "encrypted", "rule": { "kind": "require-encryption-at-rest" },
       "mode": "enforce" },
-    { "id": "clinical-retention",
-      "rule": { "kind": "retention-floor", "min_secs": 220752000 },
-      "mode": "enforce", "severity": "required" },
-    { "id": "named-agents",
-      "heads": ["clinical/*"],
-      "rule": { "kind": "require-principal" },
+    { "id": "retention", "rule": { "kind": "retention-floor", "min_secs": 220752000 },
       "mode": "enforce" },
-    { "id": "signed-history",
-      "heads": ["clinical/*"],
+    { "id": "named-agents", "heads": ["clinical/*"],
+      "rule": { "kind": "require-principal" }, "mode": "enforce" },
+    { "id": "signed-history", "heads": ["clinical/*"],
       "rule": { "kind": "require-signed-checkpoints" },
       "mode": "monitor", "severity": "recommended" }
   ]
 }
 ```
 
-- **`heads`** — exact names, a `prefix*` wildcard, or `*`/omitted = all heads.
-  Database-global rules (encryption, retention) ignore the selector.
-- **`mode`** — `enforce` rejects the offending write (HTTP 403); `monitor`
-  allows it but records the violation.
-- **`severity`** — `required` (default) or `recommended`; surfaced in reports
-  and the console, does not change blocking behavior.
-- **`enabled`** — defaults true; set false to park a policy without deleting it.
+- `heads`: exact names, `prefix*`, or `*`/omitted for all. Global rules ignore
+  it.
+- `mode`: `enforce` rejects the write (HTTP 403, code `policy_violation`);
+  `monitor` allows it and logs the violation.
+- `severity`: `required` (default) or `recommended`. Informational only.
+- `enabled`: default `true`.
 
 ## Rules
 
-| `kind` | What it checks | Gateable at write time |
+| `kind` | Checks | At write time |
 |---|---|---|
-| `require-tamper-evident-chain` | The head's checkpoint chain verifies | no (continuous) |
-| `require-signed-checkpoints` | Every checkpoint on the head is signed | no (continuous) |
-| `require-signed-commits` | The head's tip commit carries a signature | no (continuous) |
-| `require-encryption-at-rest` | Encryption at rest is enabled (global) | **yes** |
-| `retention-floor` (`min_secs`) | Retention floor ≥ `min_secs` (global) | **yes** |
-| `require-principal` | The write names an authenticated principal | **yes** |
-| `require-provenance` | A run declares a provider or input/retrieved data | **yes** (runs) |
+| `require-tamper-evident-chain` | the head's checkpoint chain verifies | no |
+| `require-signed-checkpoints` | every checkpoint on the head is signed | no |
+| `require-signed-commits` | the head's tip commit is signed | no |
+| `require-encryption-at-rest` | encryption is enabled (global) | yes |
+| `retention-floor` (`min_secs`) | config `retention_min_secs` ≥ `min_secs` (global) | yes |
+| `require-principal` | the write has an authenticated principal; continuously, every retrieval in the last 30 days names one | yes |
+| `require-provenance` | a run declares a provider, inputs, or retrieved chunks | yes, runs only |
 
-Continuous rules are evaluated by `policy eval` / `POST /v1/policy/evaluate`
-against live state. Write-time rules are also enforced inline on `POST
-/v1/documents`, `/v1/runs`, and `/v1/commits` at the server boundary. (The
-admin CLI is an escape hatch and is not gated — the server is the enforcement
-point for agents.)
+`retention_min_secs` only stops session GC from removing younger records.
+Erasure does not consult it.
 
-## Continuous monitoring
+## Where enforcement applies
 
-```bash
-neleus-db --db ./db policy eval
-# [Fail] clinical-encrypted   require-encryption-at-rest head=(database)  Encryption at rest is not enabled.
-# [Pass] named-agents         require-principal          head=clinical/a  All 12 retrieval(s) name a principal.
-# — 7 pass / 1 warn / 1 fail
-```
+Write-time rules run on every mutating HTTP route (documents, runs, commits,
+state, blobs, sessions, checkpoints, pack) and on searches, since a search
+writes a record. The CLI's `state set`, `commit new`, and `session append` commands
+are gated too, with principal `cli`. Other CLI writes and the embedded library
+are not gated.
 
-The console's **Monitor** view runs this on a timer and streams new violations
-live next to the pass/warn/fail summary.
+A global rule in `monitor` mode is not logged on every write; `policy eval`
+reports it.
 
-## The event log
-
-Every recorded violation appends to `meta/events.jsonl`, an append-only,
-hash-chained log: each entry carries the hash of the previous one, so deleting
-or altering an entry breaks the chain.
+## Monitoring
 
 ```bash
-neleus-db --db ./db events list
-neleus-db --db ./db events verify     # walks the chain; errors if tampered
+neleus-db --db ./db policy eval [--head <h>]
+# [Fail] encrypted  require-encryption-at-rest  head=(database)  Encryption at rest is not enabled.
+# — 3 pass / 0 warn / 1 fail
 ```
 
-Over HTTP: `GET /v1/events` returns the log; `?since=<seq>` returns only newer
-entries; `?wait=<secs>` (≤30) long-polls for the live feed.
+HTTP: `POST /v1/policy/evaluate`. The console's Monitor view runs it on a timer.
 
-## Alerting
+## Event log
 
-Set `"webhook": "http://host:port/path"` on the policy set. Each recorded
-violation is POSTed there as JSON, off the write path (delivery never adds
-latency to the write). Delivery is `http://`-only by design — point it at a
-local forwarder that terminates TLS to Slack/PagerDuty, the same way inbound
-TLS is terminated in front of `serve`.
+Violations append to `meta/events.jsonl`. Each entry carries the previous
+entry's hash, so editing or deleting one breaks the chain. Each checkpoint pins
+the log's newest entry, so `checkpoint verify` also catches a rewrite below
+that point. Erasure records live in the same log.
 
-## CLI
+```bash
+neleus-db --db ./db events list [--since <seq>]
+neleus-db --db ./db events verify
+```
 
-| Command | What it does |
-|---|---|
-| `policy list` | Print the current policy set. |
-| `policy set <file.json>` | Replace the whole set (policy-as-code apply). |
-| `policy rm --id <id>` | Remove one policy. |
-| `policy eval [--head <h>]` | Evaluate every enabled policy against live state. |
-| `events list [--since <seq>]` | List recorded events. |
-| `events verify` | Verify the event chain is intact. |
+HTTP: `GET /v1/events` with `?since=<seq>`, `?wait=<secs>` (long-poll, max 30),
+`?verify=1`.
+
+## Webhook
+
+Each logged violation is POSTed as JSON to `webhook` on a background thread,
+so it never delays the write. Only `http://` is supported; use a local
+forwarder for HTTPS targets. The URL is shown only to admins.
+
+Other commands (`policy list`, `policy rm --id <id>`) are in [cli.md](cli.md).

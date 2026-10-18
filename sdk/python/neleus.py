@@ -276,10 +276,15 @@ class Client:
             "top_k": top_k, "filter": filter,
         })
 
-    def prove(self, commit: str, chunk: str, *, include_content: bool = True) -> str:
-        out = self._t.request("POST", "/v1/proofs/chunk", {
-            "commit": commit, "chunk": chunk, "include_content": include_content,
-        })
+    def prove(
+        self, commit: str, chunk: str, *, include_content: bool = True,
+        head: Optional[str] = None,
+    ) -> str:
+        # Tenant-scoped keys must name one of their heads and pass include_content=False.
+        body = {"commit": commit, "chunk": chunk, "include_content": include_content}
+        if head is not None:
+            body["head"] = head
+        out = self._t.request("POST", "/v1/proofs/chunk", body)
         return out["proof_cbor"]
 
     def verify(self, proof_cbor: str) -> dict:

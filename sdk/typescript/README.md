@@ -1,75 +1,35 @@
 # @neleus/client
 
-TypeScript client for [neleus-db](../../). Talks to a `neleus-db serve`
-instance over HTTP. Works in Node 18+ (global `fetch`) and browsers. No
-runtime dependencies.
+TypeScript HTTP client for a `neleus-db serve` instance. Node 18+ or
+browsers, no runtime dependencies.
 
 ```bash
 npm install @neleus/client
 ```
 
 ```ts
-import { connect } from "@neleus/client";
+import { connect, withRun } from "@neleus/client";
 
-const c = connect("neleus://nlk_…@127.0.0.1:7117");   // or new Client(url, { token })
-
-const { commit } = await c.putDocument("main", "kb.md", "policy text", {
-  metadata: { doc_type: "policy", acl: ["group:hr"] },
-});
-
-const res = await c.search("main", { query: "reset policy", mode: "hybrid" });
-
-// prove a hit and verify it
+const c = connect("neleus://nlk_...@127.0.0.1:7117"); // or new Client(url, { token })
+await c.putDocument("main", "kb.md", "policy text", { metadata: { acl: ["group:hr"] } });
+const res = await c.search("main", { query: "reset policy" });
 const proof = await c.prove(res.commit, res.hits[0].chunk);
-const verdict = await c.verify(proof);          // { valid: true, anchor: "doc" }
+const { valid } = await c.verify(proof);
+const bundle = await c.exportBundle("main"); // .nelaudit bytes
 
-// offline-verifiable audit bundle
-const bundle = await c.exportBundle("main");     // Uint8Array (.nelaudit)
+await withRun(c, { provider: "anthropic", model: "claude-sonnet-4-6" }, async (run) => {
+  run.prompt(question).retrievedChunks(res.hits.map((h) => h.chunk));
+  await run.output(reply);
+});
 ```
 
-Run capture — wrap a model call so its prompt, retrieved chunks, and output
-become a content-addressed, provable record:
+Methods: `health`, `blobPut`, `blobGet`, `chunkText`, `putDocument`,
+`commit`, `search` (`{ query, embedding, mode, topK, filter, commit }`),
+`prove`, `verify`, `stateGet`, `stateSet`, `sessionAppend`, `sessionList`,
+`checkpoint`, `auditQueries`, `exportBundle`, `run`. Errors throw
+`NeleusError` with `.code`, `.hint`, `.status`.
 
-```ts
-import { withRun } from "@neleus/client";
+Test: `npm run build && npm test` (needs `cargo build --release` at the repo
+root, or `NELEUS_BIN`).
 
-await withRun(c, { provider: "anthropic", model: "claude-sonnet-4-6", agentId: "reviewer" },
-  async (run) => {
-    run.prompt(question);
-    run.retrievedChunks(res.hits.map((h) => h.chunk));
-    const reply = await anthropic.messages.create(/* … */);
-    await run.output(reply.content[0].text);
-  });
-// auto-commits: prompt, chunks, and output are now provably linked.
-```
-
-## API
-
-`connect(connString?, opts?)` — from a `neleus://[token@]host[:port]` string or
-`$NELEUS_URL`. Or `new Client(url, { token?, timeoutMs?, fetch? })`. Then:
-
-- `health()`, `putDocument(head, source, text, opts?)`, `commit(head, message, manifests?)`
-- `search(at, { query?, embedding?, mode?, topK?, filter?, audit? })`
-- `prove(commit, chunk, includeContent?)`, `verify(proofCbor)`
-- `stateGet/stateSet`, `sessionAppend/sessionList`, `checkpoint(head)`
-- `auditQueries`, `exportBundle`
-- `run(opts)` / `withRun(client, opts, fn)`
-
-`search` records every call on the head `at`; pass `commit` to search a past
-commit (time-travel). Other routes accept a head name or a 64-hex commit hash.
-
-Failed calls throw `NeleusError` carrying `.code` (e.g. `policy_violation`,
-`unauthorized`), `.hint`, and `.status`.
-
-## Build & test
-
-```bash
-npm run build      # tsc -> dist/
-npm test           # spawns the release binary, runs e2e tests
-```
-
-Tests need the `neleus-db` release binary (`cargo build --release` at the repo
-root) or `NELEUS_BIN` pointing at it; without it the suite skips cleanly.
-
-For the embedded, in-process path (no server), use the
-[native Python binding](../python-native) or the Rust crate directly.
+Routes: [docs/http-api.md](../../docs/http-api.md).

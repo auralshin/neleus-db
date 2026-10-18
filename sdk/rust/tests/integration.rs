@@ -86,7 +86,7 @@ fn health_and_ingest_search_prove_verify() {
     assert!(!res.hits.is_empty());
     assert!(!res.audit_manifest.is_empty());
 
-    let proof = c.prove(&res.commit, &res.hits[0].chunk, true).unwrap();
+    let proof = c.prove(&res.commit, &res.hits[0].chunk, true, None).unwrap();
     let verdict = c.verify(&proof).unwrap();
     assert!(verdict.valid, "{verdict:?}");
     assert_eq!(verdict.anchor.as_deref(), Some("doc"));
