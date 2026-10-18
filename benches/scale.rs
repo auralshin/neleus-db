@@ -2,6 +2,8 @@
 //! vectors at production dimensionality (1536d), and coalesced single-op
 //! writes under concurrency. Run: cargo bench --bench scale
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -88,7 +90,7 @@ struct Fixture {
 fn setup() -> Fixture {
     let tmp = TempDir::new().unwrap();
     let root = tmp.path().join("db");
-    Database::init(&root).unwrap();
+    common::init_db(&root);
     let db = Database::open(&root).unwrap();
     let mut rng = lcg(42);
 
@@ -134,6 +136,18 @@ fn setup() -> Fixture {
         start.elapsed()
     );
 
+    if common::writes_only() {
+        let engine = Engine::new(db);
+        coalesced_writes(&engine);
+        return Fixture {
+            _tmp: tmp,
+            engine,
+            text_commit,
+            vec_commit: text_commit,
+            query_vec: Vec::new(),
+        };
+    }
+
     // 10k x 1536d vectors on a separate head.
     let start = Instant::now();
     let mut manifests = Vec::with_capacity(VEC_COUNT);
@@ -178,7 +192,20 @@ fn setup() -> Fixture {
         start.elapsed()
     );
 
-    // Coalesced single-op writes: 8 writers x 250 ops, one-shot measurement.
+    coalesced_writes(&engine);
+
+    let mut qrng = lcg(99);
+    Fixture {
+        _tmp: tmp,
+        engine,
+        text_commit,
+        vec_commit,
+        query_vec: synthetic_vec(&mut qrng),
+    }
+}
+
+/// Coalesced single-op writes: 8 writers x 250 ops, one-shot measurement.
+fn coalesced_writes(engine: &Engine) {
     let writer = Arc::new(engine.coalescing_writer("text"));
     let start = Instant::now();
     let threads: Vec<_> = (0..8)
@@ -202,15 +229,6 @@ fn setup() -> Fixture {
         "[scale] coalesced writes: 2000 single ops via 8 writers in {elapsed:?} = {:?}/op",
         elapsed / 2000
     );
-
-    let mut qrng = lcg(99);
-    Fixture {
-        _tmp: tmp,
-        engine,
-        text_commit,
-        vec_commit,
-        query_vec: synthetic_vec(&mut qrng),
-    }
 }
 
 fn bench_scale(c: &mut Criterion) {
@@ -222,7 +240,7 @@ fn bench_scale(c: &mut Criterion) {
     group.bench_function("neleus_maxscore", |b| {
         b.iter(|| {
             f.engine
-                .search_semantic(f.text_commit, "vector retrieval latency", 10, &filter)
+                .search_semantic_unrecorded(f.text_commit, "vector retrieval latency", 10, &filter)
                 .unwrap()
         });
     });
@@ -232,7 +250,7 @@ fn bench_scale(c: &mut Criterion) {
     group.bench_function("neleus_hnsw_sq8", |b| {
         b.iter(|| {
             f.engine
-                .search_vector(f.vec_commit, &f.query_vec, 10, &filter)
+                .search_vector_unrecorded(f.vec_commit, &f.query_vec, 10, &filter)
                 .unwrap()
         });
     });
@@ -240,11 +258,14 @@ fn bench_scale(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("coalesced_single_write");
     group.sample_size(30);
+    // Outside the routine so every call writes new keys (see compare_sql).
+    let next = std::sync::atomic::AtomicUsize::new(0);
     group.bench_function("neleus_coalesced_8writers", |b| {
         let writer = Arc::new(f.engine.coalescing_writer("text"));
         b.iter_custom(|iters| {
             // Per-op cost under 8-way concurrency, amortized.
             let per_thread = (iters as usize).div_ceil(8).max(1);
+            let base = next.fetch_add(per_thread, std::sync::atomic::Ordering::Relaxed);
             let start = Instant::now();
             std::thread::scope(|s| {
                 for t in 0..8 {
@@ -252,7 +273,7 @@ fn bench_scale(c: &mut Criterion) {
                     s.spawn(move || {
                         for i in 0..per_thread {
                             writer
-                                .set(format!("b-{t}-{i}").as_bytes(), b"payload")
+                                .set(format!("b-{t}-{}", base + i).as_bytes(), b"payload")
                                 .unwrap();
                         }
                     });

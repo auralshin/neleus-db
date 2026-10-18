@@ -77,7 +77,7 @@ impl<'a> SessionStore<'a> {
         Self::validate_id(session_id)?;
         let now = now_unix()?;
         let seq = self.next_seq(head, session_id)?;
-        let content_hash = self.db.blob_store.put(content)?;
+        let content_hash = self.db.blob_store.for_head(head).put(content)?;
         let record = SessionRecord {
             schema_version: SESSION_SCHEMA_VERSION,
             session_id: session_id.to_string(),

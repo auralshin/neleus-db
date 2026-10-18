@@ -49,7 +49,9 @@ filter: they may only name heads under `acme/`, every search is forced to
 
 ## Routes
 
-`at` accepts a head name or a 64-hex commit hash (time-travel). Time fields
+`at` names a head; routes that read history also accept a 64-hex commit hash,
+except `/v1/search`, which records every search on `at` and takes a past
+commit as `commit` (time-travel). Time fields
 are unix seconds.
 
 ### Health and refs
@@ -97,9 +99,9 @@ the remote model.
 
 | Method | Path | Role | Body |
 |---|---|---|---|
-| POST | `/v1/search` | reader (**writer** with `audit: true`) | `{ at, mode, query?, embedding?, top_k?, filter?, audit? }` → `{ commit, hits[], audit_manifest? }` |
-| POST | `/v1/proofs/chunk` | reader | `{ commit, chunk, include_content? }` → `{ proof_cbor }` |
-| POST | `/v1/proofs/verify` | reader | `{ proof_cbor }` → `{ valid, anchor? \| error }` |
+| POST | `/v1/search` | reader (always recorded) | `{ at, commit?, mode, query?, embedding?, top_k?, filter? }` → `{ commit, hits[], audit_manifest }` |
+| POST | `/v1/proofs/chunk` | reader | `{ commit, chunk, include_content?, anchor_head? }` → `{ proof_cbor }` |
+| POST | `/v1/proofs/verify` | reader | `{ proof_cbor }` → `{ valid, anchor?, checkpoint? \| error }` |
 
 `mode` is `semantic` | `vector` | `hybrid`. `filter` is
 `{ tenant?, doc_type?, language?, acl?[], at? }`.
@@ -118,7 +120,7 @@ the remote model.
 |---|---|---|---|
 | GET | `/v1/compliance/summary` | reader, untenanted | per-head chain status, retrievals, encryption, retention |
 | POST | `/v1/audit/queries` | reader | `{ head, from?, to? }` → `{ records[] }` |
-| POST | `/v1/audit/export` | reader | `{ head, from?, to? }` → bundle bytes (octet-stream) |
+| POST | `/v1/audit/export` | reader | `{ head, from?, to?, anchor? }` → bundle bytes (octet-stream) |
 
 Bundles are **signed** when the server was started with
 `serve --sign-key <seed>`; `neleus-verify --public-key <hex> --require-signature`

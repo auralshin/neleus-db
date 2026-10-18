@@ -102,6 +102,13 @@ pub fn tip_seq(db_root: &Path) -> Result<Option<u64>> {
     Ok(read_tip(db_root)?.map(|e| e.seq))
 }
 
+/// Newest entry's `(seq, hash)`, for a checkpoint to pin.
+pub fn tip(db_root: &Path) -> Result<Option<(u64, crate::hash::Hash)>> {
+    read_tip(db_root)?
+        .map(|e| Ok((e.seq, e.hash.parse()?)))
+        .transpose()
+}
+
 /// Events with `seq > after` (the long-poll / live-feed cursor).
 pub fn read_since(db_root: &Path, after: u64) -> Result<Vec<Event>> {
     Ok(read(db_root)?
@@ -142,11 +149,13 @@ pub fn append(db_root: &Path, kind: &str, data: Value) -> Result<Event> {
     }
     let mut line = serde_json::to_vec(&event)?;
     line.push(b'\n');
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?
-        .write_all(&line)?;
+    let created = !path.exists();
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    file.write_all(&line)?;
+    crate::atomic::maybe_sync_file(&file)?;
+    if created {
+        crate::atomic::maybe_sync_dir(&dir)?;
+    }
     Ok(event)
 }
 

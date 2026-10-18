@@ -68,7 +68,7 @@ class NativeBinding(unittest.TestCase):
         # newer commit adds a second document
         self.db.put_document("main", "kb2", "completely unrelated second document about widgets")
         # querying the old commit must not see the newer doc
-        old = self.db.search(c1, "widgets", mode="semantic", top_k=5)
+        old = self.db.search("main", "widgets", mode="semantic", top_k=5, commit=c1)
         self.assertEqual(len(old), 0)
 
     def test_sessions(self):

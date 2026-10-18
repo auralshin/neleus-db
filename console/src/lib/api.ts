@@ -39,7 +39,6 @@ export interface ComplianceSummary {
 }
 
 export interface AuditRecord {
-  commit: string;
   manifest: string;
   queried_commit: string;
   executed_at: number;

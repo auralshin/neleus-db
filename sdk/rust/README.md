@@ -18,7 +18,6 @@ let doc = c.put_document("main", "kb.md", "policy text", DocOpts::default())?;
 let res = c.search("main", SearchOpts {
     query: Some("reset policy".into()),
     mode: Some("hybrid".into()),
-    audit: true,
     ..Default::default()
 })?;
 

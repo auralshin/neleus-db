@@ -7,6 +7,7 @@
 //! All derived data: deleting `index/` loses nothing canonical.
 //! Hits carry (commit, chunk_hash) -> upgradeable via retrieval_proof.
 
+mod recorder;
 pub mod segment;
 pub(crate) mod vector;
 pub mod writer;
@@ -31,7 +32,7 @@ pub use segment::{ChunkInput, IndexSegment, SearchFilter, SegmentHit};
 pub use writer::WriteCoalescer;
 
 const SEGMENT_TAG: &[u8] = b"index_segment:";
-const HEAD_SCHEMA_VERSION: u32 = 1;
+const HEAD_SCHEMA_VERSION: u32 = 2;
 
 /// Merge a head's segment chain into one segment past this length.
 const MERGE_THRESHOLD: usize = 8;
@@ -49,6 +50,25 @@ struct SegmentSetManifest {
     /// Oldest → newest. Newest wins on chunk-hash collisions.
     segments: Vec<Hash>,
     built_at: u64,
+}
+
+/// What [`Engine::search`] looks for: lexical, vector, or both fused.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchQuery<'a> {
+    Semantic(&'a str),
+    Vector(&'a [f32]),
+    Hybrid {
+        text: Option<&'a str>,
+        embedding: Option<&'a [f32]>,
+    },
+}
+
+/// A recorded search: the commit searched, its hits, and the record's hash.
+#[derive(Debug, Clone)]
+pub struct Searched {
+    pub commit: CommitHash,
+    pub hits: Vec<EngineHit>,
+    pub record: Hash,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +99,7 @@ pub struct Engine {
     /// Serializes erasure's segment-file deletion against segment reads:
     /// readers take it shared, `reindex_all_heads` takes it exclusive.
     index_gate: RwLock<()>,
+    recorder: recorder::Recorder,
 }
 
 impl Engine {
@@ -92,12 +113,21 @@ impl Engine {
             segments: RwLock::new(HashMap::new()),
             heads: RwLock::new(HashMap::new()),
             index_gate: RwLock::new(()),
+            recorder: recorder::Recorder::default(),
         }
     }
 
     /// Open a database and wrap it in a resident engine.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         Ok(Self::new(Database::open(path)?))
+    }
+
+    /// Sign every commit this engine makes with `signer`.
+    pub fn set_commit_signer(
+        &mut self,
+        signer: Arc<dyn crate::commit::CommitSigner + Send + Sync>,
+    ) {
+        self.db.commit_store.set_signer(signer);
     }
 
     pub fn db(&self) -> &Database {
@@ -147,7 +177,7 @@ impl Engine {
             .db
             .manifest_store
             .put_doc_manifest_from_bytes_with_metadata(
-                &self.db.blob_store,
+                &self.db.blob_store.for_head(head),
                 source.to_string(),
                 bytes,
                 chunking,
@@ -195,6 +225,17 @@ impl Engine {
         include_content: bool,
     ) -> Result<crate::retrieval_proof::ChunkProof> {
         crate::retrieval_proof::prove_chunk(&self.db, commit, chunk, include_content)
+    }
+
+    /// [`Self::prove`] anchored in `head`'s latest checkpoint.
+    pub fn prove_anchored(
+        &self,
+        head: &str,
+        commit: CommitHash,
+        chunk: Hash,
+        include_content: bool,
+    ) -> Result<crate::retrieval_proof::ChunkProof> {
+        crate::retrieval_proof::prove_chunk_anchored(&self.db, head, commit, chunk, include_content)
     }
 
     // ---------- persistence ----------
@@ -547,8 +588,65 @@ impl Engine {
         out
     }
 
-    /// Top-`k` BM25 hits for `query` at `commit`, honoring `filter`.
-    pub fn search_semantic(
+    /// Search `head`, or the past commit `at`, and record the retrieval on
+    /// `head`. This is the served path; the `*_unrecorded` searches leave no
+    /// audit record.
+    pub fn search(
+        &self,
+        head: &str,
+        at: Option<CommitHash>,
+        query: SearchQuery<'_>,
+        top_k: usize,
+        filter: &SearchFilter,
+        principal: Option<&str>,
+    ) -> Result<Searched> {
+        if head.len() == 64 && head.parse::<Hash>().is_ok() {
+            return Err(anyhow!(
+                "search must name a head to record on; pass a commit hash as `at`"
+            ));
+        }
+        let tip = self.resolve_commit(head)?;
+        // The record names `head`, so the searched commit must be in its history.
+        let commit = match at {
+            Some(c) if c != tip && !crate::sync::is_ancestor(&self.db, c, tip)? => {
+                return Err(anyhow!("commit {c} is not in the history of head '{head}'"));
+            }
+            Some(c) => c,
+            None => tip,
+        };
+        let (mode, text, embedding, hits) = match query {
+            SearchQuery::Semantic(q) => (
+                "semantic",
+                Some(q),
+                None,
+                self.search_semantic_unrecorded(commit, q, top_k, filter)?,
+            ),
+            SearchQuery::Vector(e) => (
+                "vector",
+                None,
+                Some(e),
+                self.search_vector_unrecorded(commit, e, top_k, filter)?,
+            ),
+            SearchQuery::Hybrid { text, embedding } => (
+                "hybrid",
+                text,
+                embedding,
+                self.search_hybrid_unrecorded(commit, text, embedding, top_k, filter)?,
+            ),
+        };
+        let record = self.record_query_at_head(
+            head, commit, mode, text, embedding, top_k, filter, principal, &hits,
+        )?;
+        Ok(Searched {
+            commit,
+            hits,
+            record,
+        })
+    }
+
+    /// Top-`k` BM25 hits for `query` at `commit`, honoring `filter`. Leaves no
+    /// audit record; served searches go through [`Self::search`].
+    pub fn search_semantic_unrecorded(
         &self,
         commit: CommitHash,
         query: &str,
@@ -578,8 +676,8 @@ impl Engine {
     }
 
     /// Top-`k` nearest-vector (HNSW) hits for `embedding` at `commit`, honoring
-    /// `filter`.
-    pub fn search_vector(
+    /// `filter`. Leaves no audit record.
+    pub fn search_vector_unrecorded(
         &self,
         commit: CommitHash,
         embedding: &[f32],
@@ -599,7 +697,8 @@ impl Engine {
     }
 
     /// BM25 + vector fused with RRF; degrades to one modality if only one given.
-    pub fn search_hybrid(
+    /// Leaves no audit record.
+    pub fn search_hybrid_unrecorded(
         &self,
         commit: CommitHash,
         query: Option<&str>,
@@ -622,10 +721,11 @@ impl Engine {
             self.ensure_indexed(commit)?;
         }
         let (semantic, vector) = std::thread::scope(|s| {
-            let semantic =
-                query.map(|q| s.spawn(move || self.search_semantic(commit, q, fetch, filter)));
-            let vector =
-                embedding.map(|e| s.spawn(move || self.search_vector(commit, e, fetch, filter)));
+            let semantic = query.map(|q| {
+                s.spawn(move || self.search_semantic_unrecorded(commit, q, fetch, filter))
+            });
+            let vector = embedding
+                .map(|e| s.spawn(move || self.search_vector_unrecorded(commit, e, fetch, filter)));
             (
                 semantic.map(|h| h.join().expect("semantic search panicked")),
                 vector.map(|h| h.join().expect("vector search panicked")),
@@ -694,6 +794,7 @@ impl Engine {
     ///
     /// The sequence number is what makes omission detectable. Integrity alone
     /// cannot tell "no retrievals" from "retrievals withheld"; a gap can.
+    /// Concurrent calls on one head share a commit.
     #[allow(clippy::too_many_arguments)]
     pub fn record_query_at_head(
         &self,
@@ -707,30 +808,62 @@ impl Engine {
         principal: Option<&str>,
         hits: &[EngineHit],
     ) -> Result<Hash> {
-        // Serialize the read-compute-commit-set of the audit tip across
-        // processes: two concurrent recorders on the same head must not read
-        // the same tip and mint the same sequence number, which would make
-        // verify_bundle reject the chain as duplicated.
+        let record = recorder::Record {
+            commit,
+            mode: mode.to_string(),
+            query_text: query_text.map(str::to_string),
+            embedding: embedding.map(<[f32]>::to_vec),
+            top_k,
+            filter: filter.clone(),
+            principal: principal.map(str::to_string),
+            hits: hits.to_vec(),
+        };
+        self.recorder
+            .record(head, record, |batch| self.commit_records(head, batch))
+    }
+
+    /// Chain `batch` after the head's newest record and publish it with one
+    /// record-ref update. Records stay off the head's commit history, so
+    /// searching never lengthens the ancestry a chunk proof carries.
+    fn commit_records(&self, head: &str, batch: &[recorder::Record]) -> Result<Vec<Hash>> {
+        // Serialize the read-compute-commit of the audit tip across processes:
+        // two recorders reading the same tip would mint the same sequence
+        // number, which verify_bundle rejects as a duplicate.
         let _audit_lock = crate::lock::flock_exclusive(
             self.db.root.join(".audit.lock"),
             std::time::Duration::from_secs(10),
         )?;
-        let prev = self.db.refs.query_get(head)?;
-        let seq = match prev {
-            Some(h) => self.db.manifest_store.get_query_manifest(h)?.seq + 1,
-            None => 0,
-        };
-        let manifest = self.build_query_manifest(
-            commit, mode, query_text, embedding, top_k, filter, principal, hits, seq, prev,
-        )?;
-        self.db.create_commit_at_head(
-            head,
-            principal.unwrap_or("audit"),
-            "audit: retrieval",
-            vec![manifest],
-        )?;
-        self.db.refs.query_set(head, manifest)?;
-        Ok(manifest)
+        let mut tip = crate::audit::query_tip(&self.db, head)?;
+        let blobs = self.db.blob_store.for_head(head);
+        let mut manifests = Vec::with_capacity(batch.len());
+        for r in batch {
+            // Times never go backwards along the chain, so a time window
+            // is a contiguous run of sequence numbers.
+            let (prev, seq, at) = match tip {
+                Some((h, seq, at)) => (Some(h), seq + 1, now_unix()?.max(at)),
+                None => (None, 0, now_unix()?),
+            };
+            let m = self.build_query_manifest(
+                &blobs,
+                r.commit,
+                &r.mode,
+                r.query_text.as_deref(),
+                r.embedding.as_deref(),
+                r.top_k,
+                &r.filter,
+                r.principal.as_deref(),
+                &r.hits,
+                seq,
+                prev,
+                at,
+            )?;
+            tip = Some((m, seq, at));
+            manifests.push(m);
+        }
+        if let Some((last, _, _)) = tip {
+            self.db.refs.record_set(head, last)?;
+        }
+        Ok(manifests)
     }
 
     /// Bare, unchained QueryManifest object (`seq = 0`, no `prev`).
@@ -749,13 +882,25 @@ impl Engine {
         hits: &[EngineHit],
     ) -> Result<Hash> {
         self.build_query_manifest(
-            commit, mode, query_text, embedding, top_k, filter, principal, hits, 0, None,
+            &self.db.blob_store,
+            commit,
+            mode,
+            query_text,
+            embedding,
+            top_k,
+            filter,
+            principal,
+            hits,
+            0,
+            None,
+            now_unix()?,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn build_query_manifest(
         &self,
+        blobs: &crate::blob_store::BlobStore,
         commit: CommitHash,
         mode: &str,
         query_text: Option<&str>,
@@ -766,13 +911,14 @@ impl Engine {
         hits: &[EngineHit],
         seq: u64,
         prev: Option<Hash>,
+        executed_at: u64,
     ) -> Result<Hash> {
         let query_text = match query_text {
-            Some(q) => Some(self.db.blob_store.put(q.as_bytes())?),
+            Some(q) => Some(blobs.put(q.as_bytes())?),
             None => None,
         };
         let query_embedding = match embedding {
-            Some(e) => Some(self.db.blob_store.put(&to_cbor(&e.to_vec())?)?),
+            Some(e) => Some(blobs.put(&to_cbor(&e.to_vec())?)?),
             None => None,
         };
         let filters = if *filter == SearchFilter::default() {
@@ -789,7 +935,7 @@ impl Engine {
             top_k: top_k as u32,
             filters,
             principal: principal.map(str::to_string),
-            executed_at: now_unix()?,
+            executed_at,
             hits: hits
                 .iter()
                 .map(|h| QueryHit {
@@ -896,7 +1042,7 @@ mod tests {
 
         let engine = Engine::new(db);
         let hits = engine
-            .search_semantic(c2, "quark", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(c2, "quark", 5, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty());
         assert!(
@@ -934,7 +1080,7 @@ mod tests {
         let commit = commit_doc(&db, "main", b"rust systems programming here", None);
         let engine = Engine::new(db);
         let hits = engine
-            .search_semantic(commit, "rust systems", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(commit, "rust systems", 5, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].score > 0.0);
@@ -950,10 +1096,10 @@ mod tests {
 
         // Both commits' knowledge is visible at c2.
         let rust = engine
-            .search_semantic(c2, "rust", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(c2, "rust", 5, &SearchFilter::default())
             .unwrap();
         let python = engine
-            .search_semantic(c2, "python", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(c2, "python", 5, &SearchFilter::default())
             .unwrap();
         assert!(!rust.is_empty(), "ancestor commit's chunks must be indexed");
         assert!(!python.is_empty());
@@ -967,7 +1113,7 @@ mod tests {
         let engine = Engine::new(db);
 
         let at_c1 = engine
-            .search_semantic(c1, "python", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(c1, "python", 5, &SearchFilter::default())
             .unwrap();
         assert!(
             at_c1.is_empty(),
@@ -993,7 +1139,7 @@ mod tests {
         );
         // All knowledge survives the merge.
         let hits = engine
-            .search_semantic(last, "document number 0", 20, &SearchFilter::default())
+            .search_semantic_unrecorded(last, "document number 0", 20, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty());
     }
@@ -1039,13 +1185,13 @@ mod tests {
 
         let engine = Engine::new(db);
         let vec_hits = engine
-            .search_vector(commit, &[1.0, 0.1, 0.0], 2, &SearchFilter::default())
+            .search_vector_unrecorded(commit, &[1.0, 0.1, 0.0], 2, &SearchFilter::default())
             .unwrap();
         assert_eq!(vec_hits[0].chunk_hash, text_a);
         assert!(vec_hits[0].score > 0.9);
 
         let hybrid = engine
-            .search_hybrid(
+            .search_hybrid_unrecorded(
                 commit,
                 Some("alpha"),
                 Some(&[1.0, 0.0, 0.0]),
@@ -1071,7 +1217,9 @@ mod tests {
             tenant: Some("acme".into()),
             ..Default::default()
         };
-        let hits = engine.search_semantic(c2, "knowledge", 10, &acme).unwrap();
+        let hits = engine
+            .search_semantic_unrecorded(c2, "knowledge", 10, &acme)
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text_preview.contains("acme"));
     }
@@ -1082,14 +1230,14 @@ mod tests {
         let commit = commit_doc(&db, "main", b"cached corpus text", None);
         let engine = Engine::new(db);
         let _ = engine
-            .search_semantic(commit, "cached", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(commit, "cached", 5, &SearchFilter::default())
             .unwrap();
 
         // Nuke the on-disk index; the warm engine must still answer.
         fs::remove_dir_all(engine.index_root.join("segments")).unwrap();
         fs::remove_dir_all(engine.index_root.join("heads")).unwrap();
         let hits = engine
-            .search_semantic(commit, "cached", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(commit, "cached", 5, &SearchFilter::default())
             .unwrap();
         assert!(!hits.is_empty(), "warm query must be served from memory");
     }
@@ -1131,7 +1279,7 @@ mod tests {
         let filter = SearchFilter::default();
 
         let first: Vec<Hash> = engine
-            .search_hybrid(
+            .search_hybrid_unrecorded(
                 commit,
                 Some("alpha beta"),
                 Some(&[1.0, 0.0, 0.0]),
@@ -1145,7 +1293,7 @@ mod tests {
         assert_eq!(first.len(), 10);
         for _ in 0..25 {
             let again: Vec<Hash> = engine
-                .search_hybrid(
+                .search_hybrid_unrecorded(
                     commit,
                     Some("alpha beta"),
                     Some(&[1.0, 0.0, 0.0]),
@@ -1166,7 +1314,7 @@ mod tests {
         let commit = commit_doc(&db, "main", b"auditable content", None);
         let engine = Engine::new(db);
         let hits = engine
-            .search_semantic(commit, "auditable", 5, &SearchFilter::default())
+            .search_semantic_unrecorded(commit, "auditable", 5, &SearchFilter::default())
             .unwrap();
         let h = engine
             .record_query(

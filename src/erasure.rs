@@ -61,7 +61,7 @@ pub struct EraseOptions<'a> {
 }
 
 /// Erase a subject's content. Shreds blobs referenced *only* by that subject's
-/// runs and documents (a blob shared with another subject — e.g. via dedup — is
+/// runs, documents, and the retrievals that returned them (a blob shared with another subject — e.g. via dedup — is
 /// kept), rebuilds the index if any shredded blob fed it, then appends a signed
 /// record to the event log.
 pub fn erase_subject(engine: &Engine, subject: &str, opts: EraseOptions) -> Result<ErasureRecord> {
@@ -201,6 +201,30 @@ fn scan_subject_blobs(db: &Database, subject: &str) -> Result<Scan> {
                 classify_manifest(&bytes, subject, &mut scan);
             }
             cursor = commit.parents.first().copied();
+        }
+    }
+    // A retrieval that returned the subject's chunks is about the subject, so
+    // its query text and embedding are the subject's too.
+    for (head, _) in db.refs.list_heads()? {
+        let mut cursor = db.refs.record_get(&head)?;
+        let mut steps = 0usize;
+        while let Some(m) = cursor {
+            steps += 1;
+            if steps > MAX_WALK {
+                bail!("erasure walk exceeded {MAX_WALK} records");
+            }
+            let qm = db.manifest_store.get_query_manifest(m)?;
+            let mine = qm
+                .hits
+                .iter()
+                .any(|h| scan.chunk_content.contains(&h.chunk));
+            let dest = if mine {
+                &mut scan.mine
+            } else {
+                &mut scan.foreign
+            };
+            dest.extend(qm.query_text.into_iter().chain(qm.query_embedding));
+            cursor = qm.prev;
         }
     }
     Ok(scan)
@@ -415,12 +439,45 @@ mod tests {
 
         // Before erasure: alice's chunk is indexed and retrievable.
         let hits = engine
-            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("diabetes"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(
             hits.iter().any(|h| h.chunk_hash == alice_chunk),
             "alice indexed pre-erasure"
         );
+        // Recorded searches: one returned alice's chunk, one did not.
+        let about_alice = engine
+            .search(
+                "main",
+                None,
+                crate::engine::SearchQuery::Semantic("diabetes"),
+                5,
+                &SearchFilter::default(),
+                None,
+            )
+            .unwrap()
+            .record;
+        let unrelated = engine
+            .search(
+                "main",
+                None,
+                crate::engine::SearchQuery::Semantic("mountain"),
+                1,
+                &SearchFilter::default(),
+                None,
+            )
+            .unwrap()
+            .record;
+        let query_blob = |m| {
+            engine
+                .db()
+                .manifest_store
+                .get_query_manifest(m)
+                .unwrap()
+                .query_text
+                .unwrap()
+        };
+        let (alice_q, other_q) = (query_blob(about_alice), query_blob(unrelated));
 
         erase_subject(
             &engine,
@@ -438,17 +495,25 @@ mod tests {
             "alice's chunk shredded"
         );
         assert!(covers(&root, alice_chunk).unwrap());
+        assert!(
+            !engine.db().blob_store.exists(alice_q),
+            "query that returned alice's chunk shredded"
+        );
+        assert!(
+            engine.db().blob_store.exists(other_q),
+            "unrelated query kept"
+        );
 
         // Index purged: alice's term is gone; bob's content still searchable.
         let after = engine
-            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("diabetes"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(
             after.iter().all(|h| h.chunk_hash != alice_chunk),
             "alice purged from index"
         );
         let bob = engine
-            .search_hybrid(commit, Some("hiking"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("hiking"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(!bob.is_empty(), "bob's content survives erasure");
     }
@@ -497,7 +562,7 @@ mod tests {
             .chunks[0];
         let commit = engine.resolve_commit("main").unwrap();
         engine
-            .search_hybrid(commit, Some("record"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("record"), None, 5, &SearchFilter::default())
             .unwrap();
 
         // Readers hammer search while one thread erases a subject (deleting +
@@ -520,7 +585,7 @@ mod tests {
                 s.spawn(|| {
                     for _ in 0..150 {
                         engine
-                            .search_hybrid(
+                            .search_hybrid_unrecorded(
                                 commit,
                                 Some("record"),
                                 None,
@@ -535,7 +600,7 @@ mod tests {
 
         // u3's content is gone; the surviving subjects still serve.
         let after = engine
-            .search_hybrid(commit, Some("record"), None, 20, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("record"), None, 20, &SearchFilter::default())
             .unwrap();
         assert!(!after.is_empty(), "surviving subjects still searchable");
         assert!(after.iter().all(|h| h.chunk_hash != u3_chunk), "u3 purged");

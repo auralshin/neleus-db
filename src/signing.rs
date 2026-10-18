@@ -129,6 +129,28 @@ impl CommitVerifier for Ed25519Verifier {
     }
 }
 
+/// Check a commit's own signature offline: the payload hash must match the
+/// body and the signature must verify under the key its `key_id` names.
+/// Returns that key id, or `None` for an unsigned commit.
+pub fn verify_commit_signature(commit: &Commit) -> Result<Option<String>> {
+    let Some(sig) = &commit.signature else {
+        return Ok(None);
+    };
+    let expected = commit.unsigned_payload_hash()?;
+    if commit.payload_hash != Some(expected) {
+        return Err(anyhow!("commit payload_hash does not match its body"));
+    }
+    let key_id = sig
+        .key_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("signed commit names no key"))?;
+    let public = key_id
+        .strip_prefix(&format!("{SIGNATURE_SCHEME}:"))
+        .ok_or_else(|| anyhow!("unsupported commit key id '{key_id}'"))?;
+    Ed25519Verifier::from_public_hex(public)?.verify(Hash([0; 32]), commit, expected)?;
+    Ok(Some(key_id.to_string()))
+}
+
 /// Sign raw bytes (checkpoint chains).
 pub fn sign_raw(signer: &Ed25519Signer, payload: &[u8]) -> Vec<u8> {
     signer.key.sign(payload).to_bytes().to_vec()
@@ -149,8 +171,35 @@ mod tests {
         objects.ensure_dir().unwrap();
         let blobs = BlobStore::new(tmp.path().join("blobs"));
         blobs.ensure_dir().unwrap();
-        let state = StateStore::new(objects.clone(), blobs);
+        let state = StateStore::new(objects.clone(), blobs, [7; 32]);
         (CommitStore::new(objects), state)
+    }
+
+    #[test]
+    fn commit_signatures_verify_offline_and_reject_tampering() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("server.key");
+        let public_hex = generate_keypair_file(&key_path).unwrap();
+        let (mut cs, state) = stores(&tmp);
+        cs.set_signer(std::sync::Arc::new(
+            Ed25519Signer::from_seed_file(&key_path).unwrap(),
+        ));
+        let root = state.empty_root().unwrap();
+        let h = cs
+            .create_commit(vec![], root, vec![], "key:agent".into(), "m".into())
+            .unwrap();
+        let commit = cs.get_commit(h).unwrap();
+        assert_eq!(
+            verify_commit_signature(&commit).unwrap(),
+            Some(format!("ed25519:{public_hex}"))
+        );
+
+        let mut edited = commit.clone();
+        edited.message = "rewritten".into();
+        assert!(verify_commit_signature(&edited).is_err());
+        let mut resealed = edited.clone();
+        resealed.payload_hash = Some(resealed.unsigned_payload_hash().unwrap());
+        assert!(verify_commit_signature(&resealed).is_err());
     }
 
     #[test]

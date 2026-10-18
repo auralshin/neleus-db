@@ -14,7 +14,7 @@ use super::vector::{
     EF_SEARCH, HnswGraph, dot, dot_q, exact_search, exact_search_over, normalize, quantize,
 };
 
-pub const SEGMENT_SCHEMA_VERSION: u32 = 2;
+pub const SEGMENT_SCHEMA_VERSION: u32 = 3;
 
 /// Below this many vectors, exact scan beats the graph. Kept above
 /// [`EXACT_SCAN_LIMIT`]: the query path never routes to a graph at or below
@@ -154,6 +154,21 @@ pub struct IndexSegment {
     /// which is what old segments and untenanted corpora get.
     #[serde(default)]
     pub tenants: BTreeMap<String, Vec<u32>>,
+    /// Each tenant's own postings, so a tenant query never reads another
+    /// tenant's posting entries and its cost tracks only its own data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_lexicon: BTreeMap<String, BTreeMap<String, PostingList>>,
+    /// Graphs over each large tenant's own vectors, so a tenant query never
+    /// traverses, or takes time proportional to, other tenants' nodes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_graphs: BTreeMap<String, TenantGraph>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TenantGraph {
+    /// Local graph node `i` is vector node `nodes[i]`, ascending.
+    pub nodes: Vec<u32>,
+    pub graph: HnswGraph,
 }
 
 /// Retrieval filter over [`ChunkMetadata`]; conditions AND together.
@@ -330,6 +345,51 @@ impl IndexSegment {
                 tenants.entry(t.to_string()).or_default().push(doc as u32);
             }
         }
+        let mut tenant_lexicon: BTreeMap<String, BTreeMap<String, PostingList>> = BTreeMap::new();
+        for (term, postings) in &lexicon {
+            for (i, &doc) in postings.docs.iter().enumerate() {
+                let tenant = chunks[doc as usize]
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.tenant.as_deref());
+                if let Some(t) = tenant {
+                    let own = tenant_lexicon
+                        .entry(t.to_string())
+                        .or_default()
+                        .entry(term.clone())
+                        .or_insert_with(|| PostingList {
+                            docs: Vec::new(),
+                            tfs: Vec::new(),
+                        });
+                    own.docs.push(doc);
+                    own.tfs.push(postings.tfs[i]);
+                }
+            }
+        }
+        let tenant_graphs = tenants
+            .iter()
+            .filter_map(|(t, docs)| {
+                let nodes: Vec<u32> = docs
+                    .iter()
+                    .filter_map(|d| vec_docs.binary_search(d).ok().map(|n| n as u32))
+                    .collect();
+                if nodes.len() < HNSW_BUILD_THRESHOLD {
+                    return None;
+                }
+                let own: Vec<Vec<f32>> = nodes
+                    .iter()
+                    .map(|&n| vec_data[n as usize].clone())
+                    .collect();
+                let graph = if vector_dim.unwrap_or(0) >= SQ8_MIN_DIM {
+                    let (codes, scales): (Vec<Vec<u8>>, Vec<f32>) =
+                        own.iter().map(|v| quantize(v)).unzip();
+                    HnswGraph::build_quantized(&codes, &scales)
+                } else {
+                    HnswGraph::build(&own)
+                }?;
+                Some((t.clone(), TenantGraph { nodes, graph }))
+            })
+            .collect();
 
         Self {
             schema_version: SEGMENT_SCHEMA_VERSION,
@@ -346,6 +406,23 @@ impl IndexSegment {
             hnsw,
             any_acl,
             tenants,
+            tenant_lexicon,
+            tenant_graphs,
+        }
+    }
+
+    /// A tenant-scoped query on a segment that indexes tenants: it reads only
+    /// that tenant's postings and always probes, so no step scales with other
+    /// tenants' data.
+    fn tenant_scoped(&self, filter: &SearchFilter) -> bool {
+        filter.tenant.is_some() && !self.tenants.is_empty()
+    }
+
+    /// Postings a query under `filter` may read; `None` = nothing visible.
+    fn lexicon_for(&self, filter: &SearchFilter) -> Option<&BTreeMap<String, PostingList>> {
+        match &filter.tenant {
+            Some(t) if !self.tenants.is_empty() => self.tenant_lexicon.get(t),
+            _ => Some(&self.lexicon),
         }
     }
 
@@ -398,14 +475,19 @@ impl IndexSegment {
             return (0, 0, vec![0; terms.len()]);
         }
         let total_len: u64 = ids.iter().map(|&d| self.doc_len[d as usize] as u64).sum();
+        let Some(lexicon) = self.lexicon_for(filter) else {
+            return (ids.len(), total_len, vec![0; terms.len()]);
+        };
 
         // Probing beats masking exactly when the visible set is small, which is
         // the case the tenant index is meant to make cheap.
-        let dfs = if ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len() {
+        let dfs = if self.tenant_scoped(filter)
+            || ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len()
+        {
             terms
                 .iter()
                 .map(|t| {
-                    self.lexicon.get(t).map_or(0, |p| {
+                    lexicon.get(t).map_or(0, |p| {
                         ids.iter().filter(|&&d| p.tf_for(d).is_some()).count()
                     })
                 })
@@ -418,7 +500,7 @@ impl IndexSegment {
             terms
                 .iter()
                 .map(|t| {
-                    self.lexicon
+                    lexicon
                         .get(t)
                         .map_or(0, |p| p.docs.iter().filter(|&&d| mask[d as usize]).count())
                 })
@@ -475,10 +557,13 @@ impl IndexSegment {
 
         // (postings, idf, upper_bound); ub = idf * (k1 + 1) bounds any single
         // term's contribution since tf*(k1+1)/(tf+norm) < k1+1.
+        let Some(lexicon) = self.lexicon_for(filter) else {
+            return Vec::new();
+        };
         let mut term_data: Vec<(&PostingList, f32, f32)> = terms
             .iter()
             .filter_map(|term| {
-                let postings = self.lexicon.get(term)?;
+                let postings = lexicon.get(term)?;
                 // Present only in hidden docs = absent, for this caller.
                 let df = *stats.df.get(term)? as f32;
                 if df <= 0.0 {
@@ -494,7 +579,8 @@ impl IndexSegment {
 
         let avg_dl = stats.avg_dl;
         if let Some(ids) = &allowed
-            && ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len()
+            && (self.tenant_scoped(filter)
+                || ids.len().saturating_mul(SELECTIVE_FILTER_RATIO) < self.chunks.len())
         {
             // Few enough visible docs that scoring all of them beats walking
             // every posting list and discarding most of it. No pruning needed:
@@ -587,6 +673,18 @@ impl IndexSegment {
     /// Vector top-k. Exact scan for small/filtered candidate sets, HNSW with
     /// a traversal predicate otherwise, exact fallback if it under-delivers.
     pub fn vector(&self, query: &[f32], top_k: usize, filter: &SearchFilter) -> Vec<SegmentHit> {
+        self.vector_ef(query, top_k, filter, EF_SEARCH.max(top_k * 4))
+    }
+
+    /// [`Self::vector`] with an explicit graph beam width, for recall/latency
+    /// evaluation.
+    pub fn vector_ef(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        filter: &SearchFilter,
+        ef: usize,
+    ) -> Vec<SegmentHit> {
         if top_k == 0 || self.vec_data.is_empty() {
             return Vec::new();
         }
@@ -617,6 +715,23 @@ impl IndexSegment {
             return Vec::new();
         }
 
+        // A tenant query stays inside its partition: its own graph or an exact
+        // scan, chosen by the partition's size, never the shared graph.
+        if let (Some(tenant), Some(nodes)) = (&filter.tenant, &allowed_nodes)
+            && !self.tenants.is_empty()
+        {
+            let results = match self.tenant_graphs.get(tenant) {
+                Some(tg)
+                    if nodes.len() > EXACT_SCAN_LIMIT
+                        && nodes.len() * GRAPH_MIN_VISIBLE_FRACTION >= tg.nodes.len() =>
+                {
+                    self.tenant_graph_search(tg, nodes, &q, top_k)
+                }
+                _ => exact_search_over(&self.vec_data, nodes, &q, top_k),
+            };
+            return self.vector_hits(results);
+        }
+
         // Graph only when it can actually prune: a large candidate set *and* a
         // filter that leaves most of the segment visible.
         let graph_pays = candidate_count > EXACT_SCAN_LIMIT
@@ -639,7 +754,6 @@ impl IndexSegment {
         let predicate = mask.as_ref().map(|m| move |node: u32| m[node as usize]);
         let results = match &self.hnsw {
             Some(graph) if graph_pays => {
-                let ef = EF_SEARCH.max(top_k * 4);
                 let pred_ref: Option<&dyn Fn(u32) -> bool> =
                     predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
                 let hits = if self.vec_q.len() == self.vec_data.len() && dim >= SQ8_MIN_DIM {
@@ -683,6 +797,60 @@ impl IndexSegment {
             },
         };
 
+        self.vector_hits(results)
+    }
+
+    /// Search `tg` restricted to `allowed` vector nodes (a subset of its
+    /// partition), reranked in f32. Returns `(score, vector node)`.
+    fn tenant_graph_search(
+        &self,
+        tg: &TenantGraph,
+        allowed: &[u32],
+        q: &[f32],
+        top_k: usize,
+    ) -> Vec<(f32, u32)> {
+        let mask: Option<Vec<bool>> = (allowed.len() < tg.nodes.len()).then(|| {
+            let mut ok = vec![false; tg.nodes.len()];
+            for n in allowed {
+                if let Ok(i) = tg.nodes.binary_search(n) {
+                    ok[i] = true;
+                }
+            }
+            ok
+        });
+        let predicate = mask.as_ref().map(|m| move |local: u32| m[local as usize]);
+        let pred_ref: Option<&dyn Fn(u32) -> bool> =
+            predicate.as_ref().map(|p| p as &dyn Fn(u32) -> bool);
+        let q8 = (self.vec_q.len() == self.vec_data.len() && q.len() >= SQ8_MIN_DIM)
+            .then(|| quantize(q));
+        let dist = |local: u32| -> f32 {
+            let i = tg.nodes[local as usize] as usize;
+            match &q8 {
+                Some((codes, scale)) => {
+                    1.0 - dot_q(codes, &self.vec_q[i]) as f32 * scale * self.vec_scale[i]
+                }
+                None => 1.0 - dot(q, &self.vec_data[i]),
+            }
+        };
+        let ef = EF_SEARCH.max(top_k * 4);
+        let mut hits = tg
+            .graph
+            .search_with(&dist, tg.nodes.len(), top_k * 4, ef, pred_ref);
+        for h in hits.iter_mut() {
+            h.1 = tg.nodes[h.1 as usize];
+            h.0 = dot(q, &self.vec_data[h.1 as usize]);
+        }
+        hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        hits.truncate(top_k);
+        // Same completeness guard as the shared graph.
+        if hits.len() >= top_k.min(allowed.len()) {
+            hits
+        } else {
+            exact_search_over(&self.vec_data, allowed, q, top_k)
+        }
+    }
+
+    fn vector_hits(&self, results: Vec<(f32, u32)>) -> Vec<SegmentHit> {
         results
             .into_iter()
             .map(|(score, node)| {
@@ -933,6 +1101,40 @@ mod tests {
         }
     }
 
+    /// A tenant query reads only its tenant's postings, so its cost cannot
+    /// scale with other tenants' data, and it ranks exactly as it would over a
+    /// segment holding only its own documents.
+    #[test]
+    fn tenant_queries_read_only_their_own_postings() {
+        let meta = |t: &str| {
+            Some(ChunkMetadata {
+                tenant: Some(t.into()),
+                ..Default::default()
+            })
+        };
+        let mine: Vec<ChunkInput> = (0..40)
+            .map(|i| chunk(i, &format!("probe alpha {}", "x ".repeat(i)), meta("a")))
+            .collect();
+        let mut shared = mine.clone();
+        shared.extend((0..400).map(|i| chunk(1000 + i, "probe beta", meta("b"))));
+        let seg = IndexSegment::build(vec![], shared);
+        let alone = IndexSegment::build(vec![], mine);
+
+        let own = &seg.tenant_lexicon["a"]["probe"];
+        assert_eq!(own.docs.len(), 40, "tenant postings hold only its own docs");
+        let filter = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let ranked = |s: &IndexSegment| -> Vec<(Hash, u32)> {
+            s.bm25("probe alpha", 10, &filter)
+                .iter()
+                .map(|h| (h.chunk_hash, h.score.to_bits()))
+                .collect()
+        };
+        assert_eq!(ranked(&seg), ranked(&alone));
+    }
+
     /// A term occurring only in hidden documents must be indistinguishable
     /// from a term that does not occur at all.
     #[test]
@@ -1129,6 +1331,56 @@ mod tests {
             seg.vector(&[1.0, 0.0, 0.0], 5, &SearchFilter::default())
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn tenant_vector_search_is_independent_of_other_tenants() {
+        let vec_of = |i: usize| {
+            let mut v: Vec<f32> = (0..16)
+                .map(|j| {
+                    let x = ((i * 16 + j) as u64)
+                        .wrapping_mul(0x9e3779b97f4a7c15)
+                        .rotate_left(31);
+                    ((x % 2000) as f32 / 1000.0) - 1.0
+                })
+                .collect();
+            super::super::vector::normalize(&mut v);
+            v
+        };
+        let owned = |i: usize, t: &str| ChunkInput {
+            meta: Some(ChunkMetadata {
+                tenant: Some(t.into()),
+                ..Default::default()
+            }),
+            ..chunk_with_vec(i, "filler", vec_of(i))
+        };
+        let a: Vec<ChunkInput> = (0..1100).map(|i| owned(i, "a")).collect();
+        let filter = SearchFilter {
+            tenant: Some("a".into()),
+            ..Default::default()
+        };
+        let alone = IndexSegment::build(vec![], a.clone());
+        let mut crowded = a;
+        crowded.extend((5000..6500).map(|i| owned(i, "b")));
+        let crowded = IndexSegment::build(vec![], crowded);
+        assert!(crowded.tenant_graphs.contains_key("a"));
+        assert!(crowded.tenant_graphs.contains_key("b"));
+
+        for i in [0usize, 7, 300, 1099] {
+            let q = vec_of(i);
+            let x: Vec<u32> = alone
+                .vector(&q, 10, &filter)
+                .iter()
+                .map(|h| h.doc)
+                .collect();
+            let y: Vec<u32> = crowded
+                .vector(&q, 10, &filter)
+                .iter()
+                .map(|h| h.doc)
+                .collect();
+            assert_eq!(x, y, "tenant a's answer moved with tenant b's data");
+            assert_eq!(x[0], i as u32, "self-recall failed for {i}");
+        }
     }
 
     #[test]

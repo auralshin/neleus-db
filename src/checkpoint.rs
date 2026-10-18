@@ -17,10 +17,10 @@ use crate::merkle::{
 };
 use crate::signing::{Ed25519Signer, Ed25519Verifier, sign_raw};
 
-const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
+pub const CHECKPOINT_TAG: &[u8] = b"checkpoint:";
 const CHECKPOINT_PAYLOAD_TAG: &[u8] = b"checkpoint_payload:";
 const CHECKPOINT_LEAF_TAG: &[u8] = b"checkpoint_leaf:";
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// Leaf for the append-only log over checkpointed commits.
 pub fn checkpoint_leaf(commit: CommitHash) -> MerkleLeaf {
@@ -73,6 +73,15 @@ pub struct Checkpoint {
     /// rebuild; its width is the popcount of the entry count.
     #[serde(default)]
     pub log_spine: Vec<Hash>,
+    /// Newest retrieval record when the checkpoint was made. Pinning it lets a verifier
+    /// holding this checkpoint detect records dropped from the end of the
+    /// chain, not only gaps between records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_tip: Option<Hash>,
+    /// Newest event-log entry `(seq, hash)` when the checkpoint was made, so
+    /// a rewrite of the event log below an anchor is detectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_tip: Option<(u64, Hash)>,
 }
 
 impl Checkpoint {
@@ -159,6 +168,8 @@ impl<'a> CheckpointStore<'a> {
             key_id: None,
             log_root: root_from_spine(&log_spine, count),
             log_spine,
+            query_tip: crate::audit::query_tip(self.db, head)?.map(|(h, _, _)| h),
+            event_tip: crate::events::tip(&self.db.root)?,
         };
         if let Some(signer) = signer {
             let payload = checkpoint.payload_hash()?;
@@ -232,6 +243,7 @@ impl<'a> CheckpointStore<'a> {
             .checkpoint_get(head)?
             .ok_or_else(|| anyhow!("head '{head}' has no checkpoints"))?;
 
+        let events = crate::events::read(&self.db.root)?;
         let mut cursor = Some(latest);
         let mut expected_seq: Option<u64> = None;
         let mut length = 0u64;
@@ -306,6 +318,19 @@ impl<'a> CheckpointStore<'a> {
                 ));
             }
 
+            if let Some((seq, pinned)) = cp.event_tip {
+                let found = usize::try_from(seq)
+                    .ok()
+                    .and_then(|i| events.get(i))
+                    .map(|e| e.hash.as_str());
+                if found != Some(pinned.to_string().as_str()) {
+                    return Err(anyhow!(
+                        "checkpoint {hash} pins event {seq} ({pinned}), which the event log \
+                         no longer holds: the log was truncated or rewritten"
+                    ));
+                }
+            }
+
             genesis = hash;
             length += 1;
             cursor = cp.prev;
@@ -355,6 +380,22 @@ mod tests {
         assert_eq!(report.latest, cp2);
         assert_eq!(report.genesis, cp1);
         assert_eq!(store.get(cp2).unwrap().prev, Some(cp1));
+    }
+
+    #[test]
+    fn rewriting_the_event_log_breaks_a_pinned_checkpoint() {
+        let (_t, db) = test_db();
+        commit(&db, "c1");
+        crate::events::append(&db.root, "policy.violation", serde_json::json!({"n": 1})).unwrap();
+        let store = CheckpointStore::new(&db);
+        store.create("main", None).unwrap();
+        assert!(store.verify_chain("main", None, false).is_ok());
+
+        // A fresh, internally valid log: only the checkpoint's pin reveals it.
+        std::fs::remove_file(db.root.join("meta").join("events.jsonl")).unwrap();
+        crate::events::append(&db.root, "policy.violation", serde_json::json!({"n": 2})).unwrap();
+        assert!(crate::events::verify(&db.root).is_ok());
+        assert!(store.verify_chain("main", None, false).is_err());
     }
 
     #[test]

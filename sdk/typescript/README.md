@@ -17,7 +17,7 @@ const { commit } = await c.putDocument("main", "kb.md", "policy text", {
   metadata: { doc_type: "policy", acl: ["group:hr"] },
 });
 
-const res = await c.search("main", { query: "reset policy", mode: "hybrid", audit: true });
+const res = await c.search("main", { query: "reset policy", mode: "hybrid" });
 
 // prove a hit and verify it
 const proof = await c.prove(res.commit, res.hits[0].chunk);
@@ -55,7 +55,8 @@ await withRun(c, { provider: "anthropic", model: "claude-sonnet-4-6", agentId: "
 - `auditQueries`, `exportBundle`
 - `run(opts)` / `withRun(client, opts, fn)`
 
-`at` accepts a head name or a 64-hex commit hash (time-travel).
+`search` records every call on the head `at`; pass `commit` to search a past
+commit (time-travel). Other routes accept a head name or a 64-hex commit hash.
 
 Failed calls throw `NeleusError` carrying `.code` (e.g. `policy_violation`,
 `unauthorized`), `.hint`, and `.status`.

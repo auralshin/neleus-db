@@ -20,11 +20,10 @@ export interface Hit {
 export interface SearchResult {
   commit: string;
   hits: Hit[];
-  audit_manifest: string | null;
+  audit_manifest: string;
 }
 
 export interface AuditRecord {
-  commit: string;
   manifest: string;
   queried_commit: string;
   executed_at: number;
@@ -172,16 +171,16 @@ export class Client {
 
   search(
     at: string,
-    opts: { query?: string; embedding?: number[]; mode?: SearchMode; topK?: number; filter?: Filter; audit?: boolean } = {},
+    opts: { query?: string; embedding?: number[]; mode?: SearchMode; topK?: number; filter?: Filter; commit?: string } = {},
   ): Promise<SearchResult> {
     return this.json("POST", "/v1/search", {
       at,
+      commit: opts.commit ?? null,
       mode: opts.mode ?? "hybrid",
       query: opts.query ?? null,
       embedding: opts.embedding ?? null,
       top_k: opts.topK ?? 10,
       filter: opts.filter ?? null,
-      audit: opts.audit ?? false,
     });
   }
 

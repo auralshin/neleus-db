@@ -30,7 +30,7 @@ export function Inspector({ conn, onStatus }: { conn: Conn; onStatus: (m: string
     ["Reachable via first-parent ancestry to the introducing commit", 'blake3("commit:" ‖ bytes)'],
     [`Manifest (${result?.anchor ?? "—"}) listed by that commit`, 'blake3("manifest:" ‖ bytes)'],
     ["Chunk referenced by the manifest", chunk || "—"],
-    ["Chunk content hashes to the chunk id", 'blake3("blob:" ‖ content)'],
+    ["Chunk payload hashes to the chunk id", 'blake3("blob:" ‖ salt ‖ content)'],
   ];
 
   return (

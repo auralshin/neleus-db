@@ -3,7 +3,7 @@
 //! only (no force-push — divergence is reported, never overwritten).
 //! Transport: std-only HTTP/1.1 to a `serve` peer; TLS terminates in front.
 //! Encrypted DBs replicate ciphertext verbatim, so both sides need the same
-//! encryption config (checked before any copy).
+//! encryption config and boundary key (checked before any copy).
 
 use std::fs;
 use std::io::{Read, Write};
@@ -29,6 +29,7 @@ pub struct MergeReport {
     pub refs_updated: Vec<String>,
     pub refs_skipped: Vec<String>,
     pub checkpoints_updated: Vec<String>,
+    pub records_updated: Vec<String>,
 }
 
 /// Merge a remote tree: copy missing blobs/objects, fast-forward heads,
@@ -42,6 +43,13 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
             format!("remote tree has no config at {}", remote_cfg_path.display())
         })?)?;
     let local_cfg = serde_json::to_value(&db.config)?;
+    // Trees cut under different keys share no nodes and break canonical roots.
+    if remote_cfg.get("secret") != local_cfg.get("secret") {
+        bail!(
+            "refusing to merge: database secrets differ (create the replica with \
+             `db init --replica-of <url>`)"
+        );
+    }
     if remote_cfg.get("encryption") != local_cfg.get("encryption") {
         bail!(
             "refusing to merge: encryption configs differ (replication requires \
@@ -151,6 +159,20 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
         }
     }
 
+    // Record chains: adopt the remote tip when our tip is in its prev chain.
+    for (name, remote_tip) in remote_refs.list_records()? {
+        match db.refs.record_get(&name)? {
+            Some(local) if local == remote_tip => {}
+            Some(local) if !record_chain_contains(db, remote_tip, local)? => {
+                report.refs_skipped.push(format!("records:{name}"));
+            }
+            _ => {
+                db.refs.record_set(&name, remote_tip)?;
+                report.records_updated.push(name);
+            }
+        }
+    }
+
     Ok(report)
 }
 
@@ -171,7 +193,11 @@ pub fn merge_pack_file(db: &Database, pack_file: &Path) -> Result<MergeReport> {
 }
 
 /// Is `ancestor` reachable from `descendant` through any parent edges?
-fn is_ancestor(db: &Database, ancestor: CommitHash, descendant: CommitHash) -> Result<bool> {
+pub(crate) fn is_ancestor(
+    db: &Database,
+    ancestor: CommitHash,
+    descendant: CommitHash,
+) -> Result<bool> {
     let mut queue = vec![descendant];
     let mut seen = std::collections::HashSet::new();
     let mut steps = 0usize;
@@ -188,6 +214,26 @@ fn is_ancestor(db: &Database, ancestor: CommitHash, descendant: CommitHash) -> R
         }
         let commit = db.commit_store.get_commit(hash)?;
         queue.extend(commit.parents);
+    }
+    Ok(false)
+}
+
+fn record_chain_contains(db: &Database, tip: Hash, needle: Hash) -> Result<bool> {
+    let mut cursor = Some(tip);
+    let mut steps = 0usize;
+    while let Some(hash) = cursor {
+        if hash == needle {
+            return Ok(true);
+        }
+        steps += 1;
+        if steps > MAX_ANCESTRY_WALK {
+            bail!("record chain walk exceeded {MAX_ANCESTRY_WALK}");
+        }
+        cursor = db
+            .manifest_store
+            .get_query_manifest(hash)
+            .with_context(|| format!("reading record {hash}"))?
+            .prev;
     }
     Ok(false)
 }
@@ -223,6 +269,31 @@ pub fn pull(db: &Database, remote_url: &str, token: Option<&str>) -> Result<Merg
     fs::write(&tmp, &body)?;
     let result = merge_pack_file(db, &tmp);
     let _ = fs::remove_file(&tmp);
+    result
+}
+
+/// Create a database at `path` as a replica of a remote peer: adopt its
+/// boundary key, then merge its pack.
+pub fn clone(path: &Path, remote_url: &str, token: Option<&str>) -> Result<MergeReport> {
+    let body = http_request(remote_url, "GET", "/v1/pack", token, &[], None)?;
+    let meta = path.join("meta");
+    fs::create_dir_all(&meta)?;
+    let tmp = meta.join(crate::atomic::build_temp_name("clone")?);
+    let staging = meta.join(crate::atomic::build_temp_name("clone-staging")?);
+    fs::write(&tmp, &body)?;
+    let result = (|| {
+        crate::pack::unpack(&tmp, &staging, true)?;
+        let remote_cfg: serde_json::Value =
+            serde_json::from_slice(&fs::read(staging.join("meta").join("config.json"))?)?;
+        let key = remote_cfg
+            .get("secret")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("remote config has no secret"))?;
+        Database::init_with_secret(path, key)?;
+        merge_tree(&Database::open(path)?, &staging)
+    })();
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_dir_all(&staging);
     result
 }
 
@@ -327,8 +398,18 @@ mod tests {
 
     fn test_db(tmp: &TempDir, name: &str) -> Database {
         let root = tmp.path().join(name);
-        Database::init(&root).unwrap();
+        Database::init_with_secret(&root, &"07".repeat(32)).unwrap();
         Database::open(&root).unwrap()
+    }
+
+    #[test]
+    fn merge_refuses_a_different_secret() {
+        let tmp = TempDir::new().unwrap();
+        let a = test_db(&tmp, "a");
+        let other = tmp.path().join("other");
+        Database::init(&other).unwrap();
+        let err = merge_tree(&a, &other).unwrap_err().to_string();
+        assert!(err.contains("secrets differ"), "{err}");
     }
 
     #[test]

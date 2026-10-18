@@ -161,9 +161,15 @@ fn main() -> Result<()> {
         let start = Instant::now();
         for q in &queries {
             let hits = match mode {
-                "bm25" => engine.search_semantic(commit, &q.text, TOP_K, &filter)?,
-                "vector" => engine.search_vector(commit, &q.emb, TOP_K, &filter)?,
-                _ => engine.search_hybrid(commit, Some(&q.text), Some(&q.emb), TOP_K, &filter)?,
+                "bm25" => engine.search_semantic_unrecorded(commit, &q.text, TOP_K, &filter)?,
+                "vector" => engine.search_vector_unrecorded(commit, &q.emb, TOP_K, &filter)?,
+                _ => engine.search_hybrid_unrecorded(
+                    commit,
+                    Some(&q.text),
+                    Some(&q.emb),
+                    TOP_K,
+                    &filter,
+                )?,
             };
             let ranked: Vec<String> = hits
                 .iter()

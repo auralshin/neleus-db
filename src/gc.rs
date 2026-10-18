@@ -1,7 +1,7 @@
 //! Garbage collection: reclaim objects unreachable from any ref.
 //!
-//! Marks from `refs/heads/*` commits, `refs/states/*` roots, and
-//! `refs/checkpoints/*` chains, walking:
+//! Marks from `refs/heads/*` commits, `refs/states/*` roots,
+//! `refs/records/*` record chains, and `refs/checkpoints/*` chains, walking:
 //!
 //! ```text
 //! commit ── parents ──▶ commit
@@ -26,7 +26,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::canonical::{from_cbor, to_cbor};
 use crate::db::Database;
@@ -92,6 +92,7 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
     // outlives its head, and a chain pointing at a swept commit fails to verify.
     let checkpoints = crate::checkpoint::CheckpointStore::new(db);
     let mut stack = collect_refs(&db.root.join("refs").join("heads"))?;
+    let mut query_tips = collect_refs(&db.root.join("refs").join("records"))?;
     for tip in collect_refs(&db.root.join("refs").join("checkpoints"))? {
         let mut cursor = Some(tip);
         while let Some(hash) = cursor {
@@ -102,24 +103,28 @@ fn mark_reachable(db: &Database) -> Result<HashSet<Hash>> {
                 .get(hash)
                 .with_context(|| format!("gc: reading checkpoint {hash}"))?;
             stack.push(cp.commit);
+            query_tips.extend(cp.query_tip);
             cursor = cp.prev;
         }
     }
 
-    // Audit-chain tips. Records are normally reachable through the commit that
-    // carries them; the ref keeps the chain intact if that commit is orphaned.
-    for tip in collect_refs(&db.root.join("refs").join("queries"))? {
+    // Retrieval records: each head's record chain, plus anchored pins, which
+    // keep a pinned chain intact even if its record ref is gone.
+    for tip in query_tips {
         let mut cursor = Some(tip);
         while let Some(hash) = cursor {
             if reach.contains(&hash) {
                 break;
             }
-            let Ok(bytes) = db.manifest_store.raw_manifest_bytes(hash) else {
-                break;
-            };
-            let Some(qm) = exact_type::<QueryManifest>(&bytes) else {
-                break;
-            };
+            // Fail closed: a sweep after a broken link would prune the rest
+            // of the chain as unreachable.
+            let bytes = db
+                .manifest_store
+                .raw_manifest_bytes(hash)
+                .with_context(|| format!("gc fail-closed: record chain reaches missing {hash}"))?;
+            let qm = exact_type::<QueryManifest>(&bytes).ok_or_else(|| {
+                anyhow!("gc fail-closed: record chain reaches non-QueryManifest {hash}")
+            })?;
             mark_manifest(db, hash, &mut reach)?;
             cursor = qm.prev;
         }
@@ -392,6 +397,70 @@ mod tests {
         );
     }
 
+    /// Regression: retrieval records are referenced by no commit, only by the
+    /// record ref and checkpoint pins, the same shape as the checkpoint bug.
+    #[test]
+    fn gc_preserves_the_record_chain() {
+        use crate::checkpoint::CheckpointStore;
+        use crate::engine::{Engine, SearchFilter, SearchQuery};
+
+        let tmp = TempDir::new().unwrap();
+        let (root, _) = open_db(&tmp);
+        let engine = Engine::open(&root).unwrap();
+        let spec = ChunkingSpec {
+            method: "fixed".into(),
+            chunk_size: 64,
+            overlap: 0,
+        };
+        engine
+            .put_document("main", "kb", b"searchable record corpus", spec, None, "t")
+            .unwrap();
+        let search = || {
+            engine
+                .search(
+                    "main",
+                    None,
+                    SearchQuery::Semantic("searchable"),
+                    5,
+                    &SearchFilter::default(),
+                    None,
+                )
+                .unwrap()
+        };
+        for _ in 0..3 {
+            search();
+        }
+        CheckpointStore::new(engine.db())
+            .create("main", None)
+            .unwrap();
+        for _ in 0..2 {
+            search();
+        }
+
+        gc(engine.db(), true, NO_GRACE).unwrap();
+        let records = crate::audit::collect(engine.db(), "main", 0, u64::MAX).unwrap();
+        assert_eq!(records.len(), 5, "record chain pruned");
+
+        // With the ref gone, the checkpoint's pin still keeps its records.
+        std::fs::remove_file(root.join("refs").join("records").join("main")).unwrap();
+        gc(engine.db(), true, NO_GRACE).unwrap();
+        let cp = CheckpointStore::new(engine.db())
+            .get(engine.db().refs.checkpoint_get("main").unwrap().unwrap())
+            .unwrap();
+        let mut cursor = cp.query_tip;
+        let mut kept = 0;
+        while let Some(h) = cursor {
+            cursor = engine
+                .db()
+                .manifest_store
+                .get_query_manifest(h)
+                .unwrap()
+                .prev;
+            kept += 1;
+        }
+        assert_eq!(kept, 3, "pinned records pruned");
+    }
+
     /// A checkpoint pins its commit even once the head has moved past it, so
     /// the commit it anchors must survive the sweep too.
     #[test]
@@ -568,6 +637,21 @@ mod tests {
             db.state_store.get(sroot, b"k").unwrap(),
             Some(b"v".to_vec())
         );
+    }
+
+    #[test]
+    fn fail_closed_on_a_broken_record_chain() {
+        let tmp = TempDir::new().unwrap();
+        let (_root, db) = open_db(&tmp);
+        db.state_set_at_head("main", b"k", b"v").unwrap();
+        // A record ref naming an object that is not a QueryManifest.
+        let bogus = db
+            .object_store
+            .put_typed_bytes(b"manifest:", &to_cbor(&serde_json::json!({})).unwrap())
+            .unwrap();
+        db.refs.record_set("main", bogus).unwrap();
+        let err = gc(&db, true, NO_GRACE).unwrap_err();
+        assert!(err.to_string().contains("fail-closed"), "got: {err}");
     }
 
     #[test]

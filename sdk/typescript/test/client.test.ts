@@ -72,7 +72,7 @@ maybe("ingest, search, prove, verify", async () => {
   const doc = await c.putDocument("main", "kb.md", "TypeScript agents need verifiable audit trails.");
   assert.ok(doc.commit);
 
-  const res = await c.search("main", { query: "verifiable audit", mode: "semantic", audit: true });
+  const res = await c.search("main", { query: "verifiable audit", mode: "semantic" });
   assert.ok(res.hits.length > 0);
   assert.ok(res.audit_manifest);
 
@@ -85,8 +85,8 @@ maybe("ingest, search, prove, verify", async () => {
 maybe("audit export bundle", async () => {
   const c = new Client(url, { token });
   await c.putDocument("comp", "kb", "auditable corpus");
-  const res = await c.search("comp", { query: "auditable", mode: "semantic", audit: true });
-  await c.commit("comp", "audit", [res.audit_manifest!]);
+  const res = await c.search("comp", { query: "auditable", mode: "semantic" });
+  await c.commit("comp", "audit", [res.audit_manifest]);
   await c.checkpoint("comp");
 
   const bundle = await c.exportBundle("comp");

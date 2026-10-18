@@ -6,13 +6,18 @@ to the byte level.
 ## Content addressing
 
 Everything durable is identified by the BLAKE3 hash of its bytes. A blob's
-name is `blake3("blob:" ‖ bytes)`; a commit's name is
+name is `blake3("blob:" ‖ salt ‖ bytes)`, where the salt is a keyed hash of
+the bytes under a key derived from the database `secret` and the head's
+namespace (the part before the first `/`, e.g. a tenant); a commit's name is
 `blake3("commit:" ‖ dag_cbor(commit))`. The domain prefix (`blob:`,
 `commit:`, `manifest:`, …) keeps types from colliding.
 
 Two consequences fall straight out:
 
-- **Dedup is free.** Identical content writes once.
+- **Dedup is free within a namespace.** Identical content under one namespace
+  writes once; across namespaces it gets distinct ids, so one tenant cannot
+  detect another's documents, and an id cannot be confirmed by guessing
+  content without the secret.
 - **Tampering is detectable.** Change a byte, change the hash. A reference to
   the old hash no longer resolves to the altered bytes — it resolves to
   nothing, or to the original if it still exists. You cannot quietly swap
@@ -40,8 +45,11 @@ all built on "the name is the hash of the content."
 ## State: a versioned KV with proofs
 
 State is an ordered, content-addressed prolly tree (Merkle Search Tree). Node
-boundaries are derived from `hash(key)`, so the shape is a pure function of the
-key set — the same keys always yield the same root, regardless of write order.
+boundaries are derived from a hash of the key keyed by a per-database secret
+(derived from `secret`), so within a database the shape is a pure function of the key
+set — the same keys always yield the same root, regardless of write order. The
+secret stops a writer from choosing keys that never cut a node and building one
+huge leaf.
 High fanout keeps it shallow (depth `~log32(n)`), so reads, writes, and proofs
 all follow a short root→leaf path. Small values inline into leaves, large ones
 become blobs. Because every node's hash commits to its subtree, you can produce
@@ -73,7 +81,7 @@ cache-friendly, SIMD-friendly layouts and proven index libraries. Delete
 `index/` and you lose nothing but warm-up time.
 
 Every query runs against a commit root, which gives you **snapshot isolation**
-and **time-travel** (`search --head <commit-hash>`) for free.
+and **time-travel** (`search --head <h> --at <commit-hash>`) for free.
 
 ## Retrieval
 
@@ -98,10 +106,11 @@ Four layers, each building on content addressing:
    someone holding the commit signing key. Publish the latest hash anywhere
    durable to externally anchor everything below it.
 3. **Chunk proofs** — a self-contained bundle proving `(commit, chunk)`:
-   commit hash → first-parent ancestry → the manifest that lists the chunk →
-   the chunk bytes, every link a hash equation. Verifiable offline.
-4. **Audit records** — `QueryManifest`s committed to history, exportable as a
-   signed bundle. The audit log is itself content-addressed and provable.
+   commit hash → a state path showing the commit indexes the manifest → the
+   manifest that lists the chunk → the chunk bytes, every link a hash
+   equation. The size does not grow with history. Verifiable offline.
+4. **Audit records** — `QueryManifest`s in a per-head record chain kept off
+   the data history (`refs/records/<head>`), exportable as a signed bundle. The audit log is itself content-addressed and provable.
 
 ## Local and hosted are the same engine
 

@@ -53,12 +53,12 @@ warm.
 ## 3. Search
 
 Three modes — `semantic` (BM25), `vector` (HNSW), `hybrid` (both, RRF-fused).
-Filters narrow by metadata; `--audit` records a content-addressed
-`QueryManifest` of exactly what came back.
+Filters narrow by metadata. Every search is recorded on its head as a
+content-addressed `QueryManifest` of exactly what came back.
 
 ```bash
 ndb search hybrid --head main --query "password reset policy" \
-    --acl group:hr --top-k 5 --audit
+    --acl group:hr --top-k 5
 ```
 
 Vector and hybrid need an embedding file (a JSON or CBOR float array):
@@ -127,7 +127,7 @@ front. See [http-api.md](http-api.md) for every route and
 
 ## 8. Audit evidence
 
-Audit records accumulate as you serve `--audit` queries. Export a period as a
+Audit records accumulate as you serve queries. Export a period as a
 signed bundle and let an auditor verify it without you:
 
 ```bash
@@ -149,7 +149,8 @@ let (_manifest, commit) = engine.put_document(
     ChunkingSpec { method: "fixed".into(), chunk_size: 512, overlap: 64 },
     None, "ingest",
 )?;
-let hits = engine.search_hybrid(commit, Some("reset policy"), None, 5, &SearchFilter::default())?;
+let q = neleus_db::SearchQuery::Hybrid { text: Some("reset policy"), embedding: None };
+let hits = engine.search("main", None, q, 5, &SearchFilter::default(), None)?.hits; // recorded on main
 let proof = engine.prove(commit, hits[0].chunk_hash, true)?;
 assert!(neleus_db::verify_chunk_proof(&proof).is_ok());
 ```

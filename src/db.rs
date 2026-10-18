@@ -20,7 +20,7 @@ use crate::refs::RefsStore;
 use crate::state::StateStore;
 use crate::wal::{Wal, WalRecoveryReport};
 
-const DB_CONFIG_SCHEMA_VERSION: u32 = 4;
+const DB_CONFIG_SCHEMA_VERSION: u32 = 5;
 /// A loser re-runs `op` (a copy-on-write path rebuild) per attempt, so 16 was
 /// reachable with two competing writers.
 const DEFAULT_CAS_RETRIES: usize = 64;
@@ -44,6 +44,13 @@ fn cas_backoff(attempt: usize) {
     let nanos = (r as u64) % (window.as_nanos() as u64).max(1);
     std::thread::sleep(Duration::from_nanos(nanos));
 }
+
+/// State key under which a commit records that it introduced `manifest`.
+pub fn manifest_index_key(manifest: Hash) -> Vec<u8> {
+    format!("{MANIFEST_INDEX_PREFIX}{manifest}").into_bytes()
+}
+
+pub const MANIFEST_INDEX_PREFIX: &str = "__manifests__/";
 
 #[derive(Debug, Clone)]
 pub struct Database {
@@ -89,7 +96,8 @@ pub struct Config {
     pub compression: Option<String>,
     #[serde(default)]
     pub encryption: Option<EncryptionConfig>,
-    /// "os" (default: crash-safe, fast) or "full" (fsync per write).
+    /// "full" (default: flush per write), "barrier" (ordered, not flushed), or
+    /// "os" (no sync). See `atomic::Durability`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub durability: Option<String>,
     /// Minimum record age in seconds before session GC may remove it, even
@@ -99,12 +107,23 @@ pub struct Config {
     /// touched by session GC regardless of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_min_secs: Option<u64>,
+    /// Hex 32-byte database secret. Keys state-tree boundaries and blob salts
+    /// (separate derived keys); replicas must share it (`db init --replica-of`).
+    pub secret: String,
 }
 
 impl Database {
     /// Create an empty database at `path`: directories, config, and the empty
     /// state root.
     pub fn init(path: impl AsRef<Path>) -> Result<()> {
+        let secret = hex::encode(crate::encryption::utils::random_bytes(32)?);
+        Self::init_with_secret(path, &secret)
+    }
+
+    /// [`Self::init`] with a given secret, for a replica of an existing
+    /// database.
+    pub fn init_with_secret(path: impl AsRef<Path>, secret: &str) -> Result<()> {
+        parse_secret(secret)?;
         let root = path.as_ref();
         fs::create_dir_all(root).with_context(|| format!("failed creating {}", root.display()))?;
         fs::create_dir_all(root.join("blobs"))?;
@@ -126,6 +145,7 @@ impl Database {
                 encryption: None,
                 durability: None,
                 retention_min_secs: None,
+                secret: secret.to_string(),
             };
             let bytes = serde_json::to_vec_pretty(&cfg)?;
             write_atomic(&cfg_path, &bytes)?;
@@ -170,28 +190,35 @@ impl Database {
         }
 
         match config.durability.as_deref() {
-            None | Some("full") => crate::atomic::set_full_durability(true),
-            Some("os") => crate::atomic::set_full_durability(false),
+            None | Some("full") => crate::atomic::set_durability(crate::atomic::Durability::Full),
+            Some("barrier") => crate::atomic::set_durability(crate::atomic::Durability::Barrier),
+            Some("os") => crate::atomic::set_durability(crate::atomic::Durability::Os),
             Some(other) => {
                 return Err(anyhow::anyhow!(
-                    "unknown durability '{other}' (expected \"os\" or \"full\")"
+                    "unknown durability '{other}' (expected \"full\", \"barrier\", or \"os\")"
                 ));
             }
         }
 
         let encryption = build_encryption_runtime(&config)?;
         let compress = config.compression.as_deref() == Some("zstd");
+        let secret = parse_secret(&config.secret)?;
         let blob_store = BlobStore::with_runtime_options(
             root.join("blobs"),
             config.verify_on_read,
             compress,
             encryption.clone(),
+            secret,
         );
         let object_store =
             ObjectStore::with_runtime_options(root.join("objects"), compress, encryption.clone());
         let wal = Wal::new(root.join("wal"));
         let refs = RefsStore::new(root.join("refs"), wal.clone());
-        let state_store = StateStore::new(object_store.clone(), blob_store.clone());
+        let state_store = StateStore::new(
+            object_store.clone(),
+            blob_store.clone(),
+            secret.derive("neleus-db state boundary", b"").0,
+        );
         let manifest_store = ManifestStore::new(object_store.clone());
         let commit_store = CommitStore::new(object_store.clone());
 
@@ -243,7 +270,7 @@ impl Database {
     /// root. Retries under concurrent contention.
     pub fn state_set_at_head(&self, head: &str, key: &[u8], value: &[u8]) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| {
-            self.state_store.set(base_root, key, value)
+            self.state_store.for_head(head).set(base_root, key, value)
         })
     }
 
@@ -257,7 +284,7 @@ impl Database {
 
     pub fn state_set_many_at_head(&self, head: &str, pairs: &[(&[u8], &[u8])]) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| {
-            self.state_store.set_many(base_root, pairs)
+            self.state_store.for_head(head).set_many(base_root, pairs)
         })
     }
 
@@ -268,7 +295,7 @@ impl Database {
         ops: &[(&[u8], Option<&[u8]>)],
     ) -> Result<Hash> {
         self.apply_state_update_with_cas(head, |base_root| {
-            self.state_store.write_many(base_root, ops)
+            self.state_store.for_head(head).write_many(base_root, ops)
         })
     }
 
@@ -279,7 +306,10 @@ impl Database {
     }
 
     /// Commit `manifests` onto `head`, advancing the head ref. Fails loudly
-    /// rather than silently rolling back a concurrent staged write.
+    /// rather than silently rolling back a concurrent staged write. Each
+    /// manifest is also indexed in the commit's state under
+    /// [`manifest_index_key`], so a chunk proof is one state path, not a walk
+    /// of every commit since the chunk was written.
     pub fn create_commit_at_head(
         &self,
         head: &str,
@@ -297,12 +327,22 @@ impl Database {
             // `resolve_state_root` (which would re-read the ref and could
             // observe a peer's write, producing a spurious mismatch later).
             let staged_before = self.refs.state_get(head)?;
-            let state_root = match staged_before {
+            let base_root = match staged_before {
                 Some(s) => s,
                 None => match parent {
                     Some(commit_hash) => self.commit_store.get_commit(commit_hash)?.state_root,
                     None => self.state_store.empty_root()?,
                 },
+            };
+            let keys: Vec<Vec<u8>> = manifests.iter().map(|m| manifest_index_key(*m)).collect();
+            let state_root = if keys.is_empty() {
+                base_root
+            } else {
+                let pairs: Vec<(&[u8], &[u8])> =
+                    keys.iter().map(|k| (k.as_slice(), &[][..])).collect();
+                self.state_store
+                    .for_head(head)
+                    .set_many(base_root, &pairs)?
             };
             let candidate = self.commit_store.create_commit(
                 parents,
@@ -502,6 +542,14 @@ fn load_config(cfg_path: &Path) -> Result<Config> {
         ));
     }
     Ok(cfg)
+}
+
+fn parse_secret(hex_key: &str) -> Result<crate::hash::Key> {
+    hex::decode(hex_key)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .map(crate::hash::Key)
+        .ok_or_else(|| anyhow::anyhow!("config secret must be 64 hex characters"))
 }
 
 fn build_encryption_runtime(config: &Config) -> Result<Option<Arc<EncryptionRuntime>>> {
@@ -904,6 +952,7 @@ mod tests {
             }),
             durability: None,
             retention_min_secs: None,
+            secret: "07".repeat(32),
         };
         write_atomic(
             &path.join("meta").join("config.json"),
@@ -974,7 +1023,13 @@ mod tests {
         // Indexed + retrievable before erasure.
         assert!(
             engine
-                .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+                .search_hybrid_unrecorded(
+                    commit,
+                    Some("diabetes"),
+                    None,
+                    5,
+                    &SearchFilter::default()
+                )
                 .unwrap()
                 .iter()
                 .any(|h| h.chunk_hash == alice_chunk),
@@ -1003,7 +1058,7 @@ mod tests {
 
         // Index purged for alice; bob still served.
         let after = engine
-            .search_hybrid(commit, Some("diabetes"), None, 5, &SearchFilter::default())
+            .search_hybrid_unrecorded(commit, Some("diabetes"), None, 5, &SearchFilter::default())
             .unwrap();
         assert!(
             after.iter().all(|h| h.chunk_hash != alice_chunk),
@@ -1011,7 +1066,7 @@ mod tests {
         );
         assert!(
             !engine
-                .search_hybrid(commit, Some("hiking"), None, 5, &SearchFilter::default())
+                .search_hybrid_unrecorded(commit, Some("hiking"), None, 5, &SearchFilter::default())
                 .unwrap()
                 .is_empty(),
             "bob survives erasure"
@@ -1071,7 +1126,7 @@ mod tests {
 
         // Reads through the engine still succeed.
         let hits = engine
-            .search_semantic(
+            .search_semantic_unrecorded(
                 commit,
                 "SECRET NEEDLE",
                 5,

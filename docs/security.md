@@ -76,11 +76,14 @@ that proxied endpoint.
 
 ## Durability
 
-`durability` in config: `os` (default — no fsync; crash-of-process safe,
-power loss may drop the most recent writes, SQLite WAL+NORMAL class) or
-`full` (fsync file + directory per write; power-loss durable). Either way,
-content addressing means a torn write is detectable and refs are
-WAL-recovered — you lose recency, never integrity.
+`durability` in config: `full` (default — flush file + directory per write,
+`F_FULLFSYNC` on macOS; power-loss durable before acknowledgement),
+`barrier` (`F_BARRIERFSYNC` on macOS, the class SQLite's WAL commit uses there;
+writes stay ordered but a power loss may drop the most recent ones; other
+platforms flush fully), or `os` (no sync; crash-of-process safe, SQLite
+WAL+NORMAL class). In every mode files and refs are published by atomic
+rename and content addressing makes a torn object detectable — weaker modes
+lose recency, never integrity.
 
 ## Reporting
 
