@@ -37,14 +37,14 @@ jobs:
       - name: Lint
         run: cargo fmt --check
 
-      - name: Test
-        run: cargo test
-
-      # Before Build: build.rs embeds console/dist into the binary.
+      # First: build.rs embeds console/dist into every build, tests included.
       - name: Console
         run: |
           npm --prefix console ci
           npm --prefix console run build
+
+      - name: Test
+        run: cargo test
 
       - name: Build
         run: cargo build --release
