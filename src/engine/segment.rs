@@ -14,7 +14,7 @@ use super::vector::{
     EF_SEARCH, HnswGraph, dot, dot_q, exact_search, exact_search_over, normalize, quantize,
 };
 
-pub const SEGMENT_SCHEMA_VERSION: u32 = 3;
+pub const SEGMENT_SCHEMA_VERSION: u32 = 4;
 
 /// Below this many vectors, exact scan beats the graph. Kept above
 /// [`EXACT_SCAN_LIMIT`]: the query path never routes to a graph at or below
@@ -150,18 +150,16 @@ pub struct IndexSegment {
     /// Tenant to its doc ids, ascending. Lets a tenant-scoped query cost its
     /// own partition instead of the whole segment, which is both the dominant
     /// residual leak and, for a small tenant in a large database, most of its
-    /// query latency. Empty means no index: callers fall back to a full scan,
-    /// which is what old segments and untenanted corpora get.
-    #[serde(default)]
+    /// query latency. Empty only for an untenanted corpus.
     pub tenants: BTreeMap<String, Vec<u32>>,
     /// Each tenant's own postings, so a tenant query never reads another
     /// tenant's posting entries and its cost tracks only its own data.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tenant_lexicon: BTreeMap<String, BTreeMap<String, PostingList>>,
     /// Graphs over each large tenant's own vectors, so a tenant query never
     /// traverses, or takes time proportional to, other tenants' nodes.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tenant_graphs: BTreeMap<String, TenantGraph>,
+    /// Doc ids ordered by chunk hash, for membership lookups across segments.
+    pub by_hash: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -391,6 +389,9 @@ impl IndexSegment {
             })
             .collect();
 
+        let mut by_hash: Vec<u32> = (0..chunks.len() as u32).collect();
+        by_hash.sort_by_key(|&d| chunks[d as usize].chunk_hash);
+
         Self {
             schema_version: SEGMENT_SCHEMA_VERSION,
             built_from,
@@ -408,7 +409,14 @@ impl IndexSegment {
             tenants,
             tenant_lexicon,
             tenant_graphs,
+            by_hash,
         }
+    }
+
+    pub fn contains_chunk(&self, hash: Hash) -> bool {
+        self.by_hash
+            .binary_search_by(|&d| self.chunks[d as usize].chunk_hash.cmp(&hash))
+            .is_ok()
     }
 
     /// A tenant-scoped query on a segment that indexes tenants: it reads only

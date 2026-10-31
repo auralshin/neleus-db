@@ -64,7 +64,7 @@ pub struct RepackStats {
 }
 
 /// In-memory index over a CAS root's `pack/` dir, consulted on a loose miss.
-/// A repack is seen only by `PackSet`s loaded after it; reopen to refresh.
+/// `CasStore` reloads it when a read finds it stale.
 #[derive(Debug, Default)]
 pub struct PackSet {
     entries: std::collections::HashMap<Hash, PackLoc>,
@@ -98,6 +98,12 @@ impl PackSet {
 
     pub fn contains(&self, hash: Hash) -> bool {
         self.entries.contains_key(&hash)
+    }
+
+    pub fn pack_of(&self, hash: Hash) -> Option<PathBuf> {
+        self.entries
+            .get(&hash)
+            .map(|l| l.pack_path.as_ref().clone())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -174,6 +180,9 @@ fn load_idx_into(
         );
     }
     let count = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+    let pack_len = fs::metadata(pack_path.as_path())
+        .with_context(|| format!("stat {}", pack_path.display()))?
+        .len();
     let mut p = 16usize;
     for _ in 0..count {
         if p + 48 > body.len() {
@@ -183,6 +192,12 @@ fn load_idx_into(
         let offset = u64::from_le_bytes(body[p + 32..p + 40].try_into().unwrap());
         let len = u64::from_le_bytes(body[p + 40..p + 48].try_into().unwrap());
         p += 48;
+        if offset.checked_add(len).is_none_or(|end| end > pack_len) {
+            bail!(
+                "pack index {} places {hash} outside its pack",
+                idx_path.display()
+            );
+        }
         out.insert(
             hash,
             PackLoc {
@@ -260,7 +275,7 @@ pub fn pack_loose(cas_root: &Path) -> Result<RepackStats> {
     loose.dedup_by(|a, b| a.0 == b.0);
 
     let pack_dir = cas_root.join(PACK_DIR);
-    fs::create_dir_all(&pack_dir)
+    crate::atomic::create_dir_durable(&pack_dir)
         .with_context(|| format!("creating pack dir {}", pack_dir.display()))?;
 
     // One file in memory at a time.
@@ -406,10 +421,78 @@ fn rewrite_packs(
         }
 
         // New pack (if any) is durable; drop the old pair.
-        fs::remove_file(&idx_path).ok();
-        fs::remove_file(&pack_path).ok();
+        remove_pack_pair(&idx_path, &pack_path)?;
     }
     Ok((removed_objects, removed_bytes, skipped_objects))
+}
+
+fn remove_pack_pair(idx_path: &Path, pack_path: &Path) -> Result<()> {
+    for p in [idx_path, pack_path] {
+        fs::remove_file(p).with_context(|| format!("removing {}", p.display()))?;
+    }
+    if let Some(dir) = idx_path.parent() {
+        crate::atomic::maybe_sync_dir(dir)?;
+    }
+    Ok(())
+}
+
+/// Per-entry transform for [`rewrite_packs_mapping`]; `None` keeps the bytes.
+pub type EntryMap<'a> = &'a dyn Fn(Hash, &[u8]) -> Result<Option<Vec<u8>>>;
+
+/// Rewrite every pack with `map` applied to each entry. Returns how many
+/// entries changed. Untouched packs are left as they are.
+pub fn rewrite_packs_mapping(cas_root: &Path, map: EntryMap<'_>) -> Result<usize> {
+    let pack_dir = cas_root.join(PACK_DIR);
+    let read_dir = match fs::read_dir(&pack_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", pack_dir.display())),
+    };
+    let mut idx_paths = Vec::new();
+    for entry in read_dir {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("idx") {
+            idx_paths.push(path);
+        }
+    }
+
+    let mut changed = 0usize;
+    for idx_path in idx_paths {
+        let pack_path = idx_path.with_extension("pack");
+        let mut entries = std::collections::HashMap::new();
+        load_idx_into(&idx_path, &Arc::new(pack_path.clone()), &mut entries)?;
+        let mut f = File::open(&pack_path)
+            .with_context(|| format!("opening pack {}", pack_path.display()))?;
+        let mut items: Vec<(Hash, Vec<u8>)> = Vec::with_capacity(entries.len());
+        let mut touched = false;
+        for (hash, loc) in entries {
+            let raw = read_slice(&mut f, loc.offset, loc.len)?;
+            match map(hash, &raw)? {
+                Some(mapped) => {
+                    changed += 1;
+                    touched = true;
+                    items.push((hash, mapped));
+                }
+                None => items.push((hash, raw)),
+            }
+        }
+        if !touched {
+            continue;
+        }
+        items.sort_by_key(|a| a.0);
+        let count = items.len();
+        let inherited = fs::metadata(&pack_path).and_then(|m| m.modified()).ok();
+        let info = write_pack(
+            &pack_dir,
+            count,
+            items.into_iter().map(|(h, b)| (h, move || Ok(b))),
+        )?;
+        if let Some(mtime) = inherited {
+            stamp_pack_age(&pack_dir, &info.id, mtime)?;
+        }
+        remove_pack_pair(&idx_path, &pack_path)?;
+    }
+    Ok(changed)
 }
 
 /// A pack too young to be sure its contents are garbage: its objects may be

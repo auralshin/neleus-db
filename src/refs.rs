@@ -24,10 +24,14 @@ impl RefsStore {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(self.heads_dir())?;
-        fs::create_dir_all(self.states_dir())?;
-        fs::create_dir_all(self.checkpoints_dir())?;
-        fs::create_dir_all(self.records_dir())?;
+        for dir in [
+            self.heads_dir(),
+            self.states_dir(),
+            self.checkpoints_dir(),
+            self.records_dir(),
+        ] {
+            crate::atomic::create_dir_durable(&dir)?;
+        }
         Ok(())
     }
 
@@ -103,18 +107,19 @@ impl RefsStore {
         read_hash(self.checkpoint_path(name))
     }
 
-    pub fn checkpoint_set(&self, name: &str, hash: Hash) -> Result<()> {
-        validate_ref_name(name)?;
-        self.ensure_dirs()?;
-
-        let _lock = flock_exclusive(self.root.join(".refs.lock"), Duration::from_secs(10))?;
-        let previous = read_hash(self.checkpoint_path(name))?;
-        let entry = Wal::make_ref_entry(WalOp::RefCheckpointSet, name, previous, hash);
-        let wal_path = self.wal.begin_entry(&entry)?;
-
-        write_atomic(&self.checkpoint_path(name), format!("{hash}\n").as_bytes())?;
-        self.wal.end(&wal_path)?;
-        Ok(())
+    pub fn checkpoint_compare_and_set(
+        &self,
+        name: &str,
+        expected: Option<Hash>,
+        new_hash: Hash,
+    ) -> Result<bool> {
+        self.compare_and_set(
+            name,
+            expected,
+            new_hash,
+            WalOp::RefCheckpointSet,
+            self.checkpoint_path(name),
+        )
     }
 
     /// Newest retrieval record for a head. The record chain lives here, off

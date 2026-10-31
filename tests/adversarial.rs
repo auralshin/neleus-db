@@ -735,3 +735,210 @@ fn tamper_injection_trials() {
         assert_eq!(detected, expected, "{class}");
     }
 }
+
+/// A13. Drop the anchored pin itself: carry one fabricated record above the
+/// pin, dated before the window, and claim the window held no retrievals.
+#[test]
+fn a13_rechain_above_pin_inside_window() {
+    use neleus_db::canonical::{from_cbor, to_cbor};
+    use neleus_db::manifest::{MANIFEST_TAG, QueryManifest};
+
+    let (tmp, engine, _c) = fixture(1);
+    let commit = engine.resolve_commit("main").unwrap();
+    let filter = SearchFilter::default();
+    for i in 0..3 {
+        let hits = engine
+            .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
+            .unwrap();
+        engine
+            .record_query_at_head(
+                "main",
+                commit,
+                "semantic",
+                Some("searchable content"),
+                None,
+                5,
+                &filter,
+                Some(&format!("agent-{i}")),
+                &hits,
+            )
+            .unwrap();
+    }
+    // The auditor's anchor pins the newest record, which lies inside the window.
+    let anchor = CheckpointStore::new(engine.db())
+        .create("main", None)
+        .unwrap();
+    let out = tmp.path().join("honest.nelaudit");
+    audit::export_anchored(engine.db(), "main", 1, u64::MAX, &out, None, anchor).unwrap();
+    assert!(audit::verify_bundle_anchored(&out, None, false, anchor).is_ok());
+
+    let mut entries = parse_bundle(&std::fs::read(&out).unwrap());
+    // Drop the real records entirely, as an exporter rewriting history would.
+    let withheld: Vec<String> = entries
+        .iter()
+        .find(|(n, _)| n == "retrievals.jsonl")
+        .map(|(_, d)| {
+            String::from_utf8_lossy(d)
+                .lines()
+                .map(|l| {
+                    let r: neleus_db::audit::AuditRecord = serde_json::from_str(l).unwrap();
+                    format!("objects/{}", r.manifest)
+                })
+                .collect()
+        })
+        .unwrap();
+    entries.retain(|(n, _)| !withheld.contains(n));
+    let pin_bytes = entries
+        .iter()
+        .find(|(n, _)| n.starts_with("pinned/"))
+        .unwrap()
+        .1
+        .clone();
+    let mut forged: QueryManifest = from_cbor(&pin_bytes).unwrap();
+    forged.seq += 1;
+    forged.executed_at = 0;
+    forged.prev = Some(hash_typed(MANIFEST_TAG, &pin_bytes));
+    let forged_bytes = to_cbor(&forged).unwrap();
+    let forged_hash = hash_typed(MANIFEST_TAG, &forged_bytes);
+    entries.retain(|(n, _)| !n.starts_with("edge/"));
+    entries.push((format!("edge/{forged_hash}"), forged_bytes));
+    set_records(&mut entries, "", 0);
+    let forged_path = tmp.path().join("forged.nelaudit");
+    write_bundle(&entries, &forged_path);
+
+    let err = audit::verify_bundle_anchored(&forged_path, None, false, anchor).unwrap_err();
+    let detected = err.to_string().contains("truncated or rewritten");
+    record(
+        "re-chain above the anchor's pin inside the window",
+        detected,
+        true,
+        "pin time vs window",
+    );
+}
+
+/// A15. Anchor pinned two records below the window; withhold the records
+/// between the pin and the window so the chain cannot be tied to the anchor.
+#[test]
+fn a15_withhold_records_between_old_pin_and_window() {
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let secs = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+
+    let (tmp, engine, _c) = fixture(1);
+    let commit = engine.resolve_commit("main").unwrap();
+    let filter = SearchFilter::default();
+    let search = |i: usize| {
+        let hits = engine
+            .search_semantic_unrecorded(commit, "searchable content", 5, &filter)
+            .unwrap();
+        engine
+            .record_query_at_head(
+                "main",
+                commit,
+                "semantic",
+                Some("searchable content"),
+                None,
+                5,
+                &filter,
+                Some(&format!("agent-{i}")),
+                &hits,
+            )
+            .unwrap();
+    };
+    (0..3).for_each(&search);
+    let anchor = CheckpointStore::new(engine.db())
+        .create("main", None)
+        .unwrap();
+    (3..5).for_each(&search);
+    let start = secs();
+    while secs() == start {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let from = secs();
+    (5..8).for_each(&search);
+
+    let out = tmp.path().join("honest.nelaudit");
+    audit::export_anchored(engine.db(), "main", from, u64::MAX, &out, None, anchor).unwrap();
+    assert!(audit::verify_bundle_anchored(&out, None, false, anchor).is_ok());
+
+    let mut entries = parse_bundle(&std::fs::read(&out).unwrap());
+    let edges_below: Vec<String> = entries
+        .iter()
+        .filter(|(n, d)| {
+            n.starts_with("edge/")
+                && neleus_db::canonical::from_cbor::<neleus_db::manifest::QueryManifest>(d)
+                    .is_ok_and(|qm| qm.seq < 4)
+        })
+        .map(|(n, _)| n.clone())
+        .collect();
+    assert_eq!(
+        edges_below.len(),
+        2,
+        "exporter carries the chain down to the pin"
+    );
+    entries.retain(|(n, _)| !edges_below.contains(n));
+    let forged_path = tmp.path().join("forged.nelaudit");
+    write_bundle(&entries, &forged_path);
+
+    let err = audit::verify_bundle_anchored(&forged_path, None, false, anchor).unwrap_err();
+    let detected = err.to_string().contains("truncated or rewritten");
+    record(
+        "withhold the records between an old anchor pin and the window",
+        detected,
+        true,
+        "anchor pin in chain",
+    );
+}
+
+/// A14. Forge a signature trailer on an unsigned bundle; pad a signed one.
+#[test]
+fn a14_forged_trailer_and_trailing_bytes() {
+    use neleus_db::signing::{Ed25519Signer, generate_keypair_file};
+
+    let (tmp, engine, _c) = fixture(1);
+    let out = tmp.path().join("unsigned.nelaudit");
+    audit::export(engine.db(), "main", 0, u64::MAX, &out, None).unwrap();
+    let mut raw = std::fs::read(&out).unwrap();
+    let key_id = b"ed25519:forged";
+    raw.extend_from_slice(b"SIG1");
+    raw.extend_from_slice(&(key_id.len() as u32).to_le_bytes());
+    raw.extend_from_slice(key_id);
+    raw.extend_from_slice(&[0u8; 64]);
+    let forged = tmp.path().join("forged-sig.nelaudit");
+    std::fs::write(&forged, &raw).unwrap();
+    let detected = audit::verify_bundle(&forged, None, true).is_err();
+    record(
+        "forge a signature trailer, require a signature, give no key",
+        detected,
+        true,
+        "bundle signature",
+    );
+    let lenient = audit::verify_bundle(&forged, None, false).unwrap();
+    assert_eq!(
+        lenient.bundle_key_id, None,
+        "unchecked trailer reported as signed"
+    );
+
+    let key = tmp.path().join("audit.key");
+    generate_keypair_file(&key).unwrap();
+    let signer = Ed25519Signer::from_seed_file(&key).unwrap();
+    let signed = tmp.path().join("signed.nelaudit");
+    audit::export(engine.db(), "main", 0, u64::MAX, &signed, Some(&signer)).unwrap();
+    let public = signer.public_key_hex();
+    assert!(audit::verify_bundle(&signed, Some(&public), true).is_ok());
+    let mut raw = std::fs::read(&signed).unwrap();
+    raw.push(0);
+    let padded = tmp.path().join("padded.nelaudit");
+    std::fs::write(&padded, &raw).unwrap();
+    let detected = audit::verify_bundle(&padded, Some(&public), true).is_err();
+    record(
+        "append bytes after the bundle signature",
+        detected,
+        true,
+        "bundle framing",
+    );
+}

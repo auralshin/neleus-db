@@ -51,7 +51,7 @@ impl ObjectStore {
         let hash = hash_typed(tag, bytes);
         let framed = compression::frame(bytes, self.compress)?;
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(&framed)?,
+            Some(runtime) => runtime.encrypt(&framed, hash.as_bytes())?,
             None => framed,
         };
         self.cas.put_existing_hash(hash, &stored)?;
@@ -61,7 +61,7 @@ impl ObjectStore {
     pub fn get_bytes(&self, hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
         let after_decrypt = match &self.encryption {
-            Some(runtime) => runtime.decrypt(&raw)?,
+            Some(runtime) => runtime.decrypt(&raw, hash.as_bytes())?,
             None => raw,
         };
         Ok(compression::unframe(&after_decrypt)?.into_owned())
@@ -73,7 +73,7 @@ impl ObjectStore {
     pub fn get_typed_bytes(&self, tag: &[u8], hash: Hash) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
         let after_decrypt = match &self.encryption {
-            Some(runtime) => runtime.decrypt(&raw)?,
+            Some(runtime) => runtime.decrypt(&raw, hash.as_bytes())?,
             None => raw,
         };
         let bytes = compression::unframe(&after_decrypt)?;
@@ -86,6 +86,10 @@ impl ObjectStore {
             ));
         }
         Ok(bytes.into_owned())
+    }
+
+    pub fn refresh_packs(&self) {
+        self.cas.refresh_packs();
     }
 
     pub fn exists(&self, hash: Hash) -> bool {

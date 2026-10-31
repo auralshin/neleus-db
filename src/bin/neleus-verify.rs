@@ -19,9 +19,18 @@ fn main() -> ExitCode {
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--public-key" => public_key = args.next(),
+            "--public-key" | "--anchor" => {
+                let Some(value) = args.next() else {
+                    eprintln!("{arg} needs a value");
+                    return ExitCode::from(2);
+                };
+                if arg == "--anchor" {
+                    anchor = Some(value);
+                } else {
+                    public_key = Some(value);
+                }
+            }
             "--require-signature" => require_signature = true,
-            "--anchor" => anchor = args.next(),
             "--json" => json = true,
             "--help" | "-h" => {
                 eprintln!(

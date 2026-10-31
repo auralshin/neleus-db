@@ -35,7 +35,12 @@ pub struct MergeReport {
 /// Merge a remote tree: copy missing blobs/objects, fast-forward heads,
 /// adopt checkpoint tips whose chain contains ours. states/wal/meta/index
 /// stay local.
-pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
+/// `gate` runs before each ref is adopted, with the head it belongs to.
+pub fn merge_tree(
+    db: &Database,
+    remote_root: &Path,
+    gate: &dyn Fn(&str) -> Result<()>,
+) -> Result<MergeReport> {
     // Encryption compatibility gate: ciphertext is keyed by master_salt.
     let remote_cfg_path = remote_root.join("meta").join("config.json");
     let remote_cfg: serde_json::Value =
@@ -81,7 +86,6 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
         }
 
         // Packs are content-named: missing filename = missing object set.
-        // Visible to handles opened after the merge (same as `db repack`).
         let remote_pack_dir = remote_store.join(crate::packstore::PACK_DIR);
         if remote_pack_dir.is_dir() {
             let local_pack_dir = local_root.join(crate::packstore::PACK_DIR);
@@ -98,6 +102,8 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
                     report.packs_copied += 1;
                 }
             }
+            db.blob_store.refresh_packs();
+            db.object_store.refresh_packs();
         }
     }
 
@@ -107,10 +113,16 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
         crate::wal::Wal::new(remote_root.join("wal")),
     );
     for (name, remote_hash) in remote_refs.list_heads()? {
+        // Every ref moves only from the value the decision was made on: a
+        // local writer landing in between keeps its write and we skip.
         match db.refs.head_get(&name)? {
             None => {
-                db.refs.head_set(&name, remote_hash)?;
-                report.refs_updated.push(name);
+                gate(&name)?;
+                if db.refs.head_compare_and_set(&name, None, remote_hash)? {
+                    report.refs_updated.push(name);
+                } else {
+                    report.refs_skipped.push(name);
+                }
             }
             Some(local_hash) if local_hash == remote_hash => {}
             Some(local_hash) => {
@@ -126,11 +138,21 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
                         report.refs_skipped.push(name);
                         continue;
                     }
-                    db.refs.head_set(&name, remote_hash)?;
-                    // Keep the staged-state ref in step so the next commit
-                    // builds on the merged state rather than rolling it back.
+                    gate(&name)?;
+                    // Read the commit before the head names it.
                     let commit = db.commit_store.get_commit(remote_hash)?;
-                    db.refs.state_set(&name, commit.state_root)?;
+                    if !db
+                        .refs
+                        .head_compare_and_set(&name, Some(local_hash), remote_hash)?
+                    {
+                        report.refs_skipped.push(name);
+                        continue;
+                    }
+                    // Keep the staged-state ref in step so the next commit
+                    // builds on the merged state; a concurrent local writer
+                    // that re-staged meanwhile reconciles in its own CAS loop.
+                    db.refs
+                        .state_compare_and_set(&name, staged, commit.state_root)?;
                     report.refs_updated.push(name);
                 } else {
                     report.refs_skipped.push(name);
@@ -142,24 +164,32 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
     // Checkpoints: adopt remote tip when our tip is inside its chain.
     let checkpoints = crate::checkpoint::CheckpointStore::new(db);
     for (name, remote_cp) in remote_refs.list_checkpoints()? {
-        match db.refs.checkpoint_get(&name)? {
-            None => {
-                db.refs.checkpoint_set(&name, remote_cp)?;
-                report.checkpoints_updated.push(name);
-            }
-            Some(local_cp) if local_cp == remote_cp => {}
-            Some(local_cp) => {
-                if checkpoint_chain_contains(&checkpoints, remote_cp, local_cp)? {
-                    db.refs.checkpoint_set(&name, remote_cp)?;
-                    report.checkpoints_updated.push(name);
-                } else {
-                    report.refs_skipped.push(format!("checkpoint:{name}"));
-                }
-            }
+        let local_cp = db.refs.checkpoint_get(&name)?;
+        let adopt = match local_cp {
+            None => true,
+            Some(l) if l == remote_cp => continue,
+            Some(l) => checkpoint_chain_contains(&checkpoints, remote_cp, l)?,
+        };
+        if adopt {
+            gate(&name)?;
+        }
+        if adopt
+            && db
+                .refs
+                .checkpoint_compare_and_set(&name, local_cp, remote_cp)?
+        {
+            report.checkpoints_updated.push(name);
+        } else {
+            report.refs_skipped.push(format!("checkpoint:{name}"));
         }
     }
 
     // Record chains: adopt the remote tip when our tip is in its prev chain.
+    // Recorders hold `.audit.lock` across read-tip, build, set; so must this.
+    let _audit_lock = crate::lock::flock_exclusive(
+        db.root.join(".audit.lock"),
+        std::time::Duration::from_secs(10),
+    )?;
     for (name, remote_tip) in remote_refs.list_records()? {
         match db.refs.record_get(&name)? {
             Some(local) if local == remote_tip => {}
@@ -167,6 +197,7 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
                 report.refs_skipped.push(format!("records:{name}"));
             }
             _ => {
+                gate(&name)?;
                 db.refs.record_set(&name, remote_tip)?;
                 report.records_updated.push(name);
             }
@@ -177,7 +208,11 @@ pub fn merge_tree(db: &Database, remote_root: &Path) -> Result<MergeReport> {
 }
 
 /// Merge a pack file (the `db pack` format) into `db` via a staging unpack.
-pub fn merge_pack_file(db: &Database, pack_file: &Path) -> Result<MergeReport> {
+pub fn merge_pack_file(
+    db: &Database,
+    pack_file: &Path,
+    gate: &dyn Fn(&str) -> Result<()>,
+) -> Result<MergeReport> {
     // Inside the root: a sibling puts an incoming peer's whole unpacked tree
     // outside the encryption boundary. `pack` skips temp-named dirs.
     let dir = db.root.join("meta");
@@ -187,7 +222,7 @@ pub fn merge_pack_file(db: &Database, pack_file: &Path) -> Result<MergeReport> {
         fs::remove_dir_all(&staging)?;
     }
     crate::pack::unpack(pack_file, &staging, true)?;
-    let result = merge_tree(db, &staging);
+    let result = merge_tree(db, &staging, gate);
     let _ = fs::remove_dir_all(&staging);
     result
 }
@@ -261,13 +296,18 @@ fn checkpoint_chain_contains(
 // ---------- transport ----------
 
 /// Fetch the remote's pack and merge locally.
-pub fn pull(db: &Database, remote_url: &str, token: Option<&str>) -> Result<MergeReport> {
+pub fn pull(
+    db: &Database,
+    remote_url: &str,
+    token: Option<&str>,
+    gate: &dyn Fn(&str) -> Result<()>,
+) -> Result<MergeReport> {
     let body = http_request(remote_url, "GET", "/v1/pack", token, &[], None)?;
     let dir = db.root.join("meta");
     fs::create_dir_all(&dir)?;
     let tmp = dir.join(crate::atomic::build_temp_name("pull")?);
     fs::write(&tmp, &body)?;
-    let result = merge_pack_file(db, &tmp);
+    let result = merge_pack_file(db, &tmp, gate);
     let _ = fs::remove_file(&tmp);
     result
 }
@@ -289,8 +329,13 @@ pub fn clone(path: &Path, remote_url: &str, token: Option<&str>) -> Result<Merge
             .get("secret")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| anyhow!("remote config has no secret"))?;
-        Database::init_with_secret(path, key)?;
-        merge_tree(&Database::open(path)?, &staging)
+        let encryption = match remote_cfg.get("encryption") {
+            Some(v) => serde_json::from_value(v.clone())?,
+            None => None,
+        };
+        Database::init_with_secret(path, key, encryption)?;
+        // A fresh replica has no policies yet.
+        merge_tree(&Database::open(path)?, &staging, &|_| Ok(()))
     })();
     let _ = fs::remove_file(&tmp);
     let _ = fs::remove_dir_all(&staging);
@@ -398,7 +443,7 @@ mod tests {
 
     fn test_db(tmp: &TempDir, name: &str) -> Database {
         let root = tmp.path().join(name);
-        Database::init_with_secret(&root, &"07".repeat(32)).unwrap();
+        Database::init_with_secret(&root, &"07".repeat(32), None).unwrap();
         Database::open(&root).unwrap()
     }
 
@@ -408,7 +453,7 @@ mod tests {
         let a = test_db(&tmp, "a");
         let other = tmp.path().join("other");
         Database::init(&other).unwrap();
-        let err = merge_tree(&a, &other).unwrap_err().to_string();
+        let err = merge_tree(&a, &other, &|_| Ok(())).unwrap_err().to_string();
         assert!(err.contains("secrets differ"), "{err}");
     }
 
@@ -423,7 +468,7 @@ mod tests {
             .create_commit_at_head("main", "agent", "c1", vec![])
             .unwrap();
 
-        let report = merge_tree(&b, &a.root).unwrap();
+        let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
         assert!(report.objects_added > 0);
         assert_eq!(report.refs_updated, vec!["main".to_string()]);
         let b = Database::open(&b.root).unwrap();
@@ -436,7 +481,7 @@ mod tests {
         let c2 = a
             .create_commit_at_head("main", "agent", "c2", vec![])
             .unwrap();
-        let report = merge_tree(&b, &a.root).unwrap();
+        let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
         assert_eq!(report.refs_updated, vec!["main".to_string()]);
         assert_eq!(b.refs.head_get("main").unwrap(), Some(c2));
     }
@@ -452,7 +497,7 @@ mod tests {
         let _ = b.state_set_at_head("main", b"k", b"b").unwrap();
         let local_head = b.create_commit_at_head("main", "b", "cb", vec![]).unwrap();
 
-        let report = merge_tree(&b, &a.root).unwrap();
+        let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
         assert_eq!(report.refs_skipped, vec!["main".to_string()]);
         assert!(report.refs_updated.is_empty());
         assert_eq!(b.refs.head_get("main").unwrap(), Some(local_head));
@@ -471,7 +516,7 @@ mod tests {
 
         let pack_path = tmp.path().join("a.pack");
         crate::pack::pack(&a.root, &pack_path, true).unwrap();
-        let report = merge_pack_file(&b, &pack_path).unwrap();
+        let report = merge_pack_file(&b, &pack_path, &|_| Ok(())).unwrap();
         assert!(report.objects_added > 0);
         assert_eq!(b.refs.head_get("main").unwrap(), Some(c1));
     }
@@ -486,12 +531,12 @@ mod tests {
             .unwrap();
         let cps = crate::checkpoint::CheckpointStore::new(&a);
         cps.create("main", None).unwrap();
-        merge_tree(&b, &a.root).unwrap();
+        merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
 
         a.create_commit_at_head("main", "agent", "c2", vec![])
             .unwrap();
         let cp2 = cps.create("main", None).unwrap();
-        let report = merge_tree(&b, &a.root).unwrap();
+        let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
         assert_eq!(report.checkpoints_updated, vec!["main".to_string()]);
         assert_eq!(b.refs.checkpoint_get("main").unwrap(), Some(cp2));
     }

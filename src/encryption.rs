@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce as AesNonce};
 use anyhow::{Result, anyhow};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
@@ -168,8 +168,9 @@ impl EncryptionRuntime {
         })
     }
 
-    /// Encrypt `plaintext`, returning the serialized envelope.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+    /// Encrypt `plaintext`, returning the serialized envelope. `aad` is the
+    /// object's address, so a ciphertext swapped under another name fails.
+    pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let salt = utils::random_bytes(PER_BLOB_SALT_LEN)?;
         let nonce = utils::random_bytes(AEAD_NONCE_LEN)?;
         let per_blob_key =
@@ -178,7 +179,10 @@ impl EncryptionRuntime {
             self.inner.algorithm,
             per_blob_key.as_slice(),
             &nonce,
-            plaintext,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
         )?;
 
         let envelope = EncryptedData {
@@ -191,8 +195,8 @@ impl EncryptionRuntime {
         crate::canonical::to_cbor(&envelope)
     }
 
-    /// Decrypt a serialized envelope.
-    pub fn decrypt(&self, bytes: &[u8]) -> Result<Vec<u8>> {
+    /// Decrypt a serialized envelope under the same `aad` it was sealed with.
+    pub fn decrypt(&self, bytes: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         let envelope: EncryptedData = crate::canonical::from_cbor(bytes)
             .map_err(|e| anyhow!("invalid encryption envelope: {e}"))?;
         if envelope.version != ENVELOPE_VERSION {
@@ -226,7 +230,10 @@ impl EncryptionRuntime {
             self.inner.algorithm,
             per_blob_key.as_slice(),
             &envelope.nonce,
-            &envelope.ciphertext,
+            Payload {
+                msg: &envelope.ciphertext,
+                aad,
+            },
         )
     }
 
@@ -280,7 +287,7 @@ fn aead_encrypt(
     algorithm: Algorithm,
     key: &[u8],
     nonce: &[u8],
-    plaintext: &[u8],
+    plaintext: Payload<'_, '_>,
 ) -> Result<Vec<u8>> {
     match algorithm {
         Algorithm::Aes256Gcm => {
@@ -304,7 +311,7 @@ fn aead_decrypt(
     algorithm: Algorithm,
     key: &[u8],
     nonce: &[u8],
-    ciphertext: &[u8],
+    ciphertext: Payload<'_, '_>,
 ) -> Result<Vec<u8>> {
     match algorithm {
         Algorithm::Aes256Gcm => {
@@ -393,8 +400,8 @@ mod tests {
         let cfg = enabled_aes_config();
         let a = EncryptionRuntime::from_config(cfg.clone(), "pw".into()).unwrap();
         let b = EncryptionRuntime::from_config(cfg, "pw".into()).unwrap();
-        let envelope = a.encrypt(b"argon payload").unwrap();
-        assert_eq!(b.decrypt(&envelope).unwrap(), b"argon payload");
+        let envelope = a.encrypt(b"argon payload", b"addr").unwrap();
+        assert_eq!(b.decrypt(&envelope, b"addr").unwrap(), b"argon payload");
     }
 
     #[test]
@@ -413,8 +420,8 @@ mod tests {
         let runtime =
             EncryptionRuntime::from_config(enabled_aes_config(), "strong-password".into()).unwrap();
         let plaintext = b"runtime payload";
-        let envelope = runtime.encrypt(plaintext).unwrap();
-        let decrypted = runtime.decrypt(&envelope).unwrap();
+        let envelope = runtime.encrypt(plaintext, b"addr").unwrap();
+        let decrypted = runtime.decrypt(&envelope, b"addr").unwrap();
         assert_eq!(plaintext, &decrypted[..]);
         assert_eq!(runtime.algorithm(), "aes-256-gcm");
     }
@@ -425,20 +432,28 @@ mod tests {
             EncryptionRuntime::from_config(enabled_chacha_config(), "strong-password".into())
                 .unwrap();
         let plaintext = b"runtime payload";
-        let envelope = runtime.encrypt(plaintext).unwrap();
-        let decrypted = runtime.decrypt(&envelope).unwrap();
+        let envelope = runtime.encrypt(plaintext, b"addr").unwrap();
+        let decrypted = runtime.decrypt(&envelope, b"addr").unwrap();
         assert_eq!(plaintext, &decrypted[..]);
         assert_eq!(runtime.algorithm(), "chacha20-poly1305");
+    }
+
+    #[test]
+    fn wrong_aad_fails_authentication() {
+        let runtime =
+            EncryptionRuntime::from_config(enabled_aes_config(), "strong-password".into()).unwrap();
+        let envelope = runtime.encrypt(b"x", b"addr").unwrap();
+        assert!(runtime.decrypt(&envelope, b"other").is_err());
     }
 
     #[test]
     fn wrong_password_fails() {
         let cfg = enabled_aes_config();
         let runtime = EncryptionRuntime::from_config(cfg.clone(), "right".into()).unwrap();
-        let envelope = runtime.encrypt(b"x").unwrap();
+        let envelope = runtime.encrypt(b"x", b"addr").unwrap();
 
         let other = EncryptionRuntime::from_config(cfg, "wrong".into()).unwrap();
-        assert!(other.decrypt(&envelope).is_err());
+        assert!(other.decrypt(&envelope, b"addr").is_err());
     }
 
     /// Same plaintext encrypted twice must yield distinct envelopes
@@ -447,8 +462,8 @@ mod tests {
     #[test]
     fn same_plaintext_different_ciphertext() {
         let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
-        let a = runtime.encrypt(b"same").unwrap();
-        let b = runtime.encrypt(b"same").unwrap();
+        let a = runtime.encrypt(b"same", b"addr").unwrap();
+        let b = runtime.encrypt(b"same", b"addr").unwrap();
         assert_ne!(a, b);
     }
 
@@ -461,7 +476,7 @@ mod tests {
         let start = std::time::Instant::now();
         for i in 0..100 {
             let payload = format!("payload-{i}");
-            let _ = runtime.encrypt(payload.as_bytes()).unwrap();
+            let _ = runtime.encrypt(payload.as_bytes(), b"addr").unwrap();
         }
         let elapsed = start.elapsed();
         assert!(
@@ -484,7 +499,7 @@ mod tests {
             ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
         };
         let bytes = crate::canonical::to_cbor(&older).unwrap();
-        let err = runtime.decrypt(&bytes).unwrap_err();
+        let err = runtime.decrypt(&bytes, b"addr").unwrap_err();
         assert!(err.to_string().contains("unsupported envelope version"));
     }
 
@@ -494,16 +509,16 @@ mod tests {
         let json =
             br#"{"version":2,"algorithm":"aes-256-gcm","salt":"","nonce":"","ciphertext":""}"#;
         let runtime = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
-        let err = runtime.decrypt(json).unwrap_err();
+        let err = runtime.decrypt(json, b"addr").unwrap_err();
         assert!(err.to_string().contains("invalid encryption envelope"));
     }
 
     #[test]
     fn algorithm_mismatch_between_runtime_and_envelope_fails() {
         let aes = EncryptionRuntime::from_config(enabled_aes_config(), "pw".into()).unwrap();
-        let envelope = aes.encrypt(b"x").unwrap();
+        let envelope = aes.encrypt(b"x", b"addr").unwrap();
         let chacha = EncryptionRuntime::from_config(enabled_chacha_config(), "pw".into()).unwrap();
-        let err = chacha.decrypt(&envelope).unwrap_err();
+        let err = chacha.decrypt(&envelope, b"addr").unwrap_err();
         assert!(err.to_string().contains("algorithm mismatch"));
     }
 

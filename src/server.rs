@@ -105,6 +105,13 @@ struct ServerState {
     write_lock: Mutex<()>,
 }
 
+impl ServerState {
+    /// A panic while holding the lock poisons it; the guarded data is `()`.
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Binds and serves on background threads until [`ServerHandle::shutdown`].
 pub fn start(mut engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
     let listener =
@@ -200,8 +207,15 @@ pub fn start(mut engine: Engine, config: ServerConfig) -> Result<ServerHandle> {
             let state = Arc::clone(&state);
             let active = Arc::clone(&active);
             std::thread::spawn(move || {
+                // Released on unwind too, so a panic cannot leak a slot.
+                struct Slot(Arc<AtomicUsize>);
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+                let _slot = Slot(active);
                 let _ = handle_connection(stream, &state);
-                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -679,12 +693,15 @@ fn handle_connection(stream: TcpStream, state: &ServerState) -> Result<()> {
 
 fn classify_error(e: &anyhow::Error) -> (u16, String) {
     let msg = e.to_string();
+    // Prefix classes first: "bad request: missing field" is a 400, not a 404.
     let status = if msg.starts_with("forbidden") {
         403
+    } else if msg.starts_with("bad request") {
+        400
     } else if msg.contains("not found") || msg.contains("missing") || msg.contains("has no commits")
     {
         404
-    } else if msg.starts_with("bad request") || msg.contains("invalid") {
+    } else if msg.contains("invalid") {
         400
     } else {
         500
@@ -938,7 +955,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             // deduped globally, and run capture (the flagship SDK flow) uploads
             // run content here with a tenant key. Reads stay untenanted.
             require(req, Role::Writer)?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             // No head to scope against; global rules (encryption at rest,
             // retention) apply regardless of the selector.
             gate_write(db, req, "blobs", "")?;
@@ -984,7 +1001,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let head = scope_head(req, str_field(&v, "head")?)?;
             let key = b64_field(&v, "key")?;
             let value = b64_field(&v, "value")?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             gate_write(db, req, "state", head)?;
             let root = db.state_set_at_head(head, &key, &value)?;
             Ok(Response::Json(200, json!({"root": root.to_string()})))
@@ -995,7 +1012,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let v = parse_json(&req.body)?;
             let head = scope_head(req, str_field(&v, "head")?)?;
             let key = b64_field(&v, "key")?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             gate_write(db, req, "state", head)?;
             let root = db.state_del_at_head(head, &key)?;
             Ok(Response::Json(200, json!({"root": root.to_string()})))
@@ -1056,7 +1073,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 metadata = Some(m);
             }
             let author = principal_id(req).unwrap_or_else(|| "server".into());
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             crate::policy::enforce_write(
                 db,
                 &crate::policy::WriteContext {
@@ -1107,7 +1124,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 }
             };
 
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             let has_provenance = v.get("provider").and_then(Value::as_str).is_some()
                 || v.get("inputs")
                     .and_then(Value::as_array)
@@ -1229,7 +1246,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                     .collect::<Result<_>>()?,
                 Some(_) => bail!("bad request: manifests must be an array"),
             };
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             crate::policy::enforce_write(
                 db,
                 &crate::policy::WriteContext {
@@ -1398,7 +1415,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let content = str_field(&v, "content")?;
             let role = v.get("role").and_then(Value::as_str);
             let ttl_secs = v.get("ttl_secs").and_then(Value::as_u64);
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             gate_write(db, req, "sessions", head)?;
             let (seq, content_hash) =
                 engine
@@ -1442,7 +1459,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             require(req, Role::Writer)?;
             let v = parse_json(&req.body)?;
             let head = scope_head(req, str_field(&v, "head")?)?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             gate_write(db, req, "checkpoints", head)?;
             let hash = engine
                 .checkpoints()
@@ -1467,9 +1484,10 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
                 .body_path
                 .clone()
                 .ok_or_else(|| anyhow!("pack upload was not staged"))?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             gate_write(db, req, "pack", "")?;
-            let report = crate::sync::merge_pack_file(db, &tmp)?;
+            let report =
+                crate::sync::merge_pack_file(db, &tmp, &|head| gate_write(db, req, "pack", head))?;
             Ok(Response::Json(
                 200,
                 json!({
@@ -1588,7 +1606,7 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             require_untenanted(req, Role::Admin)?;
             let set: crate::policy::PolicySet = serde_json::from_slice(&req.body)
                 .map_err(|e| anyhow!("bad request: invalid policy json: {e}"))?;
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
             let stored = crate::policy::store(&db.root, set)?;
             Ok(Response::Json(200, json!({"policy": stored})))
         }
@@ -1655,7 +1673,8 @@ fn route(state: &ServerState, req: &Request) -> Result<Response> {
             let subject = str_field(&v, "subject")?;
             let reason = v.get("reason").and_then(Value::as_str).unwrap_or("request");
             let requested_by = req.principal.as_ref().map(|p| p.key_id.as_str());
-            let _w = state.write_lock.lock().expect("write lock poisoned");
+            let _w = state.write_guard();
+            gate_write(db, req, "erasure", "")?;
             let record = crate::erasure::erase_subject(
                 engine,
                 subject,
@@ -2549,7 +2568,7 @@ mod tests {
 
         let source_root = tmp.path().join("source");
         let key = Database::open(tmp.path().join("db")).unwrap().config.secret;
-        Database::init_with_secret(&source_root, &key).unwrap();
+        Database::init_with_secret(&source_root, &key, None).unwrap();
         let source = Database::open(&source_root).unwrap();
         source.blob_store.put(b"pushed payload").unwrap();
         crate::sync::push(&source, &url, token.as_deref()).unwrap();
@@ -2591,7 +2610,7 @@ mod tests {
         assert_eq!(report.refs_updated, vec!["main".to_string()]);
         let replica = Database::open(&replica_root).unwrap();
         assert!(
-            crate::sync::pull(&replica, &url, token)
+            crate::sync::pull(&replica, &url, token, &|_| Ok(()))
                 .unwrap()
                 .refs_updated
                 .is_empty()

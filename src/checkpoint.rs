@@ -4,7 +4,7 @@
 //! signing key. Optionally ed25519-signed; publishing the latest hash
 //! externally anchors everything below it.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::now_unix;
@@ -181,7 +181,13 @@ impl<'a> CheckpointStore<'a> {
             .db
             .object_store
             .put_serialized(CHECKPOINT_TAG, &checkpoint)?;
-        self.db.refs.checkpoint_set(head, hash)?;
+        if !self
+            .db
+            .refs
+            .checkpoint_compare_and_set(head, prev_hash, hash)?
+        {
+            bail!("checkpoint chain for head '{head}' advanced concurrently; retry");
+        }
         Ok(hash)
     }
 

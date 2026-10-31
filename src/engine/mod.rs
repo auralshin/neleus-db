@@ -32,7 +32,7 @@ pub use segment::{ChunkInput, IndexSegment, SearchFilter, SegmentHit};
 pub use writer::WriteCoalescer;
 
 const SEGMENT_TAG: &[u8] = b"index_segment:";
-const HEAD_SCHEMA_VERSION: u32 = 2;
+const HEAD_SCHEMA_VERSION: u32 = 3;
 
 /// Merge a head's segment chain into one segment past this length.
 const MERGE_THRESHOLD: usize = 8;
@@ -248,16 +248,16 @@ impl Engine {
         self.index_root.join("heads").join(commit.to_string())
     }
 
-    fn encode(&self, plaintext: Vec<u8>) -> Result<Vec<u8>> {
+    fn encode(&self, plaintext: Vec<u8>, name: Hash) -> Result<Vec<u8>> {
         match &self.encryption {
-            Some(rt) => rt.encrypt(&plaintext),
+            Some(rt) => rt.encrypt(&plaintext, name.as_bytes()),
             None => Ok(plaintext),
         }
     }
 
-    fn decode(&self, raw: Vec<u8>) -> Result<Vec<u8>> {
+    fn decode(&self, raw: Vec<u8>, name: Hash) -> Result<Vec<u8>> {
         match &self.encryption {
-            Some(rt) => rt.decrypt(&raw),
+            Some(rt) => rt.decrypt(&raw, name.as_bytes()),
             None => Ok(raw),
         }
     }
@@ -268,7 +268,7 @@ impl Engine {
         let path = self.segment_path(hash);
         if !path.exists() {
             fs::create_dir_all(path.parent().expect("segments dir"))?;
-            crate::atomic::write_atomic(&path, &self.encode(bytes)?)?;
+            crate::atomic::write_atomic(&path, &self.encode(bytes, hash)?)?;
         }
         self.segments
             .write()
@@ -289,11 +289,18 @@ impl Engine {
         let path = self.segment_path(hash);
         let raw = fs::read(&path)
             .with_context(|| format!("missing index segment {} at {}", hash, path.display()))?;
-        let bytes = self.decode(raw)?;
+        let bytes = self.decode(raw, hash)?;
         if hash_typed(SEGMENT_TAG, &bytes) != hash {
             return Err(anyhow!("index segment {} failed integrity check", hash));
         }
         let seg: Arc<IndexSegment> = Arc::new(from_cbor(&bytes)?);
+        if seg.schema_version != segment::SEGMENT_SCHEMA_VERSION {
+            return Err(anyhow!(
+                "index segment {hash} has schema {}, expected {}; delete index/ to rebuild",
+                seg.schema_version,
+                segment::SEGMENT_SCHEMA_VERSION
+            ));
+        }
         self.segments
             .write()
             .expect("segment cache poisoned")
@@ -311,7 +318,7 @@ impl Engine {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
-        let manifest: SegmentSetManifest = from_cbor(&self.decode(raw)?)?;
+        let manifest: SegmentSetManifest = from_cbor(&self.decode(raw, commit)?)?;
         if manifest.schema_version != HEAD_SCHEMA_VERSION {
             return Ok(None); // stale derived data; rebuild
         }
@@ -332,7 +339,7 @@ impl Engine {
         };
         let path = self.head_path(commit);
         fs::create_dir_all(path.parent().expect("heads dir"))?;
-        crate::atomic::write_atomic(&path, &self.encode(to_cbor(&manifest)?)?)?;
+        crate::atomic::write_atomic(&path, &self.encode(to_cbor(&manifest)?, commit)?)?;
         self.heads
             .write()
             .expect("head cache poisoned")
@@ -352,17 +359,26 @@ impl Engine {
         let mut chain = vec![commit]; // newest first
         let mut base_segments: Vec<Hash> = Vec::new();
         let mut cursor = commit;
+        let mut reached = false;
         for _ in 0..MAX_CHAIN_WALK {
             let c = self.db.commit_store.get_commit(cursor)?;
             let Some(&parent) = c.parents.first() else {
+                reached = true;
                 break;
             };
             if let Some(set) = self.read_head(parent)? {
                 base_segments = set.as_ref().clone();
+                reached = true;
                 break;
             }
             chain.push(parent);
             cursor = parent;
+        }
+        if !reached {
+            return Err(anyhow!(
+                "commit {commit}: no indexed ancestor within {MAX_CHAIN_WALK} commits; \
+                 index an older commit first (search it with `at`)"
+            ));
         }
 
         // Manifests already covered by the base segments.
@@ -564,10 +580,14 @@ impl Engine {
     ) -> Vec<EngineHit> {
         let mut seen: HashSet<Hash> = HashSet::new();
         let mut out: Vec<EngineHit> = Vec::new();
-        // Newest segment first: freshest chunk version wins.
-        for (seg, hits) in per_segment.iter().rev() {
+        // Newest segment first: freshest chunk version wins, even when the
+        // filter hid that version (re-ingested under new metadata).
+        for (i, (seg, hits)) in per_segment.iter().enumerate().rev() {
             for hit in hits {
-                if !seen.insert(hit.chunk_hash) {
+                let shadowed = per_segment[i + 1..]
+                    .iter()
+                    .any(|(newer, _)| newer.contains_chunk(hit.chunk_hash));
+                if shadowed || !seen.insert(hit.chunk_hash) {
                     continue;
                 }
                 out.push(EngineHit {
@@ -1222,6 +1242,33 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].text_preview.contains("acme"));
+    }
+
+    #[test]
+    fn newer_restricted_copy_shadows_older_public_copy() {
+        let (_tmp, db) = test_db();
+        let _c1 = commit_doc(&db, "main", b"payroll policy text", None);
+        let restricted = ChunkMetadata {
+            acl: vec!["hr".into()],
+            ..Default::default()
+        };
+        let c2 = commit_doc(&db, "main", b"payroll policy text", Some(restricted));
+        let engine = Engine::new(db);
+        let public = engine
+            .search_semantic_unrecorded(c2, "payroll", 10, &SearchFilter::default())
+            .unwrap();
+        assert!(
+            public.is_empty(),
+            "restricted copy must shadow the public one"
+        );
+        let hr = SearchFilter {
+            acl: vec!["hr".into()],
+            ..Default::default()
+        };
+        let hits = engine
+            .search_semantic_unrecorded(c2, "payroll", 10, &hr)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

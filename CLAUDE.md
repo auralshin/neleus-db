@@ -41,9 +41,9 @@ verification detects, including seeded tamper-injection trials.
   carry the payload; `ChunkProof::chunk_content` strips the salt.
 - Concurrent recordings on a head group-commit (`engine/recorder.rs`).
 - Audit bundles carry only the latest checkpoint; `--anchor` adds a
-  consistency proof from a retained checkpoint, plus edge records (the record
-  before the window and records up to each pin) so a window is provably
-  complete. Chunk proofs are one commit plus a state path to the manifest's
+  consistency proof from a retained checkpoint, plus edge records (from the
+  lowest pin up to the window and from the window up to the highest pin) so a
+  window is provably complete. Chunk proofs are one commit plus a state path to the manifest's
   `__manifests__/` index key; they can carry an inclusion anchor
   (`prove_chunk_anchored`).
 - Tenant-scoped vector queries use the tenant's own graph or an exact scan,

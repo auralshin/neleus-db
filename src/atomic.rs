@@ -86,14 +86,49 @@ pub(crate) fn build_temp_name(stem: &str) -> Result<String> {
     Ok(format!(".{stem}.tmp-{pid}-{nanos}-{seq}"))
 }
 
+/// `create_dir_all` whose new entries are durable: every directory from the
+/// first one created downward is synced, so a crash cannot drop a new shard
+/// or ref directory along with the file just published into it.
+pub(crate) fn create_dir_durable(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        return Ok(());
+    }
+    let mut created = vec![path.to_path_buf()];
+    while let Some(parent) = created.last().and_then(|p| p.parent()) {
+        if parent.as_os_str().is_empty() || parent.is_dir() {
+            break;
+        }
+        created.push(parent.to_path_buf());
+    }
+    fs::create_dir_all(path)?;
+    if let Some(base) = created.last().and_then(|p| p.parent())
+        && !base.as_os_str().is_empty()
+    {
+        maybe_sync_dir(base)?;
+    }
+    for dir in created.iter().rev() {
+        maybe_sync_dir(dir)?;
+    }
+    Ok(())
+}
+
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_mode(path, bytes, None)
+}
+
+/// Owner-only from creation: the temp file carries the mode through the rename.
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_mode(path, bytes, Some(0o600))
+}
+
+fn write_atomic_mode(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         anyhow!(
             "cannot write atomic file without parent: {}",
             path.display()
         )
     })?;
-    fs::create_dir_all(parent)
+    create_dir_durable(parent)
         .with_context(|| format!("failed creating parent dir {}", parent.display()))?;
 
     let file_name = path
@@ -103,9 +138,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
     let tmp_path = parent.join(build_temp_name(&file_name)?);
 
-    let mut f = OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    if let Some(mode) = mode {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(mode);
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut f = opts
         .open(&tmp_path)
         .with_context(|| format!("failed creating temp file {}", tmp_path.display()))?;
     f.write_all(bytes)

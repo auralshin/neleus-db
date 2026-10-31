@@ -1,7 +1,7 @@
 //! ed25519 [`CommitSigner`]/[`CommitVerifier`] implementation.
 //! Key file: 64 hex chars (32-byte seed), mode 0600. The signature's
-//! `key_id` embeds the public key as a routing hint only; verification
-//! always uses the caller-supplied key.
+//! `key_id` embeds the public key; `verify_commit_signature` checks only
+//! self-consistency under it, so attribution needs a caller-supplied key.
 
 use std::fs;
 use std::path::Path;
@@ -38,13 +38,8 @@ pub fn generate_keypair_file(path: &Path) -> Result<String> {
     {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, body.as_bytes())
+    crate::atomic::write_atomic_private(path, body.as_bytes())
         .with_context(|| format!("writing key file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
     Ok(public_hex)
 }
 

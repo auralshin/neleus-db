@@ -16,8 +16,9 @@
 //! `objects/<hash>` (canonical commit + manifest bytes),
 //! `checkpoints/<hash>` (the latest checkpoint; its Merkle root covers the
 //! rest), `pinned/<hash>` (the retrieval record it pins), `edge/<hash>`
-//! (the record before the window and every record from the window up to each
-//! pin, so the window is provably complete), and for an anchored export
+//! (every record from the lowest pin up to the window and from the window up
+//! to the highest pin, so the window is provably complete), and for an
+//! anchored export
 //! `anchor/<hash>` + `anchor_proof` (consistency from the anchor).
 //!
 //! The verifier needs no database and makes no network calls: every claim in
@@ -378,13 +379,15 @@ fn export_inner(
     }
     entries.extend(anchor_entries);
 
-    // Edges: the record before the window proves nothing older in the window
-    // was dropped, and records from the window up to each pin tie the window
-    // to the checkpoints, so neither end can be truncated.
-    let pin_seq = pinned
+    // Edges: records from the lowest pin up to the window and from the window
+    // up to the highest pin tie both ends of the chain to checkpoints, so
+    // neither end can be truncated or re-chained.
+    let pin_seqs: Vec<u64> = pinned
         .values()
         .filter_map(|b| decode_query_manifest(b).map(|qm| qm.seq))
-        .max();
+        .collect();
+    let pin_seq = pin_seqs.iter().copied().max();
+    let pin_low = pin_seqs.iter().copied().min();
     let window_end = all
         .iter()
         .filter(|(_, qm)| qm.executed_at <= to)
@@ -396,7 +399,8 @@ fn export_inner(
         .map(|(_, qm)| qm.seq)
         .max();
     for (m, qm) in &all {
-        let before = Some(qm.seq) == before_seq;
+        let before = qm.executed_at < from
+            && before_seq.is_some_and(|b| qm.seq >= pin_low.map_or(b, |p| p.min(b)));
         let link = qm.executed_at > to
             && pin_seq.is_some_and(|p| qm.seq <= p)
             && window_end.is_none_or(|e| qm.seq > e);
@@ -489,43 +493,44 @@ fn read_bundle(path: &Path) -> Result<DecodedBundle> {
     }
     let count = u32::from_le_bytes(raw[12..16].try_into().unwrap()) as usize;
 
+    // Lengths are untrusted: every slice bound is a checked add.
+    let take = |p: &mut usize, n: usize| -> Result<&[u8]> {
+        let end = p.checked_add(n).context("bundle length overflow")?;
+        let s = raw.get(*p..end).context("bundle truncated")?;
+        *p = end;
+        Ok(s)
+    };
     let mut entries = HashMap::new();
     let mut p = 16usize;
     for _ in 0..count {
-        if p + 4 > raw.len() {
-            bail!("bundle truncated");
+        let name_len = u32::from_le_bytes(take(&mut p, 4)?.try_into()?) as usize;
+        let name = String::from_utf8(take(&mut p, name_len)?.to_vec())?;
+        let data_len = usize::try_from(u64::from_le_bytes(take(&mut p, 8)?.try_into()?))
+            .context("bundle entry too large")?;
+        let data = take(&mut p, data_len)?.to_vec();
+        if entries.insert(name.clone(), data).is_some() {
+            bail!("bundle carries entry '{name}' twice");
         }
-        let name_len = u32::from_le_bytes(raw[p..p + 4].try_into().unwrap()) as usize;
-        p += 4;
-        let name = String::from_utf8(raw.get(p..p + name_len).context("truncated")?.to_vec())?;
-        p += name_len;
-        let data_len =
-            u64::from_le_bytes(raw.get(p..p + 8).context("truncated")?.try_into()?) as usize;
-        p += 8;
-        let data = raw.get(p..p + data_len).context("truncated")?.to_vec();
-        p += data_len;
-        entries.insert(name, data);
     }
 
-    let footer: [u8; 32] = raw.get(p..p + 32).context("missing footer")?.try_into()?;
-    let computed = blake3::hash(&raw[..p]);
+    let body_end = p;
+    let footer: [u8; 32] = take(&mut p, 32).context("missing footer")?.try_into()?;
+    let computed = blake3::hash(&raw[..body_end]);
     if computed.as_bytes() != &footer {
         bail!("bundle integrity check failed (corrupt or tampered)");
     }
     let mut trailer = None;
-    let mut q = p + 32;
-    if raw.len() > q {
-        if raw.get(q..q + 4) != Some(SIG_MAGIC.as_slice()) {
+    if raw.len() > p {
+        if take(&mut p, 4)? != SIG_MAGIC.as_slice() {
             bail!("unexpected trailing bytes after footer");
         }
-        q += 4;
-        let key_len =
-            u32::from_le_bytes(raw.get(q..q + 4).context("truncated sig")?.try_into()?) as usize;
-        q += 4;
-        let key_id = String::from_utf8(raw.get(q..q + key_len).context("truncated sig")?.to_vec())?;
-        q += key_len;
-        let sig = raw.get(q..q + 64).context("truncated sig")?.to_vec();
+        let key_len = u32::from_le_bytes(take(&mut p, 4)?.try_into()?) as usize;
+        let key_id = String::from_utf8(take(&mut p, key_len)?.to_vec())?;
+        let sig = take(&mut p, 64)?.to_vec();
         trailer = Some((key_id, sig));
+    }
+    if p != raw.len() {
+        bail!("unexpected trailing bytes after signature");
     }
     Ok((entries, footer, trailer))
 }
@@ -569,7 +574,11 @@ fn verify_inner(
                 .map_err(|e| anyhow!("bundle signature: {e}"))?;
             Some(key_id.clone())
         }
-        (Some((key_id, _)), None) => Some(key_id.clone()),
+        // Without a key the trailer is unchecked, so never report it as signed.
+        (Some(_), None) if require_signature => {
+            bail!("bundle is signed but no public key was given to check it")
+        }
+        (Some(_), None) => None,
         (None, _) if require_signature => bail!("bundle is unsigned"),
         (None, _) => None,
     };
@@ -788,10 +797,9 @@ fn verify_inner(
             }
             let qm = decode_query_manifest(bytes)
                 .ok_or_else(|| anyhow!("pinned object {t} is not a QueryManifest"))?;
-            // A pin before the carried run predates the window; any other pin
-            // must be in the run, which ties every carried record to it.
-            let predates = chain.first().is_some_and(|f| qm.seq < f.seq);
-            if !predates && chain_seqs.get(&qm.seq) != Some(&t.to_string().as_str()) {
+            // The exporter carries the chain down to the lowest pin, so a pin
+            // the run omits means the chain was cut or rewritten above it.
+            if chain_seqs.get(&qm.seq) != Some(&t.to_string().as_str()) {
                 bail!(
                     "checkpoint {name} pins retrieval record {t} (sequence {}), which the \
                      bundle's chain omits: the record chain was truncated or rewritten",
@@ -822,15 +830,11 @@ fn verify_inner(
             );
         }
         check_checkpoint(h, &cp, "checkpoint_inclusion")?;
-        match (&cp.signature, &verifier) {
-            (Some(sig), Some(v)) => {
-                let payload = cp.payload_hash()?;
-                v.verify_raw(payload.as_bytes(), sig)
-                    .map_err(|e| anyhow!("checkpoint {h}: {e}"))?;
-                checkpoints_signed += 1;
-            }
-            (Some(_), None) => checkpoints_signed += 1,
-            (None, _) => {}
+        if let (Some(sig), Some(v)) = (&cp.signature, &verifier) {
+            let payload = cp.payload_hash()?;
+            v.verify_raw(payload.as_bytes(), sig)
+                .map_err(|e| anyhow!("checkpoint {h}: {e}"))?;
+            checkpoints_signed += 1;
         }
         tip_cp = Some(cp);
     }
