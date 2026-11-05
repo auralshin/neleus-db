@@ -402,8 +402,16 @@ enum DbCommands {
 
 #[derive(Debug, Subcommand)]
 enum BlobCommands {
-    Put { file: PathBuf },
-    Get { hash: String, out_file: PathBuf },
+    Put {
+        file: PathBuf,
+        /// Head whose namespace salts the blob id.
+        #[arg(long, default_value = "main")]
+        head: String,
+    },
+    Get {
+        hash: String,
+        out_file: PathBuf,
+    },
 }
 
 // PutRun carries many optional string fields; boxing here adds complexity with no runtime
@@ -412,6 +420,9 @@ enum BlobCommands {
 #[derive(Debug, Subcommand)]
 enum ManifestCommands {
     PutDoc {
+        /// Head whose namespace salts the chunk ids.
+        #[arg(long, default_value = "main")]
+        head: String,
         #[arg(long)]
         source: String,
         #[arg(long)]
@@ -441,6 +452,9 @@ enum ManifestCommands {
         acl: Vec<String>,
     },
     PutRun {
+        /// Head whose namespace salts the blob ids.
+        #[arg(long, default_value = "main")]
+        head: String,
         #[arg(long)]
         model: String,
         #[arg(long)]
@@ -679,6 +693,9 @@ enum ProofCommands {
     VerifyChunk {
         /// CBOR proof bundle produced by `proof chunk --out`.
         input: PathBuf,
+        /// Require the commit to be signed under this ed25519 public key (hex).
+        #[arg(long)]
+        public_key: Option<String>,
     },
 }
 
@@ -843,7 +860,9 @@ fn main() -> Result<()> {
             DbCommands::Pull { remote, token_env } => {
                 let token = std::env::var(&token_env).ok();
                 let db = Database::open(&db_path)?;
-                let report = neleus_db::sync::pull(&db, &remote, token.as_deref())?;
+                let report = neleus_db::sync::pull(&db, &remote, token.as_deref(), &|head| {
+                    enforce_cli_write(&db, "pack", head, false)
+                })?;
                 emit(
                     json_output,
                     serde_json::json!({
@@ -876,9 +895,10 @@ fn main() -> Result<()> {
         Commands::Blob { command } => {
             let db = Database::open(&db_path)?;
             match command {
-                BlobCommands::Put { file } => {
+                BlobCommands::Put { file, head } => {
+                    enforce_cli_write(&db, "blobs", &head, false)?;
                     let bytes = fs::read(file.clone())?;
-                    let h = db.blob_store.put(&bytes)?;
+                    let h = db.blob_store.for_head(&head).put(&bytes)?;
                     emit(
                         json_output,
                         serde_json::json!({"hash": h.to_string(), "bytes": bytes.len(), "file": file}),
@@ -901,6 +921,7 @@ fn main() -> Result<()> {
             let db = Database::open(&db_path)?;
             match command {
                 ManifestCommands::PutDoc {
+                    head,
                     source,
                     file,
                     chunk_size,
@@ -913,6 +934,7 @@ fn main() -> Result<()> {
                     expires_at,
                     acl,
                 } => {
+                    enforce_cli_write(&db, "documents", &head, false)?;
                     let bytes = fs::read(file.clone())?;
                     let metadata = neleus_db::manifest::ChunkMetadata {
                         tenant,
@@ -927,7 +949,7 @@ fn main() -> Result<()> {
                     let h = db
                         .manifest_store
                         .put_doc_manifest_from_bytes_with_metadata(
-                            &db.blob_store,
+                            &db.blob_store.for_head(&head),
                             source,
                             &bytes,
                             ChunkingSpec {
@@ -945,6 +967,7 @@ fn main() -> Result<()> {
                     )?;
                 }
                 ManifestCommands::PutRun {
+                    head,
                     model,
                     prompt_file,
                     io_hashes,
@@ -958,19 +981,24 @@ fn main() -> Result<()> {
                     started_at,
                     ended_at,
                 } => {
-                    let prompt = db.blob_store.put(&fs::read(prompt_file.clone())?)?;
                     let (inputs, outputs) = parse_io_hashes(&io_hashes)?;
-
-                    let system_prompt = system_prompt_file
-                        .map(|p| db.blob_store.put(&fs::read(p)?))
-                        .transpose()?;
-
-                    let model_parameters = build_model_parameters_blob(&db, params_json, &params)?;
-
                     let retrieved_chunk_hashes = retrieved_chunks
                         .iter()
                         .map(|s| s.parse::<Hash>())
                         .collect::<Result<Vec<_>, _>>()?;
+                    let has_provenance = provider.is_some()
+                        || !inputs.is_empty()
+                        || !retrieved_chunk_hashes.is_empty();
+                    enforce_cli_write(&db, "runs", &head, has_provenance)?;
+                    let blobs = db.blob_store.for_head(&head);
+                    let prompt = blobs.put(&fs::read(prompt_file.clone())?)?;
+
+                    let system_prompt = system_prompt_file
+                        .map(|p| blobs.put(&fs::read(p)?))
+                        .transpose()?;
+
+                    let model_parameters =
+                        build_model_parameters_blob(&blobs, params_json, &params)?;
 
                     let now = now_unix()?;
                     let run = RunManifest {
@@ -1016,7 +1044,7 @@ fn main() -> Result<()> {
                 } => {
                     let key_bytes = decode_key(&key, &key_encoding)?;
                     let value = fs::read(value_file.clone())?;
-                    enforce_cli_write(&db, "state", &head)?;
+                    enforce_cli_write(&db, "state", &head, false)?;
                     let new_root = db.state_set_at_head(&head, &key_bytes, &value)?;
                     emit(
                         json_output,
@@ -1073,6 +1101,7 @@ fn main() -> Result<()> {
                     key,
                     key_encoding,
                 } => {
+                    enforce_cli_write(&db, "state", &head, false)?;
                     let key_bytes = decode_key(&key, &key_encoding)?;
                     let new_root = db.state_del_at_head(&head, &key_bytes)?;
                     emit(
@@ -1082,6 +1111,7 @@ fn main() -> Result<()> {
                     )?;
                 }
                 StateCommands::Compact { head } => {
+                    enforce_cli_write(&db, "state", &head, false)?;
                     let compacted = db.state_compact_at_head(&head)?;
                     emit(
                         json_output,
@@ -1108,6 +1138,7 @@ fn main() -> Result<()> {
                         .iter()
                         .map(|(k, v)| (k.as_slice(), v.as_slice()))
                         .collect();
+                    enforce_cli_write(&db, "state", &head, false)?;
                     let new_root = db.state_set_many_at_head(&head, &pairs)?;
                     emit(
                         json_output,
@@ -1121,6 +1152,7 @@ fn main() -> Result<()> {
                     let key_bytes: Vec<Vec<u8>> =
                         key_strs.iter().map(|s| s.as_bytes().to_vec()).collect();
                     let keys: Vec<&[u8]> = key_bytes.iter().map(|k| k.as_slice()).collect();
+                    enforce_cli_write(&db, "state", &head, false)?;
                     let new_root = db.state_del_many_at_head(&head, &keys)?;
                     emit(
                         json_output,
@@ -1144,7 +1176,7 @@ fn main() -> Result<()> {
                         .into_iter()
                         .map(|m| m.parse::<Hash>())
                         .collect::<Result<Vec<_>, _>>()?;
-                    enforce_cli_write(&db, "commits", &head)?;
+                    enforce_cli_write(&db, "commits", &head, false)?;
                     let commit_hash = match sign_key {
                         None => {
                             db.create_commit_at_head(&head, &author, &message, manifest_hashes)?
@@ -1230,6 +1262,7 @@ fn main() -> Result<()> {
                     top_k,
                     filter,
                 } => {
+                    enforce_cli_write(engine.db(), "search", &head, false)?;
                     let q = resolve_query_text(query, query_file)?;
                     let found = engine.search(
                         &head,
@@ -1248,6 +1281,7 @@ fn main() -> Result<()> {
                     top_k,
                     filter,
                 } => {
+                    enforce_cli_write(engine.db(), "search", &head, false)?;
                     let bytes = fs::read(embedding_file)?;
                     let query_vec = neleus_db::engine::parse_embedding(&bytes)?;
                     let found = engine.search(
@@ -1269,6 +1303,7 @@ fn main() -> Result<()> {
                     top_k,
                     filter,
                 } => {
+                    enforce_cli_write(engine.db(), "search", &head, false)?;
                     let q = match (&query, &query_file) {
                         (None, None) => None,
                         _ => Some(resolve_query_text(query, query_file)?),
@@ -1397,10 +1432,17 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                ProofCommands::VerifyChunk { input } => {
+                ProofCommands::VerifyChunk { input, public_key } => {
                     let bytes = fs::read(&input)?;
                     let proof: neleus_db::ChunkProof = from_cbor(&bytes)?;
-                    match neleus_db::verify_chunk_proof(&proof) {
+                    let verifier = public_key
+                        .as_deref()
+                        .map(neleus_db::signing::Ed25519Verifier::from_public_hex)
+                        .transpose()?;
+                    match neleus_db::retrieval_proof::verify_chunk_proof_with(
+                        &proof,
+                        verifier.as_ref(),
+                    ) {
                         Ok(kind) => emit(
                             json_output,
                             serde_json::json!({
@@ -1644,6 +1686,7 @@ fn main() -> Result<()> {
                 sign_key,
             } => {
                 let engine = neleus_db::engine::Engine::open(&db_path)?;
+                enforce_cli_write(engine.db(), "erasure", "", false)?;
                 let signer = match &sign_key {
                     Some(p) => Some(neleus_db::Ed25519Signer::from_seed_file(p)?),
                     None => None,
@@ -1735,6 +1778,7 @@ fn main() -> Result<()> {
             let store = neleus_db::CheckpointStore::new(&db);
             match command {
                 CheckpointCommands::New { head, sign_key } => {
+                    enforce_cli_write(&db, "checkpoints", &head, false)?;
                     let signer = sign_key
                         .map(|p| neleus_db::signing::Ed25519Signer::from_seed_file(&p))
                         .transpose()?;
@@ -1930,7 +1974,7 @@ fn main() -> Result<()> {
                             ));
                         }
                     };
-                    enforce_cli_write(&db, "sessions", &head)?;
+                    enforce_cli_write(&db, "sessions", &head, false)?;
                     let (seq, content_hash) =
                         sessions.append(&head, &session_id, role.as_deref(), &bytes, ttl_secs)?;
                     emit(
@@ -1981,6 +2025,7 @@ fn main() -> Result<()> {
                     }
                 }
                 SessionCommands::Gc { head } => {
+                    enforce_cli_write(&db, "sessions", &head, false)?;
                     let removed = sessions.gc(&head, now_unix()?)?;
                     emit(
                         json_output,
@@ -2043,7 +2088,7 @@ fn open_browser(url: &str) -> std::io::Result<()> {
 /// `--param` flags override `--params-json` keys; sorted before hashing so equal
 /// parameter sets hash identically. Returns `None` when both sources are empty.
 fn build_model_parameters_blob(
-    db: &neleus_db::db::Database,
+    blobs: &neleus_db::BlobStore,
     params_json: Option<PathBuf>,
     params: &[String],
 ) -> Result<Option<Hash>> {
@@ -2070,7 +2115,7 @@ fn build_model_parameters_blob(
     }
 
     let json_bytes = serde_json::to_vec(&map)?;
-    Ok(Some(db.blob_store.put(&json_bytes)?))
+    Ok(Some(blobs.put(&json_bytes)?))
 }
 
 fn parse_io_hashes(values: &[String]) -> Result<(Vec<Hash>, Vec<Hash>)> {
@@ -2106,15 +2151,15 @@ fn decode_key(key: &str, enc: &KeyEncoding) -> Result<Vec<u8>> {
 
 /// Apply enforce-mode policies to a local write, mirroring the server routes so
 /// filesystem access cannot bypass compliance rules. The local operator is the
-/// principal; provenance is not asserted (CLI has no run-capture endpoint).
-fn enforce_cli_write(db: &Database, op: &str, head: &str) -> Result<()> {
+/// principal.
+fn enforce_cli_write(db: &Database, op: &str, head: &str, has_provenance: bool) -> Result<()> {
     neleus_db::policy::enforce_write(
         db,
         &neleus_db::policy::WriteContext {
             op,
             head,
             principal: Some("cli"),
-            has_provenance: false,
+            has_provenance,
         },
     )
 }

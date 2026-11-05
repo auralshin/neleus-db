@@ -106,7 +106,7 @@ impl BlobStore {
         let hash = hash_blob(&payload);
         let framed = compression::frame(&payload, self.compress)?;
         let stored = match &self.encryption {
-            Some(runtime) => runtime.encrypt(&framed)?,
+            Some(runtime) => runtime.encrypt(&framed, hash.as_bytes())?,
             None => framed,
         };
         self.cas.put_existing_hash(hash, &stored)?;
@@ -122,7 +122,7 @@ impl BlobStore {
             let hash = hash_blob(&payload);
             let framed = compression::frame(&payload, self.compress)?;
             let stored = match &self.encryption {
-                Some(runtime) => runtime.encrypt(&framed)?,
+                Some(runtime) => runtime.encrypt(&framed, hash.as_bytes())?,
                 None => framed,
             };
             Ok((hash, stored))
@@ -176,7 +176,7 @@ impl BlobStore {
     fn read_payload(&self, hash: Hash, verify: bool) -> Result<Vec<u8>> {
         let raw = self.cas.get(hash)?;
         let after_decrypt = match &self.encryption {
-            Some(runtime) => runtime.decrypt(&raw)?,
+            Some(runtime) => runtime.decrypt(&raw, hash.as_bytes())?,
             None => raw,
         };
         let payload = compression::unframe(&after_decrypt)?.into_owned();
@@ -196,14 +196,17 @@ impl BlobStore {
         Ok(payload)
     }
 
+    pub fn refresh_packs(&self) {
+        self.cas.refresh_packs();
+    }
+
     pub fn exists(&self, hash: Hash) -> bool {
         self.cas.exists(hash)
     }
 
     /// Authorized erasure (GDPR): evict the plaintext cache for these blobs and
-    /// shred their stored bytes. `physical` zero-overwrites before unlink, but
-    /// that is best-effort on COW filesystems and SSDs — crypto-shredding
-    /// (encryption on) is the robust guarantee. See `CasStore::shred_many`.
+    /// shred their stored bytes. `physical` zero-overwrites before unlink,
+    /// best-effort on COW filesystems and SSDs. See `CasStore::shred_many`.
     pub fn shred(&self, hashes: &[Hash], physical: bool) -> Result<()> {
         {
             let mut cache = self.cache.write().expect("blob cache poisoned");

@@ -10,7 +10,7 @@ use crate::db::Database;
 use crate::hash::Hash;
 
 pub const SESSION_SCHEMA_VERSION: u32 = 1;
-const SESSION_PREFIX: &str = "__session__/";
+pub(crate) const SESSION_PREFIX: &str = "__session__/";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
@@ -76,25 +76,31 @@ impl<'a> SessionStore<'a> {
     ) -> Result<(u64, Hash)> {
         Self::validate_id(session_id)?;
         let now = now_unix()?;
-        let seq = self.next_seq(head, session_id)?;
         let content_hash = self.db.blob_store.for_head(head).put(content)?;
-        let record = SessionRecord {
-            schema_version: SESSION_SCHEMA_VERSION,
-            session_id: session_id.to_string(),
-            seq,
-            role: role.map(str::to_string),
-            content: content_hash,
-            created_at: now,
-            expires_at: ttl_secs.map(|t| now.saturating_add(t)),
-        };
-        let bytes = crate::canonical::to_cbor(&record)?;
-        self.db
-            .state_set_at_head(head, &Self::key(session_id, seq), &bytes)?;
+        // The seq is chosen from the root the CAS publishes against, so two
+        // appenders cannot mint the same turn.
+        let mut seq = 0;
+        self.db.apply_state_update_with_cas(head, |base_root| {
+            seq = self.next_seq(base_root, session_id)?;
+            let record = SessionRecord {
+                schema_version: SESSION_SCHEMA_VERSION,
+                session_id: session_id.to_string(),
+                seq,
+                role: role.map(str::to_string),
+                content: content_hash,
+                created_at: now,
+                expires_at: ttl_secs.map(|t| now.saturating_add(t)),
+            };
+            let bytes = crate::canonical::to_cbor(&record)?;
+            self.db
+                .state_store
+                .for_head(head)
+                .set(base_root, &Self::key(session_id, seq), &bytes)
+        })?;
         Ok((seq, content_hash))
     }
 
-    fn next_seq(&self, head: &str, session_id: &str) -> Result<u64> {
-        let root = self.db.resolve_state_root(head)?;
+    fn next_seq(&self, root: Hash, session_id: &str) -> Result<u64> {
         let prefix = Self::session_prefix(session_id);
         let entries = self.db.state_store.scan_prefix(root, &prefix)?;
         // Keys are zero-padded hex, so the max is the last one.
@@ -164,8 +170,10 @@ impl<'a> SessionStore<'a> {
             return Ok(0);
         }
         let refs: Vec<&[u8]> = expired.iter().map(|k| k.as_slice()).collect();
-        self.db.state_del_many_at_head(head, &refs)?;
-        self.db.state_compact_at_head(head)?;
+        self.db.apply_state_update_with_cas(head, |base_root| {
+            let root = self.db.state_store.del_many(base_root, &refs)?;
+            self.db.state_store.compact(root)
+        })?;
         Ok(expired.len())
     }
 }
@@ -279,6 +287,15 @@ mod tests {
         );
         assert_eq!(sessions.gc("main", now + 60).unwrap(), 0);
         assert_eq!(sessions.list("main", "s", None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn session_keys_cannot_be_written_through_state() {
+        let (_tmp, db) = test_db();
+        let err = db
+            .state_set_at_head("main", b"__session__/s/0000000000000000", b"x")
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]

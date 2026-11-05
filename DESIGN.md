@@ -157,8 +157,8 @@ named entries, a BLAKE3 footer, and an optional ed25519 signature over it.
 - `checkpoints/<hash>`: the latest checkpoint only, with
   `checkpoint_inclusion` showing its commit is the last leaf of its log root
 - `pinned/<hash>`: the record that checkpoint pins
-- `edge/<hash>`: the record before the window and every record from the window
-  up to each pin, so the window is provably complete
+- `edge/<hash>`: every record from the lowest pin up to the window and from the
+  window up to the highest pin, so the window is provably complete
 - with `--anchor`: `anchor/<hash>`, `anchor_inclusion`, and a consistency proof
   from the retained checkpoint
 
@@ -168,8 +168,9 @@ re-chaining at or below the anchor's pin is rejected.
 ## Erasure
 
 `erase_subject` shreds blobs referenced only by one subject's runs, documents,
-and the retrievals that returned them; shared blobs are kept. It crypto-shreds
-when encryption is on and deletes otherwise. Manifests, commits, and
+and the retrievals that returned them; shared blobs are kept. Blobs are
+overwritten and deleted; encryption does not add a crypto-shred, because
+per-blob keys derive from the master key. Manifests, commits, and
 checkpoints stay, so the chain still verifies. A signed `ErasureRecord` in the
 event log marks the deletion as authorized rather than tampering. A chunk proof
 for erased content sets `content_erased` and carries no bytes. Heads whose

@@ -187,6 +187,7 @@ impl HnswGraph {
                 &mut links,
                 node,
                 found,
+                max_level,
                 &mut entry_point,
                 &mut max_level,
             );
@@ -213,6 +214,7 @@ impl HnswGraph {
                     &mut links,
                     node,
                     layers,
+                    ml,
                     &mut entry_point,
                     &mut max_level,
                 );
@@ -327,11 +329,14 @@ fn apply_insert(
     links: &mut [Vec<Vec<u32>>],
     node: u32,
     per_layer: Vec<Vec<(f32, u32)>>,
+    searched_level: usize,
     entry_point: &mut u32,
     max_level: &mut usize,
 ) {
     let node_level = links[node as usize].len() - 1;
-    let top = node_level.min(*max_level);
+    // `per_layer` was found against `searched_level`; a batch-mate may have
+    // raised `max_level` since, which must not shift these layers up.
+    let top = node_level.min(searched_level);
     for (i, found) in per_layer.into_iter().enumerate() {
         let layer = top - i;
         let m_max = if layer == 0 { M0 } else { M };

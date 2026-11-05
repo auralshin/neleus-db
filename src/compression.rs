@@ -13,10 +13,23 @@ pub fn compress(bytes: &[u8]) -> Result<Vec<u8>> {
     zstd::encode_all(bytes, 0).map_err(|e| anyhow!("zstd compress failed: {e}"))
 }
 
+/// Upper bound on one inflated object, so a crafted frame cannot exhaust memory.
+pub const MAX_DECOMPRESSED_BYTES: u64 = 4 << 30;
+
 /// Inflate a zstd frame. Callers that store their own compressed/raw flag use
 /// this directly; CAS payloads go through [`frame`] / [`unframe`].
 pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(bytes).map_err(|e| anyhow!("zstd decompress failed: {e}"))
+    use std::io::Read;
+    let mut out = Vec::new();
+    zstd::Decoder::new(bytes)
+        .and_then(|d| d.take(MAX_DECOMPRESSED_BYTES + 1).read_to_end(&mut out))
+        .map_err(|e| anyhow!("zstd decompress failed: {e}"))?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(anyhow!(
+            "zstd frame inflates past {MAX_DECOMPRESSED_BYTES} bytes; refusing"
+        ));
+    }
+    Ok(out)
 }
 
 /// Tag `bytes` for storage, compressing when `compressed` is set.

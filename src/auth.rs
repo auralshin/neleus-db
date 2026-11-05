@@ -10,8 +10,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-use crate::atomic::write_atomic;
-
 pub const AUTH_SCHEMA_VERSION: u32 = 1;
 const TOKEN_PREFIX: &str = "nlk_";
 
@@ -87,14 +85,7 @@ fn load_file(db_root: &Path) -> Result<AuthFile> {
 }
 
 fn store_file(db_root: &Path, file: &AuthFile) -> Result<()> {
-    let path = auth_path(db_root);
-    write_atomic(&path, &serde_json::to_vec_pretty(file)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::atomic::write_atomic_private(&auth_path(db_root), &serde_json::to_vec_pretty(file)?)
 }
 
 /// Constant-time equality; length leaks, but inputs are fixed-size digests.

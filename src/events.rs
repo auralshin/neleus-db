@@ -48,7 +48,8 @@ fn entry_hash(seq: u64, timestamp: u64, kind: &str, prev: &str, data: &Value) ->
 /// Read all events in order. Returns empty if the log does not exist.
 pub fn read(db_root: &Path) -> Result<Vec<Event>> {
     match fs::read(log_path(db_root)) {
-        Ok(bytes) => bytes
+        // An unterminated last line is a torn append and is not an entry.
+        Ok(bytes) => bytes[..bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)]
             .split(|&b| b == b'\n')
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_slice::<Event>(l).map_err(Into::into))
@@ -85,16 +86,50 @@ fn read_tip(db_root: &Path) -> Result<Option<Event>> {
     let mut buf = vec![0u8; window as usize];
     f.read_exact(&mut buf)?;
 
-    // The last line is whole (every append ends in a newline). A window that
-    // caught no line break at all may have split one, so re-read in full.
+    // Only terminated lines count: an unterminated tail is a torn append. A
+    // window that caught no earlier line break may have split a line, so
+    // re-read in full.
     let text = String::from_utf8_lossy(&buf);
-    let last = text.lines().rfind(|l| !l.trim().is_empty());
+    let whole = &text[..text.rfind('\n').map_or(0, |i| i + 1)];
+    let last = whole.lines().rfind(|l| !l.trim().is_empty());
     match last {
-        Some(line) if window == len || text[..text.len() - line.len()].contains('\n') => {
+        Some(line) if window == len || whole[..whole.len() - line.len() - 1].contains('\n') => {
             Ok(Some(serde_json::from_str(line)?))
         }
         _ => Ok(read(db_root)?.pop()),
     }
+}
+
+/// Drop an unterminated last line left by a crash mid-append, so the next
+/// entry does not fuse with it. Called under the append lock.
+fn truncate_torn_tail(path: &Path) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    f.seek(SeekFrom::Start(len - 1))?;
+    f.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    f.seek(SeekFrom::Start(0))?;
+    f.read_to_end(&mut bytes)?;
+    let keep = bytes
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i as u64 + 1);
+    f.set_len(keep)?;
+    crate::atomic::maybe_sync_file(&f)?;
+    Ok(())
 }
 
 /// Newest entry's sequence, or `None` if empty. Reads a tail window, not the log.
@@ -127,6 +162,7 @@ pub fn append(db_root: &Path, kind: &str, data: Value) -> Result<Event> {
     let dir = db_root.join("meta");
     fs::create_dir_all(&dir)?;
     let _lock = crate::lock::flock_exclusive(dir.join(".events.lock"), Duration::from_secs(10))?;
+    truncate_torn_tail(&log_path(db_root))?;
 
     let (seq, prev) = match read_tip(db_root)? {
         Some(tip) => (tip.seq + 1, tip.hash),
@@ -197,6 +233,23 @@ mod tests {
         append(root, "big", json!({"blob": big})).unwrap();
         append(root, "after", json!({"i": 2})).unwrap();
         assert_eq!(verify(root).unwrap(), 3, "chain must stay intact");
+    }
+
+    #[test]
+    fn torn_tail_is_repaired_on_append() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let first = append(root, "a", json!({})).unwrap();
+        let path = log_path(root);
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(br#"{"seq":1,"timestamp":0,"kind":"torn"#)
+            .unwrap();
+        drop(f);
+        assert_eq!(tip(root).unwrap().unwrap().0, first.seq);
+        let next = append(root, "b", json!({})).unwrap();
+        assert_eq!(next.seq, 1);
+        assert_eq!(next.prev, first.hash);
+        assert_eq!(verify(root).unwrap(), 2);
     }
 
     #[test]

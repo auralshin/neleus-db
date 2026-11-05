@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::canonical::{from_cbor, to_cbor};
 use crate::checkpoint::{CHECKPOINT_TAG, Checkpoint, CheckpointStore, verify_commit_logged};
-use crate::commit::{COMMIT_TAG, Commit, CommitHash};
+use crate::commit::{COMMIT_TAG, Commit, CommitHash, CommitVerifier};
 use crate::db::Database;
 use crate::hash::{Hash, hash_blob, hash_typed};
 use crate::manifest::{
@@ -217,7 +217,17 @@ pub fn prove_chunk_anchored(
 
 /// Verify a [`ChunkProof`] offline. Returns the kind of manifest that
 /// anchored the chunk (`"doc"`, `"chunk"`, `"summary"`, `"run"`).
+/// Any commit signature is checked only under the key the commit names.
 pub fn verify_chunk_proof(proof: &ChunkProof) -> Result<&'static str> {
+    verify_chunk_proof_with(proof, None::<&crate::signing::Ed25519Verifier>)
+}
+
+/// Like [`verify_chunk_proof`], but with `verifier` the commit must be signed
+/// under that trusted key, which is what attributes the proof to an author.
+pub fn verify_chunk_proof_with<V: CommitVerifier>(
+    proof: &ChunkProof,
+    verifier: Option<&V>,
+) -> Result<&'static str> {
     if proof.schema_version != CHUNK_PROOF_SCHEMA_VERSION {
         return Err(anyhow!(
             "unsupported proof schema version {}",
@@ -230,7 +240,19 @@ pub fn verify_chunk_proof(proof: &ChunkProof) -> Result<&'static str> {
     }
     let commit: Commit = from_cbor(&proof.commit_bytes)
         .map_err(|e| anyhow!("commit bytes do not decode as a commit: {e}"))?;
-    crate::signing::verify_commit_signature(&commit).map_err(|e| anyhow!("commit: {e}"))?;
+    match verifier {
+        Some(v) => {
+            let expected = commit.unsigned_payload_hash()?;
+            if commit.signature.is_none() || commit.payload_hash != Some(expected) {
+                return Err(anyhow!("commit {} is not signed", proof.commit));
+            }
+            v.verify(proof.commit, &commit, expected)
+                .map_err(|e| anyhow!("commit {}: {e}", proof.commit))?;
+        }
+        None => {
+            crate::signing::verify_commit_signature(&commit).map_err(|e| anyhow!("commit: {e}"))?;
+        }
+    }
 
     // 2. The commit's state indexes the manifest.
     let key = crate::db::manifest_index_key(proof.manifest_hash);
@@ -508,6 +530,41 @@ mod tests {
         let mut proof = prove_chunk(&db, commit, chunk, false).unwrap();
         proof.chunk_hash = hash_blob(b"some other chunk");
         assert!(verify_chunk_proof(&proof).is_err());
+    }
+
+    #[test]
+    fn trusted_key_rejects_unsigned_and_foreign_signed_commits() {
+        use crate::signing::{Ed25519Signer, Ed25519Verifier, generate_keypair_file};
+
+        let (tmp, mut db) = test_db();
+        let key_a = generate_keypair_file(&tmp.path().join("a.key")).unwrap();
+        let key_b = generate_keypair_file(&tmp.path().join("b.key")).unwrap();
+        let a = Ed25519Verifier::from_public_hex(&key_a).unwrap();
+        let b = Ed25519Verifier::from_public_hex(&key_b).unwrap();
+
+        let (doc_hash, chunk) = ingest(&db, b"unsigned chunk");
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![doc_hash])
+            .unwrap();
+        let proof = prove_chunk(&db, commit, chunk, false).unwrap();
+        assert_eq!(verify_chunk_proof(&proof).unwrap(), "doc");
+        assert!(
+            verify_chunk_proof_with(&proof, Some(&a))
+                .unwrap_err()
+                .to_string()
+                .contains("not signed")
+        );
+
+        db.commit_store.set_signer(std::sync::Arc::new(
+            Ed25519Signer::from_seed_file(&tmp.path().join("a.key")).unwrap(),
+        ));
+        let (doc_hash, chunk) = ingest(&db, b"signed chunk");
+        let commit = db
+            .create_commit_at_head("main", "agent", "m", vec![doc_hash])
+            .unwrap();
+        let proof = prove_chunk(&db, commit, chunk, false).unwrap();
+        assert_eq!(verify_chunk_proof_with(&proof, Some(&a)).unwrap(), "doc");
+        assert!(verify_chunk_proof_with(&proof, Some(&b)).is_err());
     }
 
     #[test]

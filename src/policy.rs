@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 use anyhow::{Result, anyhow};
 
-use crate::atomic::write_atomic;
 use crate::commit::{Commit, CommitStore};
 use crate::db::Database;
 use crate::engine::Engine;
@@ -176,6 +175,20 @@ impl PolicySet {
                     p.id
                 ));
             }
+            if p.mode == Mode::Enforce
+                && matches!(
+                    p.rule,
+                    Rule::RequireTamperEvidentChain
+                        | Rule::RequireSignedCheckpoints
+                        | Rule::RequireSignedCommits
+                )
+            {
+                return Err(anyhow!(
+                    "policy '{}': {} checks history, not a write; use mode monitor",
+                    p.id,
+                    p.rule.id()
+                ));
+            }
         }
         Ok(())
     }
@@ -200,7 +213,8 @@ pub fn store(db_root: &std::path::Path, mut set: PolicySet) -> Result<PolicySet>
     set.validate()?;
     set.schema_version = POLICY_SCHEMA_VERSION;
     set.updated_at = crate::clock::now_unix()?;
-    write_atomic(&policy_path(db_root), &serde_json::to_vec_pretty(&set)?)?;
+    // Holds the webhook URL, which may carry a bearer secret.
+    crate::atomic::write_atomic_private(&policy_path(db_root), &serde_json::to_vec_pretty(&set)?)?;
     Ok(set)
 }
 
@@ -595,6 +609,23 @@ mod tests {
         assert_eq!(find("signed").status, Status::Fail); // tip commit is unsigned
         assert_eq!(find("chain").status, Status::Fail); // no checkpoint chain
         assert_eq!(find("prin").status, Status::Pass); // no retrievals in window
+    }
+
+    #[test]
+    fn historical_rules_cannot_be_enforce_mode() {
+        let set = PolicySet {
+            policies: vec![Policy {
+                id: "signed".into(),
+                description: String::new(),
+                heads: vec![],
+                rule: Rule::RequireSignedCommits,
+                mode: Mode::Enforce,
+                severity: Severity::Required,
+                enabled: true,
+            }],
+            ..Default::default()
+        };
+        assert!(set.validate().unwrap_err().to_string().contains("monitor"));
     }
 
     #[test]

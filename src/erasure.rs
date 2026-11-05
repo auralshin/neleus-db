@@ -32,7 +32,8 @@ pub struct ErasureRecord {
     pub blobs: Vec<Hash>,
     /// `request` | `ttl` | `account-closure`.
     pub reason: String,
-    /// `crypto-shred` (encryption on) | `physical` (encryption off).
+    /// Always `physical`: overwritten best-effort, then unlinked. Encryption
+    /// adds nothing here because per-blob keys derive from the master key.
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<String>,
@@ -66,25 +67,23 @@ pub struct EraseOptions<'a> {
 /// record to the event log.
 pub fn erase_subject(engine: &Engine, subject: &str, opts: EraseOptions) -> Result<ErasureRecord> {
     let db = engine.db();
+    // Repack and GC rewrite packs; a shred racing them could be resurrected.
+    let _maintenance = crate::lock::flock_exclusive(
+        db.root.join("meta").join("maintenance.lock"),
+        std::time::Duration::from_secs(30),
+    )?;
     let scan = scan_subject_blobs(db, subject)?;
     let mut blobs: Vec<Hash> = scan.mine.difference(&scan.foreign).copied().collect();
     blobs.sort();
 
-    let encrypted = db.config.encryption.as_ref().is_some_and(|e| e.enabled);
     let touched_index = blobs.iter().any(|b| scan.chunk_content.contains(b));
-    db.blob_store.shred(&blobs, !encrypted)?;
 
     let mut record = ErasureRecord {
         schema_version: ERASURE_SCHEMA_VERSION,
         subject: subject.to_string(),
-        blobs,
+        blobs: blobs.clone(),
         reason: opts.reason.to_string(),
-        method: if encrypted {
-            "crypto-shred"
-        } else {
-            "physical"
-        }
-        .to_string(),
+        method: "physical".to_string(),
         requested_by: opts.requested_by.map(str::to_string),
         erased_at: crate::clock::now_unix()?,
         signed_by: None,
@@ -95,9 +94,11 @@ pub fn erase_subject(engine: &Engine, subject: &str, opts: EraseOptions) -> Resu
         record.signed_by = Some(signer.public_key_hex());
         record.signature = Some(hex::encode(sig));
     }
-    // Record before reindexing: the rebuild reads shredded blobs and relies on
-    // `covers()` (which reads this event) to skip them instead of erroring.
+    // Record before shredding and reindexing: a crash after the record leaves
+    // blobs that `covers()` already treats as erased, never missing blobs with
+    // no record; the rebuild relies on the same event to skip them.
     crate::events::append(&db.root, "erasure", serde_json::to_value(&record)?)?;
+    db.blob_store.shred(&blobs, true)?;
 
     // Shredded chunk text/vectors still live as derived copies in index
     // segments; rebuild every head so they physically drop out.

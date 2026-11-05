@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
 
-use crate::atomic::build_temp_name;
+use crate::atomic::{build_temp_name, maybe_sync_dir, maybe_sync_file};
 use crate::compression;
 
 const MAGIC: &[u8; 8] = b"NELEUSPK";
@@ -141,6 +141,7 @@ pub fn pack(db_root: &Path, out_file: &Path, compress: bool) -> Result<PackStats
 
     w.write_all(h.finalize().as_bytes())?;
     w.flush()?;
+    maybe_sync_file(w.get_ref())?;
     drop(w);
 
     harden_output_file(out_file)?;
@@ -220,6 +221,9 @@ pub fn unpack(pack_file: &Path, db_root: &Path, force: bool) -> Result<PackStats
     fs::rename(&staging, db_root)
         .with_context(|| format!("moving unpacked db into {}", db_root.display()))?;
     harden_dir(db_root)?;
+    if let Some(parent) = db_root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        maybe_sync_dir(parent)?;
+    }
 
     Ok(PackStats {
         entries: count as usize,
@@ -423,6 +427,7 @@ fn write_file_streamed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u64
         remaining -= n as u64;
     }
     w.flush()?;
+    maybe_sync_file(w.get_ref())?;
     Ok(())
 }
 
@@ -449,6 +454,7 @@ fn write_file_compressed<R: Read>(r: &mut R, h: &mut Hasher, dest: &Path, len: u
     let mut w = BufWriter::new(file);
     w.write_all(&raw)?;
     w.flush()?;
+    maybe_sync_file(w.get_ref())?;
     Ok(raw.len() as u64)
 }
 

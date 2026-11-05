@@ -52,13 +52,14 @@ pub fn manifest_index_key(manifest: Hash) -> Vec<u8> {
 
 pub const MANIFEST_INDEX_PREFIX: &str = "__manifests__/";
 
-/// The manifest index backs chunk proofs, so only commits may write it.
+/// The manifest index backs chunk proofs and session records name blobs the
+/// session API serves, so only commits and the session store write them.
 fn reject_reserved<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> Result<()> {
     for key in keys {
-        if key.starts_with(MANIFEST_INDEX_PREFIX.as_bytes()) {
-            return Err(anyhow::anyhow!(
-                "state keys under '{MANIFEST_INDEX_PREFIX}' are reserved for the manifest index"
-            ));
+        for prefix in [MANIFEST_INDEX_PREFIX, crate::session::SESSION_PREFIX] {
+            if key.starts_with(prefix.as_bytes()) {
+                return Err(anyhow::anyhow!("state keys under '{prefix}' are reserved"));
+            }
         }
     }
     Ok(())
@@ -129,12 +130,16 @@ impl Database {
     /// state root.
     pub fn init(path: impl AsRef<Path>) -> Result<()> {
         let secret = hex::encode(crate::encryption::utils::random_bytes(32)?);
-        Self::init_with_secret(path, &secret)
+        Self::init_with_secret(path, &secret, None)
     }
 
-    /// [`Self::init`] with a given secret, for a replica of an existing
-    /// database.
-    pub fn init_with_secret(path: impl AsRef<Path>, secret: &str) -> Result<()> {
+    /// [`Self::init`] with a given secret and encryption config, for a replica
+    /// of an existing database.
+    pub fn init_with_secret(
+        path: impl AsRef<Path>,
+        secret: &str,
+        encryption: Option<EncryptionConfig>,
+    ) -> Result<()> {
         parse_secret(secret)?;
         let root = path.as_ref();
         fs::create_dir_all(root).with_context(|| format!("failed creating {}", root.display()))?;
@@ -154,13 +159,13 @@ impl Database {
                 created_at: now_unix()?,
                 verify_on_read: true,
                 compression: None,
-                encryption: None,
+                encryption,
                 durability: None,
                 retention_min_secs: None,
                 secret: secret.to_string(),
             };
             let bytes = serde_json::to_vec_pretty(&cfg)?;
-            write_atomic(&cfg_path, &bytes)?;
+            crate::atomic::write_atomic_private(&cfg_path, &bytes)?;
         }
 
         let db = Self::open(root)?;
@@ -423,7 +428,7 @@ impl Database {
         self.state_store.empty_root()
     }
 
-    fn apply_state_update_with_cas<F>(&self, head: &str, mut op: F) -> Result<Hash>
+    pub(crate) fn apply_state_update_with_cas<F>(&self, head: &str, mut op: F) -> Result<Hash>
     where
         F: FnMut(Hash) -> Result<Hash>,
     {
@@ -500,6 +505,9 @@ impl Database {
         let mut count = 0usize;
         for dir in [self.root.join("blobs"), self.root.join("objects")] {
             count += reencrypt_cas_dir(&dir, &old_runtime, &new_runtime)?;
+            count += crate::packstore::rewrite_packs_mapping(&dir, &|hash, raw| {
+                reencrypt_bytes(raw, hash, &old_runtime, &new_runtime)
+            })?;
         }
 
         // Persist the config (algorithm/iterations unchanged; master_salt is
@@ -507,7 +515,7 @@ impl Database {
         // otherwise old ciphertext on disk becomes unreadable).
         let cfg_path = self.root.join("meta").join("config.json");
         let bytes = serde_json::to_vec_pretty(&self.config)?;
-        crate::atomic::write_atomic(&cfg_path, &bytes)?;
+        crate::atomic::write_atomic_private(&cfg_path, &bytes)?;
 
         Ok(count)
     }
@@ -515,9 +523,6 @@ impl Database {
     /// Consolidate loose `blobs/` and `objects/` into pack files, removing the
     /// loose copies. Crash-safe (pack fsynced before any delete) and held under
     /// `meta/maintenance.lock` so repack and GC can't run at once.
-    ///
-    /// Reopen the `Database` afterwards to observe the new packs — this handle
-    /// may have cached an older index ([`Self::rotate_encryption_key`] contract).
     pub fn repack(&self) -> Result<RepackSummary> {
         let _lock = flock_exclusive(
             self.root.join("meta").join("maintenance.lock"),
@@ -611,38 +616,43 @@ fn reencrypt_cas_dir(
             count += reencrypt_cas_dir(&path, old_runtime, new_runtime)?;
             continue;
         }
-        let is_content = path
+        let Some(hash) = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.len() == 64 && n.chars().all(|c| c.is_ascii_hexdigit()))
-            .unwrap_or(false);
-        if !is_content {
+            .and_then(|n| n.parse::<Hash>().ok())
+        else {
             continue;
-        }
-
-        let raw = fs::read(&path)?;
-
-        let plaintext = match old_runtime.decrypt(&raw) {
-            Ok(p) => p,
-            Err(_) => {
-                // Old key failed — was this file already rotated?
-                if new_runtime.decrypt(&raw).is_ok() {
-                    // Yes; leave it. Resumes a previously-interrupted run.
-                    continue;
-                }
-                return Err(anyhow::anyhow!(
-                    "rotation aborted: {} decrypts with neither old nor new key (likely corrupted)",
-                    path.display()
-                ));
-            }
         };
 
-        let new_ciphertext = new_runtime.encrypt(&plaintext)?;
-        crate::atomic::write_atomic(&path, &new_ciphertext)?;
-        count += 1;
+        let raw = fs::read(&path)?;
+        if let Some(rotated) = reencrypt_bytes(&raw, hash, old_runtime, new_runtime)
+            .with_context(|| format!("rotation aborted: {}", path.display()))?
+        {
+            crate::atomic::write_atomic(&path, &rotated)?;
+            count += 1;
+        }
     }
 
     Ok(count)
+}
+
+/// `None` when `raw` already reads under the new key (an interrupted run).
+fn reencrypt_bytes(
+    raw: &[u8],
+    hash: Hash,
+    old_runtime: &EncryptionRuntime,
+    new_runtime: &EncryptionRuntime,
+) -> Result<Option<Vec<u8>>> {
+    let plaintext = match old_runtime.decrypt(raw, hash.as_bytes()) {
+        Ok(p) => p,
+        Err(_) if new_runtime.decrypt(raw, hash.as_bytes()).is_ok() => return Ok(None),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "{hash} decrypts with neither old nor new key (likely corrupted)"
+            ));
+        }
+    };
+    Ok(Some(new_runtime.encrypt(&plaintext, hash.as_bytes())?))
 }
 
 #[cfg(test)]
@@ -1003,11 +1013,10 @@ mod tests {
         db
     }
 
-    /// GDPR crypto-shred path: with encryption on, erasing a subject deletes
-    /// the per-blob envelope (unrecoverable, no key) and purges the index. This
-    /// is the robust erasure guarantee documented on `BlobStore::shred`.
+    /// With encryption on, erasing a subject still overwrites and unlinks the
+    /// envelope and purges the index; unlinking alone would destroy no key.
     #[test]
-    fn encrypted_erasure_crypto_shreds_and_purges_index() {
+    fn encrypted_erasure_shreds_and_purges_index() {
         use crate::engine::{Engine, SearchFilter};
         use crate::erasure::{EraseOptions, covers, erase_subject};
         use crate::manifest::{ChunkMetadata, ChunkingSpec};
@@ -1082,8 +1091,7 @@ mod tests {
         )
         .unwrap();
 
-        // Crypto-shred, not physical overwrite, because encryption is on.
-        assert_eq!(rec.method, "crypto-shred");
+        assert_eq!(rec.method, "physical");
         assert!(rec.blobs.contains(&alice_chunk));
         assert!(
             !engine.db().blob_store.exists(alice_chunk),
@@ -1192,6 +1200,37 @@ mod tests {
         unsafe { std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "new-strong-password") };
         let db = Database::open(&db_root).unwrap();
         assert_eq!(db.blob_store.get(h).unwrap(), b"secret-payload");
+    }
+
+    #[test]
+    fn rotate_encryption_key_covers_packed_objects() {
+        let _guard = encryption_test_lock();
+        let tmp = TempDir::new().unwrap();
+        let db_root = tmp.path().join("neleus_db");
+        let db = init_encrypted_db(&db_root, "old-password");
+        let h = db.blob_store.put(b"packed-secret").unwrap();
+        db.repack().unwrap();
+        assert_eq!(loose_count(&db_root.join("blobs")), 0);
+        assert!(db.rotate_encryption_key("new-password").unwrap() > 0);
+        drop(db);
+        // SAFETY: serialized via `encryption_test_lock`.
+        unsafe { std::env::set_var("NELEUS_DB_ENCRYPTION_PASSWORD", "new-password") };
+        let db = Database::open(&db_root).unwrap();
+        assert_eq!(db.blob_store.get(h).unwrap(), b"packed-secret");
+    }
+
+    #[test]
+    fn init_with_secret_keeps_replica_encryption_config() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("replica");
+        let enc = EncryptionConfig {
+            enabled: false,
+            algorithm: "chacha20-poly1305".into(),
+            ..EncryptionConfig::default()
+        };
+        Database::init_with_secret(&root, &"07".repeat(32), Some(enc)).unwrap();
+        let cfg = load_config(&root.join("meta").join("config.json")).unwrap();
+        assert_eq!(cfg.encryption.unwrap().algorithm, "chacha20-poly1305");
     }
 
     /// Issue #3: rotation must fail loudly on a genuinely-corrupted file

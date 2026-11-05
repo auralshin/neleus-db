@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::atomic::{build_temp_name, maybe_sync_dir, maybe_sync_file};
+use crate::atomic::{build_temp_name, create_dir_durable, maybe_sync_dir, maybe_sync_file};
 use crate::hash::Hash;
 use crate::packstore::PackSet;
 
@@ -16,8 +16,7 @@ const PACK_WRITE_THRESHOLD: usize = 1024;
 pub struct CasStore {
     root: PathBuf,
     /// Pack index, lazily loaded and shared across clones. Refreshed after
-    /// this handle writes a pack (`put_many`); a repack by ANOTHER process is
-    /// seen only by stores built after it (reopen the `Database`).
+    /// this handle writes a pack and whenever a read finds it stale.
     packs: Arc<RwLock<Option<Arc<PackSet>>>>,
 }
 
@@ -41,7 +40,7 @@ impl CasStore {
         slot.as_ref().map(Arc::clone).unwrap_or(loaded)
     }
 
-    fn refresh_packs(&self) {
+    pub fn refresh_packs(&self) {
         let loaded = Arc::new(PackSet::load(&self.root).unwrap_or_default());
         *self.packs.write().expect("pack cache poisoned") = Some(loaded);
     }
@@ -51,11 +50,10 @@ impl CasStore {
     /// Deliberately deletes *reachable* content — the opposite of GC — so the
     /// caller must record a signed ErasureRecord.
     ///
-    /// `physical` zero-overwrites a loose file before unlink, but this is
-    /// best-effort: on copy-on-write filesystems (APFS, Btrfs, ZFS) and on SSDs
-    /// (wear-leveling) the original blocks may persist until the FS/FTL reclaims
-    /// them. The robust guarantee is crypto-shredding — run with encryption on
-    /// so erasure drops the per-blob key, or place the DB on encrypted media.
+    /// `physical` zero-overwrites a loose file before unlink, best-effort: on
+    /// copy-on-write filesystems (APFS, Btrfs, ZFS) and on SSDs the original
+    /// blocks may persist until reclaimed. Encryption does not change this:
+    /// per-blob keys derive from the master key, so unlinking destroys no key.
     pub fn shred_many(&self, hashes: &[Hash], physical: bool) -> Result<()> {
         use std::collections::HashSet;
         let targets: HashSet<Hash> = hashes.iter().copied().collect();
@@ -64,11 +62,18 @@ impl CasStore {
         }
         for h in &targets {
             let path = self.path_for(*h);
-            if path.exists() {
-                if physical && let Ok(len) = fs::metadata(&path).map(|m| m.len()) {
-                    let _ = fs::write(&path, vec![0u8; len as usize]);
-                }
-                fs::remove_file(&path).with_context(|| format!("shredding loose object {h}"))?;
+            if !path.exists() {
+                continue;
+            }
+            if physical {
+                let len = fs::metadata(&path)?.len();
+                let mut f = OpenOptions::new().write(true).open(&path)?;
+                f.write_all(&vec![0u8; len as usize])?;
+                maybe_sync_file(&f)?;
+            }
+            fs::remove_file(&path).with_context(|| format!("shredding loose object {h}"))?;
+            if let Some(parent) = path.parent() {
+                maybe_sync_dir(parent)?;
             }
         }
         // Name the objects to drop rather than the ones to keep: a keep-set
@@ -103,7 +108,7 @@ impl CasStore {
             return Ok(());
         }
         let pack_dir = self.root.join(crate::packstore::PACK_DIR);
-        fs::create_dir_all(&pack_dir)?;
+        create_dir_durable(&pack_dir)?;
         let count = fresh.len();
         crate::packstore::write_pack(
             &pack_dir,
@@ -117,7 +122,14 @@ impl CasStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+}
 
+/// Set a file's mtime to now, read-only open so it works on any object.
+fn touch(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path)?.set_modified(std::time::SystemTime::now())
+}
+
+impl CasStore {
     pub fn path_for(&self, hash: Hash) -> PathBuf {
         let hex = hash.to_string();
         let shard1 = &hex[0..2];
@@ -138,9 +150,22 @@ impl CasStore {
     /// overwrite, leaving non-deterministic ciphertext on disk.
     pub fn put_existing_hash(&self, hash: Hash, bytes: &[u8]) -> Result<()> {
         let path = self.path_for(hash);
-        // Already loose or packed — don't write a redundant second copy.
-        if path.exists() || self.packs().contains(hash) {
-            return Ok(());
+        // Already held: freshen it so GC's age check sees the reuse. A vanished
+        // pack means another process rewrote packs; reload before deciding.
+        match touch(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("freshening {}", path.display())),
+        }
+        if let Some(pack) = self.packs().pack_of(hash) {
+            match touch(&pack) {
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.refresh_packs(),
+                Err(e) => return Err(e).with_context(|| format!("freshening {}", pack.display())),
+            }
+            if self.packs().contains(hash) {
+                return Ok(());
+            }
         }
         let parent = path
             .parent()
@@ -157,7 +182,7 @@ impl CasStore {
             // syscall per put.
             let mut f = match open() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::create_dir_all(parent).with_context(|| {
+                    create_dir_durable(parent).with_context(|| {
                         format!("failed creating parent dir {}", parent.display())
                     })?;
                     open()
@@ -197,11 +222,18 @@ impl CasStore {
         let path = self.path_for(hash);
         match fs::read(&path) {
             Ok(bytes) => Ok(bytes),
-            // Loose miss: fall back to packs before declaring the object gone.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match self.packs().get(hash)? {
-                Some(bytes) => Ok(bytes),
-                None => Err(anyhow!("missing CAS object {} ({})", hash, path.display())),
-            },
+            // Loose miss: fall back to packs, reloading the index once in case
+            // another process added or rewrote packs since it was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let packed = match self.packs().get(hash) {
+                    Ok(Some(bytes)) => Some(bytes),
+                    Ok(None) | Err(_) => {
+                        self.refresh_packs();
+                        self.packs().get(hash)?
+                    }
+                };
+                packed.ok_or_else(|| anyhow!("missing CAS object {} ({})", hash, path.display()))
+            }
             Err(e) => {
                 Err(e).with_context(|| format!("reading CAS object {} ({})", hash, path.display()))
             }
@@ -340,6 +372,41 @@ mod tests {
         cas.put_existing_hash(h, b"abc").unwrap();
         cas.put_existing_hash(h, b"abc").unwrap();
         assert!(cas.exists(h));
+    }
+
+    #[test]
+    fn dedup_hit_freshens_the_object() {
+        let dir = TempDir::new().unwrap();
+        let cas = CasStore::new(dir.path());
+        cas.ensure_dir().unwrap();
+        let h = cas.put_and_hash(b"reused", hash_blob).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        fs::File::open(cas.path_for(h))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        cas.put_existing_hash(h, b"reused").unwrap();
+        let age = fs::metadata(cas.path_for(h)).unwrap().modified().unwrap();
+        assert!(age > old + std::time::Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn stale_pack_index_reloads_on_miss() {
+        let dir = TempDir::new().unwrap();
+        let writer = CasStore::new(dir.path());
+        let reader = CasStore::new(dir.path());
+        writer.ensure_dir().unwrap();
+        assert!(reader.get(hash_blob(b"nothing")).is_err());
+        let items: Vec<(Hash, Vec<u8>)> = (0..PACK_WRITE_THRESHOLD)
+            .map(|i| {
+                let bytes = format!("packed {i}").into_bytes();
+                (hash_blob(&bytes), bytes)
+            })
+            .collect();
+        let first = items[0].0;
+        writer.put_many(items).unwrap();
+        assert_eq!(reader.get(first).unwrap(), b"packed 0");
+        assert!(reader.exists(first));
     }
 
     #[test]

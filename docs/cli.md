@@ -20,7 +20,7 @@ authoritative.
 
 ## blob, object
 
-- `blob put <file>`: Store bytes, print the hash.
+- `blob put <file> [--head <h>]`: Store bytes, print the hash. `--head` (default `main`) picks the namespace that salts the id; use the tenant head for tenant data.
 - `blob get <hash> <out-file>`: Write bytes for a hash.
 - `object inspect <hash>`: Decode an object and report its type.
 
@@ -29,11 +29,11 @@ authoritative.
 - `manifest put-doc --source <s> --file <f> --chunk-size <n>`: Chunk a file and store a `DocManifest`.
 - `manifest put-run --model <m> --prompt-file <f>`: Record one model call as a `RunManifest`.
 
-`put-doc` flags: `--overlap <n>` (default 0), `--tenant <t>`, `--doc-type <t>`,
+`put-doc` flags: `--head <h>` (default `main`; salts chunk ids by the head's namespace), `--overlap <n>` (default 0), `--tenant <t>`, `--doc-type <t>`,
 `--language <l>`, `--valid-from <unix>`, `--valid-to <unix>`,
 `--expires-at <unix>`, `--acl <tag>` (repeatable).
 
-`put-run` flags: `--provider <p>`, `--system-prompt-file <f>`,
+`put-run` flags: `--head <h>` (default `main`), `--provider <p>`, `--system-prompt-file <f>`,
 `--params-json <f>`, `--param k=v` (repeatable, numbers and bools inferred),
 `--retrieved-chunk <hash>` (repeatable), `--io-hashes in:<hash>|out:<hash>`
 (repeatable), `--sdk-version <v>`, `--agent-id <id>`, `--started-at <unix>`,
@@ -111,8 +111,10 @@ hash is printed.
 - `erasure list`: List erasure records.
 - `erasure verify --public-key <hex>`: Check signed erasure records.
 
-With encryption at rest this is a crypto-shred; without it, overwrite is
-best-effort on copy-on-write filesystems and SSDs.
+Blobs are overwritten with zeros and unlinked; the overwrite is best-effort on
+copy-on-write filesystems and SSDs. Encryption at rest does not strengthen
+this: per-blob keys derive from the master key, so deleting a file destroys no
+key, and backups and replicas keep their copies.
 
 ## serve, auth
 

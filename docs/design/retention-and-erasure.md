@@ -36,9 +36,10 @@ neleus walks the first-parent history of every head and collects:
   the subject's chunks
 
 Blobs also referenced by another subject's content (through dedup) are kept.
-The rest are deleted from loose files and rewritten out of packs. Without
-encryption, loose files are overwritten with zeros first and the method is
-`physical`; with encryption it is `crypto-shred`. If chunk content was removed,
+The rest are overwritten with zeros, deleted from loose files, and rewritten
+out of packs; the method is always `physical`. Encryption does not turn this
+into a crypto-shred: per-blob keys derive from the master key, so deleting the
+envelope destroys no key. If chunk content was removed,
 every head's index is rebuilt so the terms and vectors are gone too.
 
 An `ErasureRecord` (subject, blob hashes, reason, method, requester, time,
