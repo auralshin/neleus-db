@@ -5,7 +5,7 @@
 //! Encrypted DBs replicate ciphertext verbatim, so both sides need the same
 //! encryption config and boundary key (checked before any copy).
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::atomic::{build_temp_name, create_dir_durable, maybe_sync_dir, maybe_sync_file};
 use crate::commit::CommitHash;
 use crate::db::Database;
 use crate::hash::Hash;
@@ -86,22 +87,33 @@ pub fn merge_tree(
         }
 
         // Packs are content-named: missing filename = missing object set.
+        // Each file lands through a temp name and `.pack` before `.idx`, so a
+        // reader never loads an index whose pack is missing or short.
         let remote_pack_dir = remote_store.join(crate::packstore::PACK_DIR);
         if remote_pack_dir.is_dir() {
             let local_pack_dir = local_root.join(crate::packstore::PACK_DIR);
-            fs::create_dir_all(&local_pack_dir)?;
-            for entry in fs::read_dir(&remote_pack_dir)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let target = local_pack_dir.join(&name);
-                if target.exists() || entry.path().is_dir() {
+            create_dir_durable(&local_pack_dir)?;
+            let mut files: Vec<_> = fs::read_dir(&remote_pack_dir)?
+                .map(|e| e.map(|e| e.path()))
+                .collect::<std::io::Result<_>>()?;
+            files.retain(|p| p.is_file());
+            let ext = |p: &Path| p.extension().and_then(|e| e.to_str()).map(str::to_owned);
+            files.sort_by_key(|p| ext(p).as_deref() == Some("idx"));
+            for path in files {
+                let name = path.file_name().expect("read_dir entry has a name");
+                let target = local_pack_dir.join(name);
+                if target.exists() {
                     continue;
                 }
-                fs::copy(entry.path(), &target)?;
-                if entry.path().extension().and_then(|e| e.to_str()) == Some("pack") {
+                let tmp = local_pack_dir.join(build_temp_name(&name.to_string_lossy())?);
+                fs::copy(&path, &tmp)?;
+                maybe_sync_file(&File::open(&tmp)?)?;
+                fs::rename(&tmp, &target)?;
+                if ext(&path).as_deref() == Some("pack") {
                     report.packs_copied += 1;
                 }
             }
+            maybe_sync_dir(&local_pack_dir)?;
             db.blob_store.refresh_packs();
             db.object_store.refresh_packs();
         }
@@ -484,6 +496,32 @@ mod tests {
         let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
         assert_eq!(report.refs_updated, vec!["main".to_string()]);
         assert_eq!(b.refs.head_get("main").unwrap(), Some(c2));
+    }
+
+    #[test]
+    fn merge_copies_packs_without_leaving_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let a = test_db(&tmp, "a");
+        let b = test_db(&tmp, "b");
+
+        let _ = a.state_set_at_head("main", b"k", b"v1").unwrap();
+        let c1 = a
+            .create_commit_at_head("main", "agent", "c1", vec![])
+            .unwrap();
+        crate::packstore::pack_loose(&a.root.join("objects")).unwrap();
+
+        let report = merge_tree(&b, &a.root, &|_| Ok(())).unwrap();
+        assert_eq!(report.packs_copied, 1);
+        let names: Vec<String> = fs::read_dir(b.root.join("objects").join("pack"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
+        let b = Database::open(&b.root).unwrap();
+        assert_eq!(b.refs.head_get("main").unwrap(), Some(c1));
+        let root = b.resolve_state_root("main").unwrap();
+        assert_eq!(b.state_store.get(root, b"k").unwrap(), Some(b"v1".to_vec()));
     }
 
     #[test]
